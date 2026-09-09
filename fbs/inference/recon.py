@@ -4,6 +4,7 @@ import requests
 from urllib.parse import urljoin
 
 from fbs.inference.sql_dialects import ERROR_SIGNATURES, detect_db_from_error
+from fbs.inference.waf import visible_text, diff_score
 
 BASELINE = 'john35912'
 
@@ -48,7 +49,21 @@ _FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
     '/*':          {'sqli': 0.3},
     'union':       {'sqli': 0.5},
     'select':      {'sqli': 0.5},
+    '$':           {'sqli': 0.4},
     'sleep':       {'sqli': 0.3},
+    # SQLi 열거/추출용 — 막히면 SQLi 강한 신호이자, strategy가 페이로드에서 회피해야 할 토큰.
+    # 거부-지문 판정 덕에 SQL 에러(=인젝션 신호)를 밴으로 오분류하지 않는다.
+    'order':       {'sqli': 0.5},
+    'having':      {'sqli': 0.4},
+    'like':        {'sqli': 0.4},
+    'substr':      {'sqli': 0.4},
+    'substring':   {'sqli': 0.4},
+    'ascii':       {'sqli': 0.4},
+    'benchmark':   {'sqli': 0.4},
+    'database':    {'sqli': 0.5},
+    'information_schema': {'sqli': 0.5},
+    ',':           {'sqli': 0.2},
+    '%':           {'sqli': 0.3},
     # XSS
     '<':           {'xss': 0.5},
     '>':           {'xss': 0.3},
@@ -62,9 +77,6 @@ _FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
     # Path traversal
     '../':         {'path_traversal': 0.5},
     '..\\':        {'path_traversal': 0.4},
-    # NoSQLi
-    '$where':      {'nosqli': 0.5},
-    '$ne':         {'nosqli': 0.4},
     # Command injection
     ';':           {'command_injection': 0.3},
     '|':           {'command_injection': 0.3},
@@ -75,6 +87,12 @@ _FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
 _LENGTH_THRESHOLD = 100
 # 텍스트 유사도 임계값 (SequenceMatcher.ratio 기준)
 _SIMILAR_RATIO = 0.85
+
+# 거부 지문 캘리브레이션(_probe_filter_map)의 판정 바닥값. 실제 임계값은 페이지 자체의 요청별
+# 흔들림(noise)을 재서 max(noise*2, 이 값)으로 동적으로 잡는다 — 고정 절댓값을 쓰면 응답이
+# "Good"/"blocked"처럼 짧은 페이지에선 진짜 필터 변화(diff 몇 자)를 놓치고(오탐), 세션토큰 등
+# 노이즈가 큰 페이지에선 노이즈를 필터로 착각한다. noise=0인 결정적 페이지에서만 이 값이 쓰인다.
+_FILTER_MIN_DIFF_FLOOR = 1
 
 
 class DBDetect:
@@ -146,10 +164,6 @@ class DBDetect:
         sqli_signal     = False
         waf_blocked     = False
         triggering_quote = None   # 신호를 낸 따옴표('/") — strategy가 페이로드 구성에 재사용
-        # 아래 루프에서 '/"별로 개별 차단 여부를 기록해뒀다가 _probe_filter_map에 넘긴다 —
-        # _FILTER_PROBE_TOKENS에도 '/"가 들어있어서, 넘기지 않으면 같은 문자를 또 raw로
-        # 보내 중복 확인하게 된다.
-        quote_probe_blocked: dict[str, bool] = {}
 
         for quote_char, payload in DB_PROBES_BY_QUOTE.items():
             probe_data = {**data, target: payload}
@@ -209,7 +223,6 @@ class DBDetect:
             )
             if blocked_this_quote:
                 waf_blocked = True
-            quote_probe_blocked[quote_char] = blocked_this_quote
 
             error_results[payload] = {
                 'status':             probe_status,
@@ -245,7 +258,7 @@ class DBDetect:
         # 필터는 따옴표에 반응 안 해서 여기선 안 잡힌다. filter_map은 그것과 별개로, vuln-type
         # 무관한 종합 카나리로 "필터가 존재하는지"부터 확인하고 반응이 있을 때만 토큰별로
         # 개별 확인한다 — SQLi 신호가 없어도(quote가 안 막혀도) 독립적으로 실행된다.
-        filter_map = self._probe_filter_map(url, method, data, target, baseline_length, quote_probe_blocked)
+        filter_map = self._probe_filter_map(url, method, data, target, baseline_body)
 
         return {
             'case':             case,
@@ -263,38 +276,53 @@ class DBDetect:
         }
 
     def _probe_filter_map(self, url: str, method: str, data: dict, target: str,
-                           baseline_length: int | None,
-                           known_blocked: dict[str, bool] | None = None) -> dict[str, bool] | None:
-        """1단계: 전체 토큰을 이어붙인 종합 카나리 1개로 "필터가 존재하는지"만 vuln-type
-        무관하게 확인한다(요청 1개). 반응이 없으면 이 필드엔 어떤 필터도 없다고 보고 추가
-        요청 없이 끝낸다(None 반환). 반응이 있으면 2단계로 토큰을 하나씩 개별 요청으로 보내서
-        정확히 뭐가 막히는지 지도를 만든다 — 한 요청에 여러 토큰을 같이 보내면 어느 토큰
-        때문에 막혔는지 구분이 안 되므로, 2단계는 반드시 토큰 하나당 요청 하나여야 한다.
+                           baseline_body: str | None) -> dict[str, bool] | None:
+        """거부 지문(rejection fingerprint) 기반 필터 지도.
 
-        known_blocked(위 quote-probe 루프가 '/"에 대해 이미 확인해둔 결과)에 들어있는
-        토큰은 2단계에서 또 raw로 보내지 않고 그 결과를 그대로 재사용한다 — _FILTER_PROBE_TOKENS
-        에도 '/"가 들어있어서, 안 그러면 완전히 같은 문자를 두 코드 경로가 각자 중복 확인한다."""
+        임계값은 고정 절댓값이 아니라 페이지 노이즈를 재서 동적으로 잡는다(max(noise*2, floor)):
+        같은 benign 요청을 한 번 더 보내 정상↔정상 흔들림(noise)을 측정 — "Good"/"blocked"처럼
+        짧은 응답(진짜 필터 변화도 diff 몇 자)과 세션토큰 등 노이즈 큰 페이지를 한 기준으로 다룬다.
 
-        def _reacted(body: str) -> bool:
-            length = len(body)
-            if baseline_length is not None and abs(length - baseline_length) > _LENGTH_THRESHOLD:
-                return True
-            return self._detect_waf_body(body)
+        1단계(캘리브레이션): 종합 카나리(전체 토큰 이어붙임)의 응답이 정상 대비 임계값을 넘게
+        다르면 그게 이 엔드포인트의 '거부 페이지 템플릿'이다. 안 넘으면 (이 토큰들에 반응하는)
+        필터가 없다고 보고 None.
 
-        known_blocked = known_blocked or {}
+        2단계: 토큰마다 BASELINE+token을 하나씩 보내(어느 토큰이 막혔는지 구분하려면 토큰당
+        요청 하나여야 함), 응답이 거부 지문에 노이즈 수준으로 가까우면 밴으로 기록한다. 길이/키워드
+        휴리스틱과 달리 이 방식은 세 경우를 구분한다:
+          - 거부 지문과 일치        → 밴 (strategy가 회피할 토큰)
+          - 정상 지문과 일치        → 무반응
+          - 둘 다 아님(에러/행 변화) → 밴 아님 (오히려 SQL까지 도달한 인젝션 신호일 수 있음)
+        세 번째가 핵심 — 예전 판정은 '따옴표가 SQL 에러를 냄'을 '차단'으로 오분류했는데, 그건
+        정반대(취약 신호)라 밴으로 처리하면 안 된다. '정상보다 거부에 가깝다'(상대 비교)가 아니라
+        '거부 지문에 (노이즈 수준으로) 절대적으로 가깝다'로 봐야 정상·거부 어느 쪽과도 먼 에러
+        페이지를 밴으로 안 잡는다."""
+        normal_text = visible_text(baseline_body or '')
+
+        # 페이지 자체의 요청별 흔들림을 먼저 잰다 — baseline_body와 같은 shape의 benign 요청을
+        # 한 번 더 보내 비교. 이 noise로 임계값을 동적으로 잡아 짧은 응답/노이즈 페이지 양쪽을 다룬다.
+        n_resp, _, _ = self._send(url, method, {**data, target: BASELINE})
+        noise = diff_score(normal_text, visible_text(n_resp.text)) if n_resp is not None else 0
+        threshold = max(noise * 2, _FILTER_MIN_DIFF_FLOOR)
 
         composite = BASELINE + ''.join(_FILTER_PROBE_TOKENS.keys())
         resp, _, _ = self._send(url, method, {**data, target: composite})
-        if resp is None or not _reacted(resp.text):
-            return None  # 필터 없음 확정 (또는 요청 실패) — 토큰별 breakdown 스킵
+        if resp is None:
+            return None
+        reject_text = visible_text(resp.text)
+        reject_diff = diff_score(normal_text, reject_text)
+        if reject_diff <= threshold:
+            return None  # 정상과 노이즈 수준 차이 = 반응하는 필터 없음
 
         blocked: dict[str, bool] = {}
         for token in _FILTER_PROBE_TOKENS:
-            if token in known_blocked:
-                blocked[token] = known_blocked[token]
-                continue
             t_resp, _, _ = self._send(url, method, {**data, target: BASELINE + token})
-            blocked[token] = t_resp is not None and _reacted(t_resp.text)
+            if t_resp is None:
+                blocked[token] = False
+                continue
+            # 응답이 거부 지문에 노이즈 수준으로 가까우면 밴. 정상/에러 페이지는 거부와 멀어
+            # (diff >> threshold) 밴으로 안 잡힌다 — 특히 SQL 에러(=인젝션 신호)를 보존한다.
+            blocked[token] = diff_score(visible_text(t_resp.text), reject_text) <= threshold
         return blocked
 
     def _send(self, url: str, method: str, data: dict) -> tuple[requests.Response | None, float, str | None]:

