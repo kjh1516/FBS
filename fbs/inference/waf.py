@@ -401,7 +401,7 @@ def apply_named_evasion(name: str, payload: str) -> str:
     return result
 
 
-def _try_evade_pairs(send_fn, payload: str, dialect: str | None, skip: set[str]):
+def _try_evade_pairs(send_fn, payload: str, dialect: str | None, skip: set[str], is_banned=None):
     """단일 기법이 전부 실패했을 때 최후 수단으로 2개씩 조합해서 재시도한다.
 
     'a 다음에 b'와 'b 다음에 a'는 결과가 다를 수 있어서(예: 공백을 지운 뒤 키워드를
@@ -428,6 +428,8 @@ def _try_evade_pairs(send_fn, payload: str, dialect: str | None, skip: set[str])
             variant_ab = fn_b(variant_a)
             if variant_ab == variant_a:
                 continue
+            if is_banned and is_banned(variant_ab):
+                continue  # 우회가 밴 토큰을 재도입 — WAF는 뚫어도 벤 필터에 다시 걸려 무의미
             status, body, elapsed = send_fn(variant_ab)
             if status is None:
                 continue
@@ -438,7 +440,8 @@ def _try_evade_pairs(send_fn, payload: str, dialect: str | None, skip: set[str])
 
 
 def try_evade(send_fn, payload: str, label: str, waf_hits: list, waf_evasions: list,
-              dialect: str | None = None, skip: set[str] | None = None, quiet: bool = False):
+              dialect: str | None = None, skip: set[str] | None = None, quiet: bool = False,
+              is_banned=None):
     """payload가 WAF에 막혔을 때 우회 변형들을 순서대로 재시도하는 공용 로직.
 
     skip(호출부의 필드별 캐시가 이미 시도해서 실패한 기법 이름들)에 든 항목은 건너뛴다 —
@@ -477,6 +480,8 @@ def try_evade(send_fn, payload: str, label: str, waf_hits: list, waf_evasions: l
         variant = transform(payload)
         if variant == payload:
             continue  # 이 페이로드엔 적용할 게 없음 (예: 공백 없는 홑따옴표 하나)
+        if is_banned and is_banned(variant):
+            continue  # 우회가 밴 토큰을 재도입 — WAF는 뚫어도 벤 필터에 다시 걸려 무의미
         status, body, elapsed = send_fn(variant)
         if status is None:
             continue
@@ -487,7 +492,7 @@ def try_evade(send_fn, payload: str, label: str, waf_hits: list, waf_evasions: l
             waf_evasions.append(f"{label}: {name} 우회 성공 → \"{variant}\"")
             return status, body, elapsed, variant, name
 
-    combo = _try_evade_pairs(send_fn, payload, dialect, skip)
+    combo = _try_evade_pairs(send_fn, payload, dialect, skip, is_banned)
     if combo is not None:
         status, body, elapsed, variant, combo_name = combo
         if not quiet:

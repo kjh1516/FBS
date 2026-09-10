@@ -1,7 +1,7 @@
 {
-  "scan_id": "2026-09-09T08:42:36.825535+00:00",
-  "target": "http://host3.dreamhack.games:10285/",
-  "scanned_at": "2026-09-09T08:42:51.751697+00:00",
+  "scan_id": "2026-09-10T08:59:59.252312+00:00",
+  "target": "http://host3.dreamhack.games:20643/",
+  "scanned_at": "2026-09-10T09:00:13.980497+00:00",
   "summary": {
     "pages_scanned": 2,
     "forms_found": 1,
@@ -13,7 +13,7 @@
   },
   "pages": [
     {
-      "url": "http://host3.dreamhack.games:10285/",
+      "url": "http://host3.dreamhack.games:20643/",
       "status_code": 200,
       "content_type": "text/html; charset=utf-8",
       "depth": 0,
@@ -30,7 +30,7 @@
       "security_headers": {}
     },
     {
-      "url": "http://host3.dreamhack.games:10285/login",
+      "url": "http://host3.dreamhack.games:20643/login",
       "status_code": 200,
       "content_type": "text/html; charset=utf-8",
       "depth": 1,
@@ -40,8 +40,8 @@
       "cookies": [
         {
           "name": "session",
-          "value": "eyJpZCI6eyIgYiI6IkVHVU51MFY5b0hRVGl5YUxhZnBMTGc9PSJ9LCJ0cmllcyI6MH0.aqEcAA.dGEK1W6oiKrBlyQ9QqlE6PdemnY",
-          "raw": "session=eyJpZCI6eyIgYiI6IkVHVU51MFY5b0hRVGl5YUxhZnBMTGc9PSJ9LCJ0cmllcyI6MH0.aqEcAA.dGEK1W6oiKrBlyQ9QqlE6PdemnY",
+          "value": "eyJpZCI6eyIgYiI6IkgwNHNvU205Uk1kTEZKdUc1UkFLMnc9PSJ9LCJ0cmllcyI6MH0.aqJxkw.rcl4XYnTkDwQmxv5t8-XNDE1iDg",
+          "raw": "session=eyJpZCI6eyIgYiI6IkgwNHNvU205Uk1kTEZKdUc1UkFLMnc9PSJ9LCJ0cmllcyI6MH0.aqJxkw.rcl4XYnTkDwQmxv5t8-XNDE1iDg",
           "flags": {
             "httponly": null,
             "secure": null,
@@ -52,7 +52,7 @@
       "tech_stack": {},
       "forms": [
         {
-          "action": "http://host3.dreamhack.games:10285/login",
+          "action": "http://host3.dreamhack.games:20643/login",
           "method": "POST",
           "enctype": "application/x-www-form-urlencoded",
           "inputs": [
@@ -74,7 +74,7 @@
   ],
   "button_results": [
     {
-      "page_url": "http://host3.dreamhack.games:10285/",
+      "page_url": "http://host3.dreamhack.games:20643/",
       "button": "Go to login page",
       "api_calls": [],
       "set_cookies": [],

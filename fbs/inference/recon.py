@@ -323,6 +323,15 @@ class DBDetect:
             # 응답이 거부 지문에 노이즈 수준으로 가까우면 밴. 정상/에러 페이지는 거부와 멀어
             # (diff >> threshold) 밴으로 안 잡힌다 — 특히 SQL 에러(=인젝션 신호)를 보존한다.
             blocked[token] = diff_score(visible_text(t_resp.text), reject_text) <= threshold
+
+        # 더 짧은 밴 토큰이 부분 문자열로 든 토큰은 그 짧은 토큰 때문에 걸린 것이지 독립적인
+        # 밴이 아니다 — 앱 필터가 substring 매칭이라(예: '$'가 밴이면 '$where'가, 'substr'가
+        # 밴이면 'substring'이 덩달아 거부됨) 제외해야 한다. 안 그러면 hints가 중복·교차유형으로
+        # 부풀고('$'(sqli) 하나 때문에 '$where'(nosqli)까지 켜짐) 밴셋도 지저분해진다.
+        banned_now = [t for t, b in blocked.items() if b]
+        for t in banned_now:
+            if any(other != t and other in t for other in banned_now):
+                blocked[t] = False
         return blocked
 
     def _send(self, url: str, method: str, data: dict) -> tuple[requests.Response | None, float, str | None]:

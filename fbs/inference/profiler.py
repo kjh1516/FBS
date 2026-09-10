@@ -358,6 +358,7 @@ class Profiler:
                     'waf_info':    waf_info,
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
+                    'filter_map':  db.get('filter_map'),
                     'breakdown': {
                         'field_matches': field_matches,
                         'tech_matches':  tech_matches,
@@ -411,6 +412,7 @@ class Profiler:
                         'waf_info':       waf_info,
                         'quote_char':     db.get('quote_char'),
                         'detected_db':    db.get('detected_db'),
+                        'filter_map':     db.get('filter_map'),
                         'enctype':        enctype,
                         'all_params':     all_params,
                         'proxy_template': form.get('proxy_template'),
@@ -453,6 +455,7 @@ class Profiler:
                     'waf_info':    waf_info,
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
+                    'filter_map':  db.get('filter_map'),
                     'breakdown': {
                         'field_matches': field_matches,
                         'tech_matches':  tech_matches,
@@ -504,6 +507,7 @@ class Profiler:
                     'waf_info':    waf_info,
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
+                    'filter_map':  db.get('filter_map'),
                     'enctype':     enctype,
                     'all_params':  entry.get('known_fields') or {},
                     'discovery_evasion': discovery_evasion,
