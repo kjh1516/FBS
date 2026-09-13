@@ -1,0 +1,28 @@
+# 저장소는 줄바꿈을 LF로 통일한다. 텍스트 파일은 자동 감지하되, 체크아웃 시에도
+# LF를 유지해(eol=lf) Windows/리눅스 어디서 작업해도 "줄바꿈만 바뀐 가짜 diff"가 안 생긴다.
+* text=auto eol=lf
+
+# 명시적으로 텍스트로 다뤄 줄바꿈을 정규화할 소스/설정 파일들
+*.py    text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+
+# 바이너리 — Git이 줄바꿈/diff 변환을 절대 하지 않도록 명시
+*.db    binary
+*.sqlite binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary

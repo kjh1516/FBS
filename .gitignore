@@ -1,0 +1,37 @@
+# ── 스캔 산출물 (실행할 때마다 바뀌는 결과물, 코드 아님) ──────────────
+fbs_results.db
+fbs_results.db-wal
+fbs_results.db-shm
+scan_report.json
+vuln_report.json
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+
+# ── Scrapy / Playwright ──────────────────────────────────────────────
+.scrapy/
+
+# ── 테스트/커버리지 (추후) ───────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── 에디터 / OS ──────────────────────────────────────────────────────
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# .vscode/는 팀 공유 설정을 커밋하고 싶으면 주석 처리, 아니면 유지
+.vscode/

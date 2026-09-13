@@ -300,9 +300,28 @@ class DBDetect:
         normal_text = visible_text(baseline_body or '')
 
         # 페이지 자체의 요청별 흔들림을 먼저 잰다 — baseline_body와 같은 shape의 benign 요청을
-        # 한 번 더 보내 비교. 이 noise로 임계값을 동적으로 잡아 짧은 응답/노이즈 페이지 양쪽을 다룬다.
-        n_resp, _, _ = self._send(url, method, {**data, target: BASELINE})
-        noise = diff_score(normal_text, visible_text(n_resp.text)) if n_resp is not None else 0
+        # 연달아 두 번 보내 비교. 이 noise로 임계값을 동적으로 잡아 짧은 응답/노이즈 페이지 양쪽을 다룬다.
+        n1, _, _ = self._send(url, method, {**data, target: BASELINE})
+        n2, _, _ = self._send(url, method, {**data, target: BASELINE})
+        t1 = visible_text(n1.text) if n1 is not None else normal_text
+        t2 = visible_text(n2.text) if n2 is not None else normal_text
+
+        # 누적형(append-only) 엔드포인트 감지: 완전히 동일한 benign 요청을 연달아 보냈을 때
+        # 응답이 '매번 일정 크기로' 커지는지 본다 — memo처럼 입력을 전역에 쌓아 되돌려주는 앱은
+        # 요청마다 같은 양만큼 visible text가 늘어난다(연속 양의 증가 + step이 서로 비슷). 이러면
+        # 거부지문 비교가 의미를 잃는다(누적 증가분이 '거부'처럼 보여 멀쩡한 토큰을 밴으로 오판
+        # → 가짜 sqli 힌트 → SQLi가 그 페이지에 페이로드 난사). 신뢰 불가라 필터 지도는 판정
+        # 보류(None) + 종합/토큰 33발 낭비 요청도 여기서 차단. 단순 노이즈(세션토큰/타임스탬프)는
+        # 크기가 증감 없이 흔들리기만 해서 이 조건을 통과 못 한다 — 멀쩡한 노이즈 페이지의 필터
+        # 지도를 우연히(d2>d1) 잘못 끄지 않도록 '단조 증가'가 아니라 '일정 증가'를 본다.
+        step1, step2 = len(t1) - len(normal_text), len(t2) - len(t1)
+        if (n1 is not None and n2 is not None
+                and step1 > _FILTER_MIN_DIFF_FLOOR and step2 > _FILTER_MIN_DIFF_FLOOR
+                and min(step1, step2) >= 0.5 * max(step1, step2)):
+            print(f"    [필터맵] 누적형 엔드포인트 추정(응답 일정 증가 +{step1},+{step2}) — 필터 지도 판정 보류")
+            return None
+
+        noise = max(diff_score(normal_text, t1), diff_score(normal_text, t2))
         threshold = max(noise * 2, _FILTER_MIN_DIFF_FLOOR)
 
         composite = BASELINE + ''.join(_FILTER_PROBE_TOKENS.keys())

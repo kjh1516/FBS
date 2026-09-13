@@ -39,10 +39,11 @@ class InferenceEngine:
     def _register_strategies(self):
         """구현된 strategy를 순서대로 등록한다."""
         from fbs.inference.strategies.sqli import SQLiStrategy
+        from fbs.inference.strategies.xss import XSSStrategy
         # from fbs.inference.strategies.ssti   import SSTIStrategy
-        # from fbs.inference.strategies.xss    import XSSStrategy
         # from fbs.inference.strategies.nosqli import NoSQLiStrategy
-        self.strategies = [SQLiStrategy(session=self.session)]
+        self.strategies = [SQLiStrategy(session=self.session),
+                           XSSStrategy(session=self.session)]
 
     # ── DB 읽기 ───────────────────────────────────────────────────────────────
 
@@ -152,7 +153,13 @@ class InferenceEngine:
         return any(sig in lower for sig in _WAF_BODY_SIGNATURES)
 
     def _probe_blind(self, surface: AttackSurface) -> bool | None:
-        canary  = f"fbs_{uuid4().hex[:8]}"
+        core    = f"fbs{uuid4().hex[:8]}"
+        # 꺾쇠/따옴표를 코어와 함께 실어, '반사 여부'(코어 존재)와 'HTML 메타문자가
+        # 이스케이프 없이 살아남는지'(XSS 전제)를 같은 요청 하나로 같이 관측한다 —
+        # 추가 요청 없이 XSSStrategy.can_handle이 쓸 신호를 만든다. 단순 반사(SQLi 폼도
+        # 반사함)와 'XSS 가능한 반사'를 구분하려는 것: SQLi 출력은 보통 <,>를 엔티티로
+        # 이스케이프하지만, 반사형 XSS 싱크는 <,>를 원형 그대로 돌려준다.
+        canary  = f"'\"<{core}>"
         enctype = surface.extra.get('enctype', '')
         params  = {p: '' for p in (surface.extra.get('all_params') or [])}
         params[surface.param] = canary
@@ -167,7 +174,10 @@ class InferenceEngine:
 
             if self._is_waf_response(resp):
                 return None  # WAF 차단 응답 — blind 판정 불가
-            reflected = canary in resp.text
+            body = resp.text
+            # 꺾쇠가 이스케이프 없이 그대로 반사되면 XSS 전제 충족으로 표시(can_handle이 사용).
+            surface.extra['reflects_html'] = f"<{core}>" in body
+            reflected = core in body
             return not reflected  # 반사되면 False(reflected), 없으면 True(blind)
         except Exception:
             return None
