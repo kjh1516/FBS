@@ -45,6 +45,7 @@ FBS 추론 엔진(동기 requests.Session + AttackSurface + VulnResult)에 맞�
 
 class XSSStrategy(BaseStrategy):
 
+    VULN_TYPE = 'xss'
     TIMEOUT = 10
     # 브라우저에서 폼 제출 후 alert/네비게이션을 기다리는 시간(ms).
     BROWSER_WAIT_MS = 1500
@@ -111,6 +112,16 @@ class XSSStrategy(BaseStrategy):
         if surface.extra.get('reflects_html'):
             return True
         return False
+
+    def priority(self, surface: AttackSurface) -> float:
+        """XSS 우선순위 — profiler의 xss hint 점수를 쓰되, 필드명 힌트가 없어도 메타문자가
+        이스케이프 없이 반사되면(reflects_html) XSS가 사실상 확정적이므로 강한 점수(0.7)로
+        올린다. 엔진은 이 값과 다른 전략(예: SQLi의 sqli hint)을 비교해 더 높은 하나만 돌린다
+        — 그래서 반사되지 않는 로그인 필드(sqli 0.8 > xss 0.4)에선 XSS가 아예 시작되지 않는다."""
+        base = surface.extra.get('hints', {}).get('xss', 0.0)
+        if surface.extra.get('reflects_html'):
+            return max(base, 0.7)
+        return base
 
     def run(self, surface: AttackSurface) -> list[VulnResult]:
         base_fields = self._base_fields(surface)

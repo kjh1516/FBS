@@ -35,6 +35,7 @@ recon 신호가 없으면(quote_char=None) 기존과 동일하게 '를 기본값
 
 class SQLiStrategy(BaseStrategy):
 
+    VULN_TYPE = 'sqli'
     TIMEOUT = 10
     TIME_TIMEOUT = 15
 

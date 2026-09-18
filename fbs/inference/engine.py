@@ -309,18 +309,28 @@ class InferenceEngine:
         print(f"\n# [추론 시작] strategy {len(self.strategies)}개 실행\n")
         for i, surface in enumerate(surfaces, 1):
             print(f"  [{i}/{len(surfaces)}] {surface.surface_type} | {surface.method} {surface.url} | param={surface.param}")
-            for strategy in self.strategies:
-                if strategy.can_handle(surface):
-                    print(f"    → {strategy.__class__.__name__} 실행 중...")
-                    results = strategy.run(surface)
-                    if results:
-                        for r in results:
-                            print(f"    ══ 최종 취약점 확정 ═══════════════════════════")
-                            print(f"    [{r.severity}] {r.vuln_type} | payload=\"{r.payload}\"")
-                            print(f"    ═══════════════════════════════════════════════")
-                    else:
-                        print(f"    · 취약점 없음")
-                    self._results.extend(results)
+
+            # 이 표면을 처리할 수 있는 전략들 중 '우선순위(profiler hint 점수)가 가장 높은 하나'만
+            # 실행한다 — 한 필드에 SQLi·XSS 등 여러 전략을 전부 돌리지 않는다. 프로파일링이 가장
+            # 유력하다고 본 유형이 이기고, 나머지는 스킵한다(예: username은 sqli 0.8 > xss 0.4라
+            # SQLi만 실행). 동점이면 등록 순서(안정 정렬)로 앞선 전략이 이긴다.
+            applicable = [s for s in self.strategies if s.can_handle(surface)]
+            if not applicable:
+                continue
+            strategy = max(applicable, key=lambda s: s.priority(surface))
+            skipped = [s.__class__.__name__ for s in applicable if s is not strategy]
+            skip_note = f" (스킵: {', '.join(skipped)})" if skipped else ""
+            print(f"    → {strategy.__class__.__name__} 실행 중 (우선순위 {strategy.priority(surface):.2f}){skip_note}...")
+
+            results = strategy.run(surface)
+            if results:
+                for r in results:
+                    print(f"    ══ 최종 취약점 확정 ═══════════════════════════")
+                    print(f"    [{r.severity}] {r.vuln_type} | payload=\"{r.payload}\"")
+                    print(f"    ═══════════════════════════════════════════════")
+            else:
+                print(f"    · 취약점 없음")
+            self._results.extend(results)
 
         self._write_results()
 

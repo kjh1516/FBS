@@ -11,11 +11,24 @@ class BaseStrategy(ABC):
       3. analyze     — 응답 분석 (WAF 여부, 반사 유형, DB 종류 등)
       4. reattack    — 분석 결과 기반 정밀 페이로드 전송
     run()은 위 흐름을 오케스트레이션한다.
+
+    엔진은 한 공격 표면에 대해, can_handle이 True인 전략을 전부 돌리지 않고 priority()가
+    가장 높은 '하나'만 실행한다. 그 우선순위는 기본적으로 profiler가 매긴 해당 취약점
+    유형(VULN_TYPE)의 hint 점수다 — 즉 프로파일링에서 가장 유력하다고 본 유형이 이긴다.
     """
+
+    # 이 전략이 대응하는 취약점 유형 키 (profiler hints의 키와 동일: 'sqli' | 'xss' | ...).
+    VULN_TYPE: str = ''
 
     @abstractmethod
     def can_handle(self, surface: 'AttackSurface') -> bool:
         """이 strategy가 해당 공격 표면을 처리할 수 있으면 True."""
+
+    def priority(self, surface: 'AttackSurface') -> float:
+        """이 표면에 대한 이 전략의 우선순위 점수. 기본은 profiler가 매긴 VULN_TYPE의 hint
+        점수 — 엔진이 can_handle True인 전략들 중 이 값이 가장 큰 하나만 골라 실행한다.
+        필드명 힌트 외의 신호(예: XSS의 reflects_html)를 반영하려면 하위 전략에서 재정의한다."""
+        return surface.extra.get('hints', {}).get(self.VULN_TYPE, 0.0)
 
     @abstractmethod
     def run(self, surface: 'AttackSurface') -> list['VulnResult']:
