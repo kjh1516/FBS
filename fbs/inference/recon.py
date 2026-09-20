@@ -64,6 +64,22 @@ _FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
     'information_schema': {'sqli': 0.5},
     ',':           {'sqli': 0.2},
     '%':           {'sqli': 0.3},
+    # 원자 SQL 연산자/구조/공백 토큰 — 공백·or·and·from까지 막는 아주 빡빡한 블랙리스트 WAF를
+    # 정확히 짚기 위함. (1) 이게 있어야 'order'/'onerror'/'information_schema'가 사실은 'or'
+    # 때문에 걸린 것임을 minimal-token 축소가 올바르게 귀속한다. (2) sqli.py가 이 원자 밴을
+    # 알아야 페이로드를 '밴'으로 인지하고, 기존 ||/&& 치환 + 공백 제거 우회(symbolic_no_space)를
+    # 실제로 발동시킨다 — 예: "' OR '1'='1' #" → "'||'1'='1'#"(공백·or 제거, 밴 0개).
+    'or':          {'sqli': 0.4},
+    'and':         {'sqli': 0.4},
+    'from':        {'sqli': 0.4},
+    ' ':           {'sqli': 0.2},
+    '-':           {'sqli': 0.2},
+    '+':           {'sqli': 0.2},
+    '*':           {'sqli': 0.2},
+    # '/'는 SQL 주석(/**/)·나눗셈에 쓰이는 원자 문자. 이게 토큰으로 있어야 '../'·'/*'가
+    # 사실은 '/' 때문에 걸린 것임을 minimal-token 축소가 귀속한다(안 그러면 '../'가 독립
+    # 밴으로 남아 path_traversal 힌트를 잘못 올림). '.'은 흔히 안 막혀서 넣지 않는다.
+    '/':           {'sqli': 0.2},
     # XSS
     '<':           {'xss': 0.5},
     '>':           {'xss': 0.3},
@@ -328,6 +344,20 @@ class DBDetect:
         resp, _, _ = self._send(url, method, {**data, target: composite})
         if resp is None:
             return None
+
+        # 종합 카나리가 500/SQL에러를 냈다면, 안에 든 따옴표(', ")가 SQL 문자열 리터럴을 깨서
+        # 거부 지문이 '차단 페이지'가 아니라 '에러 페이지'로 오염된 것이다(그러면 같은 에러를
+        # 내는 토큰이 그 지문과 닮아 '차단'으로 오분류됨). 이 500 자체가 강한 SQLi 신호(2차
+        # 확인)이기도 하다. 따옴표를 빼고 한 번 더 보내 오염 안 된 거부 지문을 다시 만든다 —
+        # 따옴표가 실제로 막히는지는 error probe와 아래 per-token 루프가 따로 판정하므로 정보
+        # 손실은 없다(정상 케이스엔 이 재전송이 없어 요청도 안 는다).
+        if resp.status_code >= 500 or detect_db_from_error(resp.text):
+            print("    [필터맵] 종합 카나리가 SQL 에러 유발(=주입 신호) — 따옴표 제외하고 거부 지문 재생성")
+            composite = BASELINE + ''.join(t for t in _FILTER_PROBE_TOKENS if t not in ("'", '"'))
+            resp, _, _ = self._send(url, method, {**data, target: composite})
+            if resp is None:
+                return None
+
         reject_text = visible_text(resp.text)
         reject_diff = diff_score(normal_text, reject_text)
         if reject_diff <= threshold:
@@ -339,8 +369,16 @@ class DBDetect:
             if t_resp is None:
                 blocked[token] = False
                 continue
-            # 응답이 거부 지문에 노이즈 수준으로 가까우면 밴. 정상/에러 페이지는 거부와 멀어
-            # (diff >> threshold) 밴으로 안 잡힌다 — 특히 SQL 에러(=인젝션 신호)를 보존한다.
+            # 5xx이거나 SQL 에러 시그니처가 뜨면 그 토큰은 '차단'이 아니라 '주입 신호'다 —
+            # 토큰이 앱 필터를 통과해 쿼리까지 도달, 구문을 깨뜨렸다는 뜻이라 밴의 정반대다.
+            # (종합 카나리에 '가 섞여 있으면 거부 지문 자체가 500 SQL 에러 페이지가 돼버려서,
+            #  '처럼 같은 에러를 내는 토큰이 그 지문과 닮아 '차단'으로 오분류되던 문제를 막는다.
+            #  아래 diff 비교만으로는 거부 지문이 에러 페이지일 때 이 오탐을 못 거른다.)
+            if t_resp.status_code >= 500 or detect_db_from_error(t_resp.text):
+                blocked[token] = False
+                continue
+            # 응답이 거부 지문에 노이즈 수준으로 가까우면 밴. 정상 페이지는 거부와 멀어
+            # (diff >> threshold) 밴으로 안 잡힌다.
             blocked[token] = diff_score(visible_text(t_resp.text), reject_text) <= threshold
 
         # 더 짧은 밴 토큰이 부분 문자열로 든 토큰은 그 짧은 토큰 때문에 걸린 것이지 독립적인

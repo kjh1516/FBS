@@ -233,6 +233,15 @@ def _apply_recon_signal(hints: dict, db: dict, block_ratio: float) -> str | None
     (균일 차단, 범용 인프라 WAF 추정) 이 신호만으로는 필드를 구분할 수 없어 확신도는
     낮지만, "이 필드를 건드렸더니 필터가 반응했다" 자체가 완전한 무신호는 아니라서
     약하게(+0.1)는 반영한다."""
+    # 가장 강한 신호: SQL 에러 시그니처로 DB 엔진이 확인됐다(detected_db). 에러가 응답에
+    # 떴다는 건 우리 입력이 실제 쿼리에 도달해 구문을 깨뜨렸다는 뜻이라 사실상 주입 확정이다.
+    # waf/sqli_signal보다 먼저, 그리고 훨씬 강하게 올려 다른 유형(예: XSS reflects_html)에
+    # 우선순위가 밀리지 않게 한다.
+    if db.get('detected_db'):
+        before = hints.get('sqli', 0.0)
+        hints['sqli'] = min(1.0, max(before + 0.4, 0.9))
+        return f"SQL 에러 시그니처로 DB({db.get('detected_db')}) 확인 — 사실상 주입 확정 → sqli {before}→{hints['sqli']}"
+
     waf_blocked = db.get('waf_blocked', False)
     if waf_blocked and block_ratio < _SELECTIVE_BLOCK_THRESHOLD:
         before = hints.get('sqli', 0.0)

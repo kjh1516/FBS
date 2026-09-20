@@ -154,12 +154,13 @@ class InferenceEngine:
 
     def _probe_blind(self, surface: AttackSurface) -> bool | None:
         core    = f"fbs{uuid4().hex[:8]}"
-        # 꺾쇠/따옴표를 코어와 함께 실어, '반사 여부'(코어 존재)와 'HTML 메타문자가
-        # 이스케이프 없이 살아남는지'(XSS 전제)를 같은 요청 하나로 같이 관측한다 —
-        # 추가 요청 없이 XSSStrategy.can_handle이 쓸 신호를 만든다. 단순 반사(SQLi 폼도
-        # 반사함)와 'XSS 가능한 반사'를 구분하려는 것: SQLi 출력은 보통 <,>를 엔티티로
-        # 이스케이프하지만, 반사형 XSS 싱크는 <,>를 원형 그대로 돌려준다.
-        canary  = f"'\"<{core}>"
+        # '반사 여부'(코어 존재)와 'HTML 메타문자가 이스케이프 없이 살아남는지'(XSS 전제)를
+        # 같은 요청 하나로 관측하되, SQL을 깨지 않는 문자만 쓴다. 예전엔 코어 앞에 '"(따옴표)를
+        # 실었는데, uid='{입력}' 같은 문자열 컨텍스트에 주입되면 그 따옴표가 쿼리를 깨서 500을
+        # 유발 → 입력이 반사조차 안 돼 'blind'로 오판했다(실제로는 반사 사이트인데). 꺾쇠 <>는
+        # 문자열 리터럴 안에서 SQL을 깨지 않으면서, 이스케이프 없이 반사되는지(XSS 전제)를 그대로
+        # 보여준다. 따옴표 필터/주입 판정은 recon의 error probe가 따로 담당하므로 여기서 뺀다.
+        canary  = f"<{core}>"
         enctype = surface.extra.get('enctype', '')
         params  = {p: '' for p in (surface.extra.get('all_params') or [])}
         params[surface.param] = canary
