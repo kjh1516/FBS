@@ -1,4 +1,6 @@
 import time
+import random
+import string
 import difflib
 import requests
 from urllib.parse import urljoin
@@ -276,6 +278,11 @@ class DBDetect:
         # 개별 확인한다 — SQLi 신호가 없어도(quote가 안 막혀도) 독립적으로 실행된다.
         filter_map = self._probe_filter_map(url, method, data, target, baseline_body)
 
+        # 반사 신호 — 이 필드가 응답에 그대로 반사되는지/어느 HTML 컨텍스트인지/꺾쇠가
+        # 이스케이프 없이 사는지를 한 번에 측정한다. 모든 전략의 공용 신호(XSS는 이걸로
+        # 바로 동작하고, SQLi 등은 blind 여부로 쓴다)라 recon에서 한 번만 잰다.
+        reflection = self.probe_reflection(url, method, data, target)
+
         return {
             'case':             case,
             'baseline_anomaly': baseline_anomaly,
@@ -285,6 +292,7 @@ class DBDetect:
             'sqli_signal':      sqli_signal,
             'waf_blocked':      waf_blocked,
             'filter_map':       filter_map,
+            'reflection':       reflection,
             # detect_db_from_error()로 이미 확인된 DB 엔진 이름(SQL_DIALECTS의 키와 동일한
             # 표기: SQLite/MySQL/PostgreSQL/MSSQL/Oracle) — 지금까진 db_hint 문구를 만드는
             # 데만 쓰고 버렸는데, sqli.py가 재탐지 없이 그대로 재사용할 수 있게 노출한다.
@@ -421,6 +429,87 @@ class DBDetect:
             return 'redirect'      # 리다이렉트 (인증 우회 가능성)
         return 'status_change'     # 기타 상태 코드 변화
 
+    # ── 반사 신호 (모든 전략 공용) ────────────────────────────────────────────
+
+    # 생존을 측정하는 메타문자. 따옴표(',")는 문자열 컨텍스트 SQL을 깨서 반사 자체를
+    # 못 보게 만들 수 있으므로(=반사 사이트를 blind로 오판) 여기선 넣지 않는다 — 꺾쇠만
+    # 잰다. 따옴표 생존은 XSS strategy가 페이로드를 실제로 쏴 보고 exec_sig로 확인한다.
+    _REFLECT_METACHARS = ('<', '>')
+
+    def probe_reflection(self, url: str, method: str, data: dict, target: str) -> dict | None:
+        """이 필드가 응답에 반사되는지 + 반사 위치(HTML 컨텍스트) + 꺾쇠 생존을 한 번에 잰다.
+
+        중립 코어(영숫자) 뒤에 'LT<GT>'를 붙여 보낸다. 따옴표가 없어 문자열 컨텍스트
+        SQL을 깨지 않으므로, 반사 사이트를 500 에러로 blind 오판하지 않는다.
+
+        반환:
+          {'reflected': bool, 'contexts': [...], 'survived': [생존 메타문자], 'tested': ['<','>']}
+          None — 요청 실패 또는 WAF 차단(반사/blind 판정 불가)
+        """
+        core = 'fbsr' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        probe = f"{core}LT<GT>"
+        resp, _elapsed, _err = self._send(url, method, {**data, target: probe})
+        if resp is None:
+            return None
+        body = resp.text
+        if self._detect_waf_body(body):
+            return None
+        tested = list(self._REFLECT_METACHARS)
+        if core not in body:
+            return {'reflected': False, 'contexts': [], 'survived': [], 'tested': tested}
+        contexts = self._reflection_contexts(body, core)
+        survived = []
+        if 'LT<' in body:
+            survived.append('<')
+        if 'GT>' in body:
+            survived.append('>')
+        return {'reflected': True, 'contexts': contexts, 'survived': survived, 'tested': tested}
+
+    def _reflection_contexts(self, body: str, marker: str) -> list[str]:
+        """marker가 반사된 모든 위치의 HTML 컨텍스트를 분류한다. raw 문자열을 파서에 넣으면
+        주입 마커가 파싱을 깨서 위치를 잃기 쉬우므로, marker 인덱스 주변 원문을 직접 스캔하는
+        휴리스틱으로 분류한다(범용 XSS 스캐너의 고전적 접근)."""
+        found = []
+        start = 0
+        while True:
+            i = body.find(marker, start)
+            if i == -1:
+                break
+            found.append(self._classify_one(body, i))
+            start = i + len(marker)
+        return found or ['html']
+
+    @staticmethod
+    def _classify_one(body: str, i: int) -> str:
+        before = body[:i]
+
+        # <script> ... </script> 내부?
+        s_open = before.rfind('<script')
+        s_close = before.rfind('</script')
+        if s_open != -1 and s_open > s_close:
+            return 'js'
+
+        # <!-- ... --> 주석 내부?
+        c_open = before.rfind('<!--')
+        c_close = before.rfind('-->')
+        if c_open != -1 and c_open > c_close:
+            return 'comment'
+
+        last_lt = before.rfind('<')
+        last_gt = before.rfind('>')
+        if last_lt > last_gt:
+            # 태그 여는 '<' 이후 아직 '>'로 안 닫힘 → 태그 내부(속성 영역)
+            tag_frag = before[last_lt:]
+            # 현재 위치가 열린 따옴표 안인지: 태그 시작 이후 따옴표 개수가 홀수면 그 안쪽
+            if tag_frag.count('"') % 2 == 1:
+                return 'attr_double'
+            if tag_frag.count("'") % 2 == 1:
+                return 'attr_single'
+            return 'attr_unquoted'
+
+        # 그 외 — 태그 사이 일반 텍스트
+        return 'html'
+
     @staticmethod
     def _extract_snippet(body: str, context: int = 200) -> str | None:
         """에러 시그니처 주변 텍스트를 추출한다."""
@@ -501,6 +590,17 @@ class Recon:
                 if filter_map:
                     blocked_tokens = [t for t, b in filter_map.items() if b]
                     print(f"    필터 지도 : {len(blocked_tokens)}/{len(filter_map)}개 토큰 차단 — {blocked_tokens}")
+                reflection = db.get('reflection')
+                if reflection is None:
+                    print(f"    반사 여부 : 측정 불가 (요청 실패 또는 WAF 차단)")
+                elif not reflection.get('reflected'):
+                    print(f"    반사 여부 : 반사 안 됨 (blind)")
+                else:
+                    survived = reflection.get('survived') or []
+                    tested   = reflection.get('tested') or []
+                    ctxs = ', '.join(sorted(set(reflection.get('contexts') or [])))
+                    surv = ' '.join(c for c in tested if c in survived) or '없음'
+                    print(f"    반사 여부 : 반사됨 | 컨텍스트={ctxs} | 꺾쇠 생존={surv}")
                 for payload, result in (db.get('error') or {}).items():
                     if result.get('probe_like_default'):
                         db_type = '탐지 가능성 높음'

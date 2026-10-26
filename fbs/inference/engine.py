@@ -1,14 +1,13 @@
 import sqlite3
 import json
 import argparse
-from uuid import uuid4
 from datetime import datetime, timezone
 
 import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
 from fbs.inference.profiler import Profiler
-from fbs.inference.recon import Recon, _WAF_BODY_SIGNATURES
+from fbs.inference.recon import Recon, DBDetect
 from fbs.inference.waf import WafDetector
 from fbs.inference.strategies.base import BaseStrategy
 
@@ -147,66 +146,31 @@ class InferenceEngine:
 
     # ── 동적 blind 탐지 ───────────────────────────────────────────────────────
 
-    @staticmethod
-    def _is_waf_response(resp) -> bool:
-        lower = resp.text.lower()
-        return any(sig in lower for sig in _WAF_BODY_SIGNATURES)
-
-    def _probe_blind(self, surface: AttackSurface) -> bool | None:
-        core    = f"fbs{uuid4().hex[:8]}"
-        # '반사 여부'(코어 존재)와 'HTML 메타문자가 이스케이프 없이 살아남는지'(XSS 전제)를
-        # 같은 요청 하나로 관측하되, SQL을 깨지 않는 문자만 쓴다. 예전엔 코어 앞에 '"(따옴표)를
-        # 실었는데, uid='{입력}' 같은 문자열 컨텍스트에 주입되면 그 따옴표가 쿼리를 깨서 500을
-        # 유발 → 입력이 반사조차 안 돼 'blind'로 오판했다(실제로는 반사 사이트인데). 꺾쇠 <>는
-        # 문자열 리터럴 안에서 SQL을 깨지 않으면서, 이스케이프 없이 반사되는지(XSS 전제)를 그대로
-        # 보여준다. 따옴표 필터/주입 판정은 recon의 error probe가 따로 담당하므로 여기서 뺀다.
-        canary  = f"<{core}>"
-        enctype = surface.extra.get('enctype', '')
-        params  = {p: '' for p in (surface.extra.get('all_params') or [])}
-        params[surface.param] = canary
-
-        try:
-            if surface.method == 'GET':
-                resp = requests.get(surface.url, params=params, timeout=5)
-            elif 'application/json' in enctype:
-                resp = requests.request(surface.method, surface.url, json=params, timeout=5)
-            else:
-                resp = requests.request(surface.method, surface.url, data=params, timeout=5)
-
-            if self._is_waf_response(resp):
-                return None  # WAF 차단 응답 — blind 판정 불가
-            body = resp.text
-            # 꺾쇠가 이스케이프 없이 그대로 반사되면 XSS 전제 충족으로 표시(can_handle이 사용).
-            surface.extra['reflects_html'] = f"<{core}>" in body
-            reflected = core in body
-            return not reflected  # 반사되면 False(reflected), 없으면 True(blind)
-        except Exception:
-            return None
-
     def _verify_blind(self, surfaces: list[AttackSurface]):
-        """정적 추론 결과를 캐너리 프로브로 검증하고 불일치를 로그로 남긴다."""
-        print(f"\n# [동적 검증] blind 여부 캐너리 프로브 시작")
-        for s in surfaces:
-            if s.extra.get('waf_blocked'):
-                print(f"  SKIP     {s.param} | WAF 차단 확인 — blind 판정 생략 (수동 확인 필요)")
-                continue
+        """recon이 커버하지 못한 표면만 조건부로 반사 프로브한다.
 
-            static  = s.blind
-            dynamic = self._probe_blind(s)
-            if dynamic is None:
-                print(f"  SKIP     {s.param} | 요청 실패 또는 WAF 차단")
+        반사 검사는 recon(DBDetect.probe_reflection) 한 곳으로 통일됐다 — 페이지 표면은
+        recon이 이미 쟀고 profiler가 그 측정값으로 blind를 설정하므로 여기선 건드리지 않는다.
+        reflection 신호가 없는 표면(버튼 클릭이 캡처한 API 필드 등 recon 미커버)만 같은
+        헬퍼로 fallback 프로브해 blind/reflects_html을 채운다. blind = 반사 안 됨."""
+        pending = [s for s in surfaces
+                   if not s.extra.get('waf_blocked') and s.extra.get('reflection') is None]
+        if not pending:
+            return  # 모든 표면의 반사를 recon이 이미 측정 — 추가 프로브 불필요
+        print(f"\n# [동적 검증] recon 미커버 표면 {len(pending)}개 반사 프로브")
+        detector = DBDetect(session=self.session)
+        for s in pending:
+            data = {p: 'test' for p in (s.extra.get('all_params') or [])}
+            refl = detector.probe_reflection(s.url, s.method, data, s.param)
+            if refl is None:
+                print(f"  SKIP   {s.param} | 요청 실패 또는 WAF 차단")
                 continue
-            elif dynamic:
-                result_str = 'blind'
-            else:
-                result_str = 'reflected'
-
-            if static != dynamic:
-                print(f"  MISMATCH {s.param} | 정적={static} → 동적={dynamic} ({result_str})")
-                s.blind = dynamic
-            else:
-                print(f"  OK       {s.param} | blind={dynamic} ({result_str})")
-                s.blind = dynamic
+            s.extra['reflection'] = refl
+            survived = refl.get('survived') or ()
+            s.extra['reflects_html'] = bool(
+                refl.get('reflected') and '<' in survived and '>' in survived)
+            s.blind = not refl.get('reflected')
+            print(f"  PROBE  {s.param} | blind={s.blind} ({'blind' if s.blind else 'reflected'})")
 
     # ── 메인 루프 ─────────────────────────────────────────────────────────────
 

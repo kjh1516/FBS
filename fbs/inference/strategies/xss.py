@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import random
 import string
 import threading
@@ -11,35 +12,44 @@ from fbs.inference.waf import classify_waf_block
 from fbs.inference.strategies.base import BaseStrategy
 
 """
-Reflected XSS strategy (MVP).
+Reflected XSS strategy.
 
 web_scanner/pipelines/xss.py(Scrapy 콜백 체인)의 '탐지 로직'만 가져오고 배관은
 FBS 추론 엔진(동기 requests.Session + AttackSurface + VulnResult)에 맞춰 새로 썼다.
-옛 코드에서 실제로 재활용한 발상:
-  - 컨텍스트별 페이로드 택소노미(html/attr/script/...)
-  - "마커가 baseline에 이미 있으면 스킵"으로 기존 문자열 오탐 방지
-  - escaped vs unescaped 구분 → 여기서는 "실행 가능 시그니처 verbatim 매칭"으로 강화
-  - Playwright를 별도 스레드 + ProactorEventLoop로 돌려 동기 문맥에서 실행 확인
-    (Windows에서 chromium subprocess를 띄우려면 ProactorEventLoop가 필요)
-  - dialog 핸들러로 alert() 메시지를 포획해 실제 실행을 확정
 
-옛 코드와 달라진 점:
-  - 페이로드를 난사하지 않고, 중립 카나리를 먼저 주입해 '반사 위치(컨텍스트)'를
-    분류한 뒤 그 컨텍스트에 맞는 페이로드만 보낸다(요청 수/오탐 감소).
-  - 반사형도 Playwright로 실제 실행(alert 발화)을 확인한다(옛 코드는 stored만 확인).
+설계 철학: "반사됐다 ≠ 취약하다. 실행을 증명하라."
+  정적 추정 대신 측정으로, 최종 판정은 실제 브라우저 실행(alert 발화)으로 한다.
 
-시퀀스:
-  baseline → 카나리 반사/컨텍스트 분류 → 컨텍스트별 페이로드 전송(raw 반사 확인)
-  → raw 반사된 후보들을 브라우저 1세션에서 실행 확인 → VulnResult
+반사 여부·반사 컨텍스트·꺾쇠 생존은 recon(DBDetect.probe_reflection)이 이미 측정해
+surface.extra['reflection']에 실어 둔다 — 반사 검사는 스캐너 전체에서 recon 한 곳으로
+통일됐고(SQLi 등 다른 전략도 blind 판정에 공용으로 쓴다), XSS는 그 신호를 받아 쓴다.
+
+탐지 파이프라인(표면 1개):
+  ① reflection 신호 소비 → 반사 안 됐으면 종료(반사형 XSS 아님)
+  ② 페이로드 선택 → (컨텍스트 ∩ 생존 문자)에 맞는 것만 — breakout 불가한 건 안 쏨
+  ③ raw 반사 확인 → 실행 시그니처(exec_sig)가 이스케이프 없이 그대로 박혔는가
+  ④ 브라우저 실행 → alert(marker) 실제 발화 → HIGH / 미발화 → MEDIUM
+
+recon이 '<'가 전부 &lt;로 치환됨을 이미 쟀으면, ②에서 태그 주입 페이로드를 아예
+발사하지 않는다(요청 수·대상 소음·오탐 감소). 단 recon은 SQL을 깨지 않으려 꺾쇠(<,>)만
+재므로, 따옴표(',") 생존은 ③에서 페이로드를 실제로 쏴 exec_sig로 확인한다.
+
+마커:
+  모든 토큰은 self-describing이다 — prefix + 표면태그(url/method/param 해시 6자리)
+  + nonce(4자리). 전부 영숫자라 어떤 컨텍스트에서도 리터럴로 생존하고, 발견된
+  마커만으로 '어느 표면에서 왔는지'를 식별할 수 있다. 실행 마커는 _markers
+  레지스트리에 (마커 → 주입점)으로 기록된다 — 지금은 반사형 귀속/진단용이지만,
+  주입점≠반사점인 stored XSS에서 역추적의 토대가 된다.
 
 확정 단계:
-  - 브라우저에서 alert(marker)가 실제로 발화 → HIGH (실행 확정)
+  - 브라우저에서 alert(marker) 실제 발화 → HIGH (실행 확정)
   - raw 반사는 됐지만 브라우저 미가용/미발화 → MEDIUM (반사 확인, 실행 미확정)
 
 아직 안 하는 것(TODO, 의도적으로 범위 밖):
-  - Stored XSS(고유 마커 주입 후 다른 페이지 싱크 확인)
+  - Stored XSS(전 표면 마커 주입 → 크롤 스윕 → 레지스트리 역추적 → 실행 확인)
   - DOM-based XSS(소스→싱크 JS 흐름)
   - XSS 전용 WAF 우회(EVASION_TRANSFORMS는 SQL 키워드용이라 XSS엔 부적합)
+  - blind/봇 XSS(OOB 콜라보레이터 필요)
 """
 
 
@@ -49,42 +59,45 @@ class XSSStrategy(BaseStrategy):
     TIMEOUT = 10
     # 브라우저에서 폼 제출 후 alert/네비게이션을 기다리는 시간(ms).
     BROWSER_WAIT_MS = 1500
-    # 카나리: 순수 영숫자라 어떤 컨텍스트에서도 이스케이프/인코딩 없이 그대로 반사된다.
-    _CANARY_PREFIX = 'fbsxc'
+
+    # 실행 확인용 마커 prefix. 실제 마커 = prefix + 표면태그(6) + nonce(4), 전부 영숫자.
     _MARKER_PREFIX = 'fbsxm'
 
-    # 컨텍스트별 페이로드 템플릿. {M}=실행 확인용 마커(영숫자).
+    # 컨텍스트별 페이로드 택소노미. {M}=실행 확인용 마커(영숫자).
     #   payload   : 필드에 실제로 넣을 문자열
     #   exec_sig  : 이 문자열이 '이스케이프되지 않고' 응답에 그대로 박혔는지 확인할 핵심
     #               실행 시그니처(verbatim 매칭). 서버가 <,>,",' 중 하나라도 엔티티로
     #               바꾸면 이 시그니처가 깨져 매칭 실패 → raw 반사 아님으로 본다.
+    #   requires  : 이 페이로드가 breakout에 반드시 필요로 하는 메타문자 집합.
+    #               recon이 측정한 생존 문자(tested ∩ requires)에 죽은 게 있으면 발사 전
+    #               스킵한다. recon은 꺾쇠(<,>)만 재므로 따옴표 요구는 ③ exec_sig로 거른다.
     # alert 따옴표는 컨텍스트 breakout 따옴표와 겹치지 않게 고른다.
-    _CONTEXT_PAYLOADS: dict[str, list[tuple[str, str]]] = {
+    _CONTEXT_PAYLOADS: dict[str, list[tuple[str, str, frozenset]]] = {
         # 태그 사이 텍스트 — 바로 태그 주입
         'html': [
-            ("<img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')"),
-            ("<svg/onload=alert('{M}')>",        "<svg/onload=alert('{M}')"),
+            ("<img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')", frozenset({'<', '>'})),
+            ("<svg/onload=alert('{M}')>",        "<svg/onload=alert('{M}')",        frozenset({'<', '>'})),
         ],
         # 겹따옴표 속성값 — "> 로 빠져나옴 (alert는 홑따옴표)
         'attr_double': [
-            ('"><img src=x onerror=alert(\'{M}\')>', "<img src=x onerror=alert('{M}')"),
+            ('"><img src=x onerror=alert(\'{M}\')>', "<img src=x onerror=alert('{M}')", frozenset({'"', '<', '>'})),
         ],
         # 홑따옴표 속성값 — '> 로 빠져나옴 (alert는 겹따옴표)
         'attr_single': [
-            ("'><img src=x onerror=alert(\"{M}\")>", '<img src=x onerror=alert("{M}")'),
+            ("'><img src=x onerror=alert(\"{M}\")>", '<img src=x onerror=alert("{M}")', frozenset({"'", '<', '>'})),
         ],
         # 따옴표 없는 속성값 — 새 이벤트 핸들러 + autofocus로 상호작용 없이 발화
         'attr_unquoted': [
-            (" autofocus onfocus=alert('{M}') x=", "onfocus=alert('{M}')"),
+            (" autofocus onfocus=alert('{M}') x=", "onfocus=alert('{M}')", frozenset({"'"})),
         ],
         # <script> 내부 — </script>로 스크립트를 닫고 태그 주입(가장 견고)
         'js': [
-            ("</script><img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')"),
-            ("';alert('{M}');//",                          "alert('{M}')"),
+            ("</script><img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')", frozenset({'<', '>'})),
+            ("';alert('{M}');//",                          "alert('{M}')",                   frozenset({"'"})),
         ],
         # HTML 주석 내부 — -->로 주석을 닫고 태그 주입
         'comment': [
-            ("--><img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')"),
+            ("--><img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')", frozenset({'<', '>'})),
         ],
     }
 
@@ -92,6 +105,9 @@ class XSSStrategy(BaseStrategy):
         self.session = session or requests.Session()
         # Playwright 가용 여부를 프로세스 단위로 한 번만 판정해 캐싱(매번 import 시도 안 함).
         self._browser_available: bool | None = None
+        # 마커 레지스트리: {실행 마커 → {url, method, param, context, payload}}.
+        # 반사형에선 귀속/진단용, stored에선 역추적의 토대.
+        self._markers: dict[str, dict] = {}
 
     # ── BaseStrategy 인터페이스 ──────────────────────────────────────────────
 
@@ -104,7 +120,7 @@ class XSSStrategy(BaseStrategy):
         hints = surface.extra.get('hints', {})
         if hints.get('xss', 0.0) > 0:
             return True
-        # 필드명 힌트가 없어도, 엔진의 blind 프로브가 'HTML 메타문자(<,>)가 이스케이프
+        # 필드명 힌트가 없어도, recon의 반사 프로브가 'HTML 메타문자(<,>)가 이스케이프
         # 없이 반사됨'을 관측했으면(reflects_html) XSS 전제가 충족된 것 — 이건 단순 반사
         # (SQLi 등도 반사함)와 달리 XSS에 특정적인 신호라, 여기서만 동작을 시작해 과도
         # 트리거를 막는다. param/memo처럼 이름만으론 아무 힌트도 못 받는 진짜 반사형
@@ -124,31 +140,35 @@ class XSSStrategy(BaseStrategy):
         return base
 
     def run(self, surface: AttackSurface) -> list[VulnResult]:
-        base_fields = self._base_fields(surface)
-
-        # 0. baseline — 마커/카나리가 원래 페이지에 이미 있었는지 확인용
-        status, baseline_body, _ = self._send(surface, dict(base_fields))
-        if status is None:
-            print("    [XSS] baseline 요청 실패 — 스킵")
-            return []
-
-        # 1. 카나리로 반사 여부 + 컨텍스트 분류
-        canary = self._rand_token(self._CANARY_PREFIX)
-        status, body, _ = self._send(surface, {**base_fields, surface.param: canary})
-        if status is None:
-            return []
-        if canary not in body:
+        # ① recon이 측정한 반사 신호 소비 — 반사 검사는 스캐너 전체에서 recon 한 곳으로 통일.
+        refl = surface.extra.get('reflection') or {}
+        if not refl.get('reflected'):
             print("    [XSS] 입력이 응답에 반사되지 않음 — 반사형 XSS 아님 (blind/stored는 범위 밖)")
             return []
+        contexts = refl.get('contexts') or ['html']
+        survived = set(refl.get('survived') or [])
+        tested   = set(refl.get('tested') or [])
+        shown = ' '.join(c for c in ('<', '>') if c in survived) or '없음'
+        print(f"    [XSS] 반사 확인(recon) — 컨텍스트: {', '.join(sorted(set(contexts)))} / 꺾쇠 생존: {shown}")
 
-        contexts = self._reflection_contexts(body, canary)
-        print(f"    [XSS] 반사 확인 — 컨텍스트: {', '.join(sorted(set(contexts)))}")
+        base_fields = self._base_fields(surface)
 
-        # 2. 컨텍스트별 페이로드 전송 → raw 반사(이스케이프 안 됨) 후보 수집
+        # baseline — 마커가 원래 페이지에 이미 있었는지 확인용(사전존재 오탐 방지)
+        status, baseline_body, _ = self._send(surface, dict(base_fields))
+        if status is None:
+            baseline_body = ''
+
+        # ② 컨텍스트별 페이로드 전송 → ③ raw 반사(이스케이프 안 됨) 후보 수집
         candidates = []  # [{context, payload, marker, fields}]
         for ctx in sorted(set(contexts)):
-            for template, sig_template in self._CONTEXT_PAYLOADS.get(ctx, []):
-                marker = self._rand_token(self._MARKER_PREFIX)
+            for template, sig_template, requires in self._CONTEXT_PAYLOADS.get(ctx, []):
+                # 발사 전 프루닝: recon이 '측정한'(tested) 문자 중 breakout 필요문자가 죽었으면
+                # 스킵. 따옴표처럼 recon이 안 잰 문자는 여기서 안 거르고 ③ exec_sig로 판정한다.
+                dead = (requires & tested) - survived
+                if dead:
+                    print(f"      · {ctx}: breakout 필요문자({''.join(sorted(dead))}) 이스케이프됨 — 발사 전 스킵")
+                    continue
+                marker = self._new_token(surface, self._MARKER_PREFIX)
                 if marker in baseline_body:
                     continue  # 극히 드문 충돌 — 안전하게 스킵
                 payload = template.format(M=marker)
@@ -162,6 +182,7 @@ class XSSStrategy(BaseStrategy):
                     continue
                 if exec_sig in p_body:
                     print(f"      · {ctx}: raw 반사 확인 (실행 시그니처 원형 유지)")
+                    self._register_marker(surface, marker, ctx, payload)
                     candidates.append({
                         'context': ctx,
                         'payload': payload,
@@ -176,7 +197,7 @@ class XSSStrategy(BaseStrategy):
             print("    [XSS] 실행 가능한 raw 반사 후보 없음 — 취약점 아님")
             return []
 
-        # 3. 브라우저로 실제 실행(alert 발화) 확인
+        # ④ 브라우저로 실제 실행(alert 발화) 확인
         fired = self._run_browser_confirm(surface, candidates)
 
         if fired is None:
@@ -227,54 +248,31 @@ class XSSStrategy(BaseStrategy):
         except Exception:
             return None, '', time.monotonic() - start
 
-    # ── 반사 컨텍스트 분류 ────────────────────────────────────────────────────
+    # ── 마커 ─────────────────────────────────────────────────────────────────
 
-    def _reflection_contexts(self, body: str, marker: str) -> list[str]:
-        """marker가 반사된 모든 위치의 HTML 컨텍스트를 분류한다.
+    def _surface_tag(self, surface: AttackSurface) -> str:
+        """표면(url/method/param)에 대한 안정적인 6자리 16진 태그 — 같은 표면은 항상
+        같은 태그를 받는다. 마커에 심어 '어느 표면발(發) 반사인지'를 식별하는 데 쓴다."""
+        raw = f"{surface.method} {surface.url} {surface.param}"
+        return hashlib.md5(raw.encode('utf-8', 'replace')).hexdigest()[:6]
 
-        raw 문자열을 파서로 넣으면 주입 마커가 파싱을 깨서 위치를 잃기 쉬우므로,
-        marker 인덱스 주변 원문을 직접 스캔하는 휴리스틱으로 분류한다(범용 XSS 스캐너의
-        고전적 접근)."""
-        found = []
-        start = 0
-        while True:
-            i = body.find(marker, start)
-            if i == -1:
-                break
-            found.append(self._classify_one(body, i))
-            start = i + len(marker)
-        return found or ['html']
+    def _new_token(self, surface: AttackSurface, prefix: str) -> str:
+        """self-describing 토큰 = prefix + 표면태그(6) + nonce(4). 전부 영숫자라
+        어떤 컨텍스트에서도 이스케이프/인코딩 없이 리터럴로 생존한다."""
+        nonce = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        return f"{prefix}{self._surface_tag(surface)}{nonce}"
 
-    @staticmethod
-    def _classify_one(body: str, i: int) -> str:
-        before = body[:i]
-
-        # <script> ... </script> 내부?
-        s_open = before.rfind('<script')
-        s_close = before.rfind('</script')
-        if s_open != -1 and s_open > s_close:
-            return 'js'
-
-        # <!-- ... --> 주석 내부?
-        c_open = before.rfind('<!--')
-        c_close = before.rfind('-->')
-        if c_open != -1 and c_open > c_close:
-            return 'comment'
-
-        last_lt = before.rfind('<')
-        last_gt = before.rfind('>')
-        if last_lt > last_gt:
-            # 태그 여는 '<' 이후 아직 '>'로 안 닫힘 → 태그 내부(속성 영역)
-            tag_frag = before[last_lt:]
-            # 현재 위치가 열린 따옴표 안인지: 태그 시작 이후 따옴표 개수가 홀수면 그 안쪽
-            if tag_frag.count('"') % 2 == 1:
-                return 'attr_double'
-            if tag_frag.count("'") % 2 == 1:
-                return 'attr_single'
-            return 'attr_unquoted'
-
-        # 그 외 — 태그 사이 일반 텍스트
-        return 'html'
+    def _register_marker(self, surface: AttackSurface, marker: str,
+                         context: str, payload: str) -> None:
+        """실행 마커를 (마커 → 주입점)으로 레지스트리에 기록. 반사형에선 귀속/진단용,
+        stored에선 반사점에서 발견한 마커로 주입점을 역추적하는 토대."""
+        self._markers[marker] = {
+            'url': surface.url,
+            'method': surface.method,
+            'param': surface.param,
+            'context': context,
+            'payload': payload,
+        }
 
     # ── 브라우저 실행 확인 (Playwright) ───────────────────────────────────────
 
@@ -407,14 +405,9 @@ class XSSStrategy(BaseStrategy):
             detail={
                 'context': cand['context'],
                 'marker': cand['marker'],
+                'surface_tag': self._surface_tag(surface),
                 'confirmed_by': 'browser' if confirmed else 'reflection',
                 'alert_message': alert_msg,
                 'note': note,
             },
         )
-
-    # ── 유틸 ─────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _rand_token(prefix: str) -> str:
-        return prefix + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))

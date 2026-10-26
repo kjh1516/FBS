@@ -279,6 +279,30 @@ def _apply_filter_map_signal(hints: dict, filter_map: dict[str, bool] | None) ->
     return '; '.join(notes) if notes else None
 
 
+def _reflection_extra(db: dict) -> dict:
+    """recon의 reflection 신호를 surface.extra로 옮긴다. reflects_html(=꺾쇠가 이스케이프
+    없이 반사됨)은 XSS can_handle/priority가 쓰는 게이팅 불리언 — 반사 출처만 engine에서
+    recon으로 옮겼을 뿐 판정 정책은 그대로다. 전체 reflection(contexts/survived)은 XSS가
+    발사 전 컨텍스트·메타문자 프루닝에 쓴다."""
+    refl = db.get('reflection')
+    survived = (refl or {}).get('survived') or ()
+    reflects_html = bool(refl and refl.get('reflected')
+                         and '<' in survived and '>' in survived)
+    return {'reflection': refl, 'reflects_html': reflects_html}
+
+
+def _blind_value(db: dict, hints: dict, response_type: str, waf_blocked: bool) -> bool | None:
+    """blind 여부 결정값. recon이 반사를 측정했으면(reflection) 그 측정값이 진실이다 —
+    reflected면 blind=False. 측정이 없으면(recon 미커버 표면이거나 프로브 실패) 정적
+    추론으로 fallback하고, 그런 표면은 engine의 _verify_blind가 따로 프로브한다."""
+    if waf_blocked:
+        return None
+    refl = db.get('reflection')
+    if refl is not None:
+        return not refl.get('reflected')
+    return _infer_blind(hints, response_type)
+
+
 def _infer_blind(hints: dict, response_type: str) -> bool | None:
     """정적 추론: hints + response_type으로 blind 여부 초기값 결정."""
     # sqli >= 0.7 → 인증 계열 필드 → 기술 스택 boost로 xss가 높아져도 blind 우선
@@ -360,7 +384,7 @@ class Profiler:
                 param=param,
                 page=page,
                 response_type=rt,
-                blind=None if waf_blocked else _infer_blind(hints, rt),
+                blind=_blind_value(db, hints, rt, waf_blocked),
                 extra={
                     'hints':       hints,
                     'waf_blocked': waf_blocked,
@@ -368,6 +392,7 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
+                    **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
                         'tech_matches':  tech_matches,
@@ -414,7 +439,7 @@ class Profiler:
                     param=param,
                     page=page,
                     response_type=rt,
-                    blind=None if waf_blocked else _infer_blind(hints, rt),
+                    blind=_blind_value(db, hints, rt, waf_blocked),
                     extra={
                         'hints':          hints,
                         'waf_blocked':    waf_blocked,
@@ -426,6 +451,7 @@ class Profiler:
                         'all_params':     all_params,
                         'proxy_template': form.get('proxy_template'),
                         'proxy_field':    form.get('proxy_field'),
+                        **_reflection_extra(db),
                         'breakdown': {
                             'field_matches': field_matches,
                             'tech_matches':  tech_matches,
@@ -457,7 +483,7 @@ class Profiler:
                 param=param,
                 page=page,
                 response_type=rt,
-                blind=None if waf_blocked else _infer_blind(hints, rt),
+                blind=_blind_value(db, hints, rt, waf_blocked),
                 extra={
                     'hints':       hints,
                     'waf_blocked': waf_blocked,
@@ -465,6 +491,7 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
+                    **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
                         'tech_matches':  tech_matches,
@@ -509,7 +536,7 @@ class Profiler:
                 param=param,
                 page=page,
                 response_type=rt,
-                blind=None if waf_blocked else _infer_blind(hints, rt),
+                blind=_blind_value(db, hints, rt, waf_blocked),
                 extra={
                     'hints':       hints,
                     'waf_blocked': waf_blocked,
@@ -520,6 +547,7 @@ class Profiler:
                     'enctype':     enctype,
                     'all_params':  entry.get('known_fields') or {},
                     'discovery_evasion': discovery_evasion,
+                    **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
                         'tech_matches':  tech_matches,
