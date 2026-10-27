@@ -163,13 +163,6 @@ def _tech_boost(tech_stack: dict) -> tuple[dict[str, float], list[tuple[str, str
     return boost, matches
 
 
-def _merge_hints(field_hints: dict, tech_boost: dict) -> dict[str, float]:
-    merged = dict(field_hints)
-    for vuln, w in tech_boost.items():
-        merged[vuln] = min(1.0, merged.get(vuln, 0.0) + w)
-    return merged
-
-
 def _collect_group_hints(page: dict) -> dict[tuple, dict[str, float]]:
     """(url, method)로 묶이는, 같은 요청에 같이 실려가는 필드들끼리 필드명 매칭 점수의
     최댓값을 모아둔다. 형제 필드 중 하나(예: uid→sqli 0.8)가 이름으로 강한 신호를 받았으면,
@@ -224,59 +217,114 @@ def _group_hint_note(own: dict, merged: dict) -> str | None:
     return '형제 필드 신호 상속: ' + ', '.join(f'{v}+{w}' for v, w in boosted.items())
 
 
-def _apply_recon_signal(hints: dict, db: dict, block_ratio: float) -> str | None:
-    """recon 신호를 hints['sqli']에 반영하고 사람이 읽을 설명을 반환한다.
+# ── 점수 프레임: 증거 클래스 + prior ──────────────────────────────────────────
+# 힌트는 "어느 전략을 먼저 돌릴지"를 고르는 순위용이다(틀려도 fallback이 복구). 그래서
+# 점수를 가산으로 뭉개지 않고, 의미가 고정된 '증거 클래스'(큰 간격)로 배정하고 prior(이름/
+# 스택)는 밴드 안에서 동점처리로만 얹는다. 규칙:
+#   - 클래스 간 간격 > prior 폭  → 측정된 증거가 이름 추측을 '항상' 이긴다.
+#   - prior만 있으면 PRIOR 밴드(≤0.39)에 머문다 — 이름만으론 증거 밴드에 못 들어간다.
+#   - 0.70 = "입력이 인터프리터에 도달한 걸 측정으로 확인" — SQLi·XSS 공통 의미라 비교 가능.
+# 세부 신호→클래스 배정은 문제를 풀며 계속 붙인다(지금은 지배적 신호만 연결).
+_CLS_CONFIRMED  = 0.90   # 측정이 주입/실행을 입증 (예: SQL 에러 시그니처)
+_CLS_REACHED    = 0.70   # 입력이 인터프리터에 도달 (따옴표로 쿼리 깨짐 / 실행가능 반사)
+_CLS_SUGGESTIVE = 0.40   # 정황 증거 (선택적 필터 차단, 토큰 차단, escape된 실행 컨텍스트)
+_PRIOR_CEIL     = 0.39   # prior(이름/스택) 단독 상한 — 증거 밴드엔 못 들어감
+_PRIOR_TIE      = 0.09   # 증거가 있을 때 prior 기여(밴드 내 동점처리용)
 
-    WAF/필터 차단 자체를 '신호 없음'으로 보지 않는다 — 사이트 전역에서 이 필드처럼
-    막히는 게 소수(선택적 차단)라면, 개발자가 이 필드를 SQL 관련으로 인지하고 일부러
-    막았다는 뜻이라 sqli 점수를 크게 올린다(+0.3). 반대로 사이트 전역이 다 막힌다면
-    (균일 차단, 범용 인프라 WAF 추정) 이 신호만으로는 필드를 구분할 수 없어 확신도는
-    낮지만, "이 필드를 건드렸더니 필터가 반응했다" 자체가 완전한 무신호는 아니라서
-    약하게(+0.1)는 반영한다."""
-    # 가장 강한 신호: SQL 에러 시그니처로 DB 엔진이 확인됐다(detected_db). 에러가 응답에
-    # 떴다는 건 우리 입력이 실제 쿼리에 도달해 구문을 깨뜨렸다는 뜻이라 사실상 주입 확정이다.
-    # waf/sqli_signal보다 먼저, 그리고 훨씬 강하게 올려 다른 유형(예: XSS reflects_html)에
-    # 우선순위가 밀리지 않게 한다.
+
+def _banded(evidence_base: float | None, prior: float) -> float:
+    """증거 클래스 base가 있으면 그 밴드 + prior를 소수점 동점처리로, 없으면 prior만(≤0.39)."""
+    p = max(0.0, min(prior, 1.0))
+    if evidence_base is None:
+        return round(p * _PRIOR_CEIL, 3)
+    return round(evidence_base + p * _PRIOR_TIE, 3)
+
+
+def _sqli_evidence(db: dict, block_ratio: float) -> tuple[float | None, str | None]:
+    """recon 신호 → SQLi 증거 클래스. (base, note) 또는 (None, None)."""
     if db.get('detected_db'):
-        before = hints.get('sqli', 0.0)
-        hints['sqli'] = min(1.0, max(before + 0.4, 0.9))
-        return f"SQL 에러 시그니처로 DB({db.get('detected_db')}) 확인 — 사실상 주입 확정 → sqli {before}→{hints['sqli']}"
-
-    waf_blocked = db.get('waf_blocked', False)
-    if waf_blocked and block_ratio < _SELECTIVE_BLOCK_THRESHOLD:
-        before = hints.get('sqli', 0.0)
-        hints['sqli'] = min(1.0, hints.get('sqli', 0.0) + 0.3)
-        return f"선택적 필터 차단(전역 차단율 {block_ratio:.0%}) → sqli {before}→{hints['sqli']}"
-    if waf_blocked:
-        before = hints.get('sqli', 0.0)
-        hints['sqli'] = min(1.0, hints.get('sqli', 0.0) + 0.1)
-        return f"전역 균일 차단(차단율 {block_ratio:.0%}) — 신호는 약하지만 필터가 반응했다는 사실 자체는 무시 안 함 → sqli {before}→{hints['sqli']}"
+        return _CLS_CONFIRMED, f"SQL 에러 시그니처로 DB({db['detected_db']}) 확인 — 사실상 주입 확정"
+    # 따옴표가 쿼리를 깨뜨린 신호 = 입력이 SQL 인터프리터에 도달 → 도달 입증
+    if db.get('sqli_signal') and db.get('quote_char'):
+        return _CLS_REACHED, f"따옴표({db['quote_char']}) 신호로 쿼리 반응 확인 → 도달 입증"
+    # 선택적 필터 차단 = 개발자가 이 필드를 SQL로 인지하고 막았다 → 정황
+    if db.get('waf_blocked') and block_ratio < _SELECTIVE_BLOCK_THRESHOLD:
+        return _CLS_SUGGESTIVE, f"선택적 필터 차단(전역 {block_ratio:.0%})"
+    # 그 외 약신호(probe≈default 등). 균일 WAF는 유형을 못 가려 여기선 증거로 안 올림(iterate).
     if db.get('sqli_signal'):
-        before = hints.get('sqli', 0.0)
-        hints['sqli'] = min(1.0, hints.get('sqli', 0.0) + 0.2)
-        return f"recon 신호(db_hint={db.get('db_hint')}) → sqli {before}→{hints['sqli']}"
-    return None
+        return _CLS_SUGGESTIVE, f"recon 약신호(db_hint={db.get('db_hint')})"
+    return None, None
 
 
-def _apply_filter_map_signal(hints: dict, filter_map: dict[str, bool] | None) -> str | None:
-    """recon의 토큰별 필터 지도(DBDetect._probe_filter_map)를 hints에 반영한다.
+def _xss_evidence(db: dict) -> tuple[float | None, str | None]:
+    """recon 반사 신호 → XSS 증거 클래스. (base, note) 또는 (None, None)."""
+    refl = db.get('reflection')
+    if not refl:
+        return None, None
+    if refl.get('reflected'):
+        ctxs     = set(refl.get('contexts') or [])
+        survived = set(refl.get('survived') or [])
+        exec_ctx = ctxs & {'js', 'attr_unquoted', 'attr_single', 'attr_double'}
+        # 꺾쇠가 이스케이프 없이 생존 = 태그 주입 가능 → 도달 입증
+        if {'<', '>'} <= survived:
+            return _CLS_REACHED, f"반사+꺾쇠생존(컨텍스트={','.join(sorted(ctxs))}) → 도달 입증"
+        # 실행 컨텍스트 반사지만 꺾쇠 escape — 따옴표 breakout 여지(미확인) → 정황
+        if exec_ctx:
+            return _CLS_SUGGESTIVE, f"실행 컨텍스트 반사({','.join(sorted(exec_ctx))}) — 꺾쇠 escape, breakout 미확인"
+        return None, None
+    # 서버 반사는 없지만 DOM 싱크 반사 의심(JS가 URL→innerHTML 등) → 브라우저가 확정 → 도달급
+    if refl.get('dom_suspect'):
+        return _CLS_REACHED, f"DOM 반사 의심({refl.get('dom_source')}→{refl.get('dom_sink')}) — 브라우저 확정 필요"
+    return None, None
 
-    막힌 토큰 하나는 _FILTER_PROBE_TOKENS에서 자기한테 매핑된 vuln-type에만 점수를 준다 —
-    따옴표가 막혔다고 xss 점수가 오르는 식으로 다른 유형에 번지지 않는다. 여러 토큰이 같은
-    유형에 매핑돼 있으면(예: ', union, select 전부 sqli) 점수가 누적되고, 이는 그 유형에
-    대한 증거가 여러 개 겹쳤다는 뜻이라 자연스럽다."""
+
+def _filter_map_evidence(filter_map: dict[str, bool] | None) -> dict[str, tuple[float, str]]:
+    """토큰별 필터 지도 → 유형별 정황(SUGGESTIVE) 증거. 막힌 토큰은 _FILTER_PROBE_TOKENS에서
+    자기 유형에만 기여한다(따옴표 차단이 xss로 번지지 않음)."""
     if not filter_map:
-        return None
-    notes = []
+        return {}
+    by_vuln: dict[str, list[str]] = {}
     for token, blocked in filter_map.items():
         if not blocked:
             continue
-        for vuln, weight in _FILTER_PROBE_TOKENS.get(token, {}).items():
-            before = hints.get(vuln, 0.0)
-            hints[vuln] = min(1.0, hints.get(vuln, 0.0) + weight)
-            if hints[vuln] > before:
-                notes.append(f"{vuln} {before}→{hints[vuln]}(토큰 {token!r} 차단)")
-    return '; '.join(notes) if notes else None
+        for vuln in _FILTER_PROBE_TOKENS.get(token, {}):
+            by_vuln.setdefault(vuln, []).append(token)
+    return {v: (_CLS_SUGGESTIVE, f"필터 차단 토큰 {toks}") for v, toks in by_vuln.items()}
+
+
+def _assemble_hints(field_hints: dict, group: dict, t_boost: dict,
+                    db: dict, block_ratio: float):
+    """prior(이름/형제/스택)와 recon 증거 클래스를 밴드 모델로 합쳐 최종 hints를 만든다.
+
+    반환: (hints, group_note, recon_note, filter_map_note) — breakdown 표시용 노트 포함."""
+    # PRIOR — 필드명 + 형제 상속 + 기술스택(전부 max, 증거 밴드엔 못 들어감)
+    prior = _with_group_hints(field_hints, group or {})
+    group_note = _group_hint_note(field_hints, prior)
+    for vuln, w in (t_boost or {}).items():
+        prior[vuln] = max(prior.get(vuln, 0.0), w)
+
+    # EVIDENCE — 유형별 최상위 증거 클래스
+    evidence: dict[str, tuple[float, str]] = {}
+    sb, sn = _sqli_evidence(db, block_ratio)
+    if sb is not None:
+        evidence['sqli'] = (sb, sn)
+    xb, xn = _xss_evidence(db)
+    if xb is not None:
+        evidence['xss'] = (xb, xn)
+    for vuln, (b, n) in _filter_map_evidence(db.get('filter_map')).items():
+        if vuln not in evidence or b > evidence[vuln][0]:
+            evidence[vuln] = (b, n)
+
+    # BUILD — 밴드 결합
+    hints = {
+        vuln: _banded(evidence.get(vuln, (None, None))[0], prior.get(vuln, 0.0))
+        for vuln in set(prior) | set(evidence)
+    }
+
+    recon_note = evidence.get('sqli', (None, None))[1]
+    other_notes = '; '.join(f"{v}: {n}" for v, (b, n) in evidence.items()
+                            if v != 'sqli' and n)
+    return hints, group_note, recon_note, (other_notes or None)
 
 
 def _reflection_extra(db: dict) -> dict:
@@ -286,8 +334,9 @@ def _reflection_extra(db: dict) -> dict:
     발사 전 컨텍스트·메타문자 프루닝에 쓴다."""
     refl = db.get('reflection')
     survived = (refl or {}).get('survived') or ()
-    reflects_html = bool(refl and refl.get('reflected')
-                         and '<' in survived and '>' in survived)
+    reflects_html = bool(refl and (
+        refl.get('dom_suspect')
+        or (refl.get('reflected') and '<' in survived and '>' in survived)))
     return {'reflection': refl, 'reflects_html': reflects_html}
 
 
@@ -369,13 +418,11 @@ class Profiler:
             if _should_skip(param):
                 continue
             field_hints, field_matches = _field_hints(param)
-            merged_hints = _with_group_hints(field_hints, group_hints.get((page['url'].split('?')[0], 'GET'), {}))
-            group_note = _group_hint_note(field_hints, merged_hints)
-            hints = _merge_hints(merged_hints, t_boost)
             db = (recon.get(param) or {}).get('db') or {}
             waf_blocked = db.get('waf_blocked', False)
-            recon_note = _apply_recon_signal(hints, db, recon.get('__block_ratio__', 0.0))
-            filter_map_note = _apply_filter_map_signal(hints, db.get('filter_map'))
+            hints, group_note, recon_note, filter_map_note = _assemble_hints(
+                field_hints, group_hints.get((page['url'].split('?')[0], 'GET'), {}),
+                t_boost, db, recon.get('__block_ratio__', 0.0))
             rt = _infer_response_type('url_param', None, resp_headers)
             surfaces.append(AttackSurface(
                 surface_type='url_param',
@@ -424,13 +471,10 @@ class Profiler:
                 if inp.get('type') in ('submit', 'button', 'image', 'reset'):
                     continue
                 field_hints, field_matches = _field_hints(param)
-                merged_hints = _with_group_hints(field_hints, group)
-                group_note = _group_hint_note(field_hints, merged_hints)
-                hints = _merge_hints(merged_hints, t_boost)
                 db = (recon.get(param) or {}).get('db') or {}
                 waf_blocked = db.get('waf_blocked', False)
-                recon_note = _apply_recon_signal(hints, db, recon.get('__block_ratio__', 0.0))
-                filter_map_note = _apply_filter_map_signal(hints, db.get('filter_map'))
+                hints, group_note, recon_note, filter_map_note = _assemble_hints(
+                    field_hints, group, t_boost, db, recon.get('__block_ratio__', 0.0))
                 rt = _infer_response_type('form_field', enctype, resp_headers)
                 surfaces.append(AttackSurface(
                     surface_type='form_field',
@@ -468,13 +512,11 @@ class Profiler:
             if _should_skip(param):
                 continue
             field_hints, field_matches = _field_hints(param)
-            merged_hints = _with_group_hints(field_hints, group_hints.get((page['url'].split('?')[0], 'GET'), {}))
-            group_note = _group_hint_note(field_hints, merged_hints)
-            hints = _merge_hints(merged_hints, t_boost)
             db = (recon.get(param) or {}).get('db') or {}
             waf_blocked = db.get('waf_blocked', False)
-            recon_note = _apply_recon_signal(hints, db, recon.get('__block_ratio__', 0.0))
-            filter_map_note = _apply_filter_map_signal(hints, db.get('filter_map'))
+            hints, group_note, recon_note, filter_map_note = _assemble_hints(
+                field_hints, group_hints.get((page['url'].split('?')[0], 'GET'), {}),
+                t_boost, db, recon.get('__block_ratio__', 0.0))
             rt = _infer_response_type('hidden_param', None, resp_headers)
             surfaces.append(AttackSurface(
                 surface_type='hidden_param',
@@ -512,13 +554,11 @@ class Profiler:
                 continue
             field_hints, field_matches = _field_hints(param)
             group_key = (entry.get('action') or page['url'].split('?')[0], 'POST')
-            merged_hints = _with_group_hints(field_hints, group_hints.get(group_key, {}))
-            group_note = _group_hint_note(field_hints, merged_hints)
-            hints = _merge_hints(merged_hints, t_boost)
             db = (recon.get(param) or {}).get('db') or {}
             waf_blocked = db.get('waf_blocked', False)
-            recon_note = _apply_recon_signal(hints, db, recon.get('__block_ratio__', 0.0))
-            filter_map_note = _apply_filter_map_signal(hints, db.get('filter_map'))
+            hints, group_note, recon_note, filter_map_note = _assemble_hints(
+                field_hints, group_hints.get(group_key, {}), t_boost, db,
+                recon.get('__block_ratio__', 0.0))
             enctype = entry.get('enctype') or 'application/x-www-form-urlencoded'
             rt = _infer_response_type('hidden_param', enctype, resp_headers)
             # scanner.py가 이 파라미터를 발견할 때 공격적 프로브 값이 필터에 막혀서 특정
@@ -578,7 +618,7 @@ class Profiler:
                     continue
                 enctype = call.get('content_type', 'application/json')
                 field_hints, field_matches = _field_hints(field_name)
-                hints = _merge_hints(field_hints, t_boost)
+                hints, _, _, _ = _assemble_hints(field_hints, {}, t_boost, {}, 0.0)
                 rt = _infer_response_type('api_field', enctype, button_result.get('response_headers'))
                 surfaces.append(AttackSurface(
                     surface_type='api_field',

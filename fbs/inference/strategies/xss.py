@@ -45,9 +45,13 @@ recon이 '<'가 전부 &lt;로 치환됨을 이미 쟀으면, ②에서 태그 �
   - 브라우저에서 alert(marker) 실제 발화 → HIGH (실행 확정)
   - raw 반사는 됐지만 브라우저 미가용/미발화 → MEDIUM (반사 확인, 실행 미확정)
 
+DOM 반사도 처리한다: recon이 원본 HTML에서 'URL 소스→innerHTML 등 싱크' 패턴을 찾아
+reflection.dom_suspect를 세우면(서버 반사 X), 서버 raw 확인을 건너뛰고 html 페이로드를
+브라우저로 직접 확정한다(브라우저가 JS를 돌려 실제 실행을 관측하므로 DOM/서버 구분 불필요).
+
 아직 안 하는 것(TODO, 의도적으로 범위 밖):
   - Stored XSS(전 표면 마커 주입 → 크롤 스윕 → 레지스트리 역추적 → 실행 확인)
-  - DOM-based XSS(소스→싱크 JS 흐름)
+  - DOM 소스→싱크 '데이터플로우 추적'(지금은 소스·싱크 공존만 보는 휴리스틱)
   - XSS 전용 WAF 우회(EVASION_TRANSFORMS는 SQL 키워드용이라 XSS엔 부적합)
   - blind/봇 XSS(OOB 콜라보레이터 필요)
 """
@@ -142,14 +146,26 @@ class XSSStrategy(BaseStrategy):
     def run(self, surface: AttackSurface) -> list[VulnResult]:
         # ① recon이 측정한 반사 신호 소비 — 반사 검사는 스캐너 전체에서 recon 한 곳으로 통일.
         refl = surface.extra.get('reflection') or {}
-        if not refl.get('reflected'):
-            print("    [XSS] 입력이 응답에 반사되지 않음 — 반사형 XSS 아님 (blind/stored는 범위 밖)")
+        server_reflected = bool(refl.get('reflected'))
+        dom = bool(refl.get('dom_suspect'))
+        if not server_reflected and not dom:
+            print("    [XSS] 서버 반사도 DOM 싱크도 없음 — 반사형/DOM XSS 아님 (stored는 범위 밖)")
             return []
-        contexts = refl.get('contexts') or ['html']
-        survived = set(refl.get('survived') or [])
-        tested   = set(refl.get('tested') or [])
-        shown = ' '.join(c for c in ('<', '>') if c in survived) or '없음'
-        print(f"    [XSS] 반사 확인(recon) — 컨텍스트: {', '.join(sorted(set(contexts)))} / 꺾쇠 생존: {shown}")
+
+        if server_reflected:
+            contexts = refl.get('contexts') or ['html']
+            survived = set(refl.get('survived') or [])
+            tested   = set(refl.get('tested') or [])
+            shown = ' '.join(c for c in ('<', '>') if c in survived) or '없음'
+            print(f"    [XSS] 서버 반사 확인(recon) — 컨텍스트: {', '.join(sorted(set(contexts)))} / 꺾쇠 생존: {shown}")
+        else:
+            # DOM 반사: 서버 HTML엔 안 보이고 JS가 브라우저에서 주입(innerHTML 등). 서버 측정이
+            # 없으니 프루닝/raw-반사 확인을 건너뛰고, html 컨텍스트 페이로드를 브라우저로 직접 확정한다.
+            contexts = ['html']
+            survived = set()
+            tested   = set()
+            print(f"    [XSS] DOM 싱크 반사 의심({refl.get('dom_source')}→{refl.get('dom_sink')}) "
+                  f"— 서버 반사 없음, 브라우저로 직접 확인")
 
         base_fields = self._base_fields(surface)
 
@@ -158,12 +174,12 @@ class XSSStrategy(BaseStrategy):
         if status is None:
             baseline_body = ''
 
-        # ② 컨텍스트별 페이로드 전송 → ③ raw 반사(이스케이프 안 됨) 후보 수집
+        # ② 컨텍스트별 페이로드 → ③ (서버 반사면 raw 반사 확인 / DOM이면 바로 브라우저 후보)
         candidates = []  # [{context, payload, marker, fields}]
         for ctx in sorted(set(contexts)):
             for template, sig_template, requires in self._CONTEXT_PAYLOADS.get(ctx, []):
                 # 발사 전 프루닝: recon이 '측정한'(tested) 문자 중 breakout 필요문자가 죽었으면
-                # 스킵. 따옴표처럼 recon이 안 잰 문자는 여기서 안 거르고 ③ exec_sig로 판정한다.
+                # 스킵. DOM은 tested가 비어 있어 프루닝이 걸리지 않는다.
                 dead = (requires & tested) - survived
                 if dead:
                     print(f"      · {ctx}: breakout 필요문자({''.join(sorted(dead))}) 이스케이프됨 — 발사 전 스킵")
@@ -173,6 +189,21 @@ class XSSStrategy(BaseStrategy):
                     continue  # 극히 드문 충돌 — 안전하게 스킵
                 payload = template.format(M=marker)
                 exec_sig = sig_template.format(M=marker)
+                cand = {
+                    'context': ctx,
+                    'payload': payload,
+                    'marker': marker,
+                    'fields': {**base_fields, surface.param: payload},
+                }
+
+                if not server_reflected:
+                    # DOM: 서버 응답엔 안 보이므로 raw 확인 없이 바로 브라우저 후보로(실행이 확정).
+                    print(f"      · {ctx}: DOM 후보 등록 — 브라우저 실행 확인 대기")
+                    self._register_marker(surface, marker, ctx, payload)
+                    candidates.append(cand)
+                    continue  # html의 img/svg 둘 다 시도(브라우저가 전부 확인)
+
+                # 서버 반사: 응답에 실행 시그니처가 이스케이프 없이 박혔는지 확인
                 p_status, p_body, _ = self._send(surface, {**base_fields, surface.param: payload})
                 if p_status is None:
                     continue
@@ -183,18 +214,13 @@ class XSSStrategy(BaseStrategy):
                 if exec_sig in p_body:
                     print(f"      · {ctx}: raw 반사 확인 (실행 시그니처 원형 유지)")
                     self._register_marker(surface, marker, ctx, payload)
-                    candidates.append({
-                        'context': ctx,
-                        'payload': payload,
-                        'marker': marker,
-                        'fields': {**base_fields, surface.param: payload},
-                    })
+                    candidates.append(cand)
                     break  # 컨텍스트당 첫 성공 페이로드 하나면 충분
                 else:
                     print(f"      · {ctx}: 반사됐으나 이스케이프됨(실행 불가) — 정탐 아님")
 
         if not candidates:
-            print("    [XSS] 실행 가능한 raw 반사 후보 없음 — 취약점 아님")
+            print("    [XSS] 실행 가능한 후보 없음 — 취약점 아님")
             return []
 
         # ④ 브라우저로 실제 실행(alert 발화) 확인

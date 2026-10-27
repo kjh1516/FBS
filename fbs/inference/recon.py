@@ -342,7 +342,11 @@ class DBDetect:
         if (n1 is not None and n2 is not None
                 and step1 > _FILTER_MIN_DIFF_FLOOR and step2 > _FILTER_MIN_DIFF_FLOOR
                 and min(step1, step2) >= 0.5 * max(step1, step2)):
-            print(f"    [필터맵] 누적형 엔드포인트 추정(응답 일정 증가 +{step1},+{step2}) — 필터 지도 판정 보류")
+            print(f"    [필터맵] {method} {url} (param={target!r}) — 누적형 엔드포인트 추정: "
+                  f"동일 benign 입력('{BASELINE}')을 연달아 2회 보냈더니 visible-text가 매번 일정량 증가")
+            print(f"             (len {len(normal_text)}→{len(t1)}→{len(t2)}, step +{step1}/+{step2}, "
+                  f"증가 일정도 {min(step1,step2)/max(step1,step2):.0%}≥50% → 입력이 전역 누적되는 메모형 추정)")
+            print(f"             거부지문 비교가 오염돼 신뢰 불가 → 필터 지도 판정 보류(종합/토큰 프로브 생략)")
             return None
 
         noise = max(diff_score(normal_text, t1), diff_score(normal_text, t2))
@@ -360,7 +364,7 @@ class DBDetect:
         # 따옴표가 실제로 막히는지는 error probe와 아래 per-token 루프가 따로 판정하므로 정보
         # 손실은 없다(정상 케이스엔 이 재전송이 없어 요청도 안 는다).
         if resp.status_code >= 500 or detect_db_from_error(resp.text):
-            print("    [필터맵] 종합 카나리가 SQL 에러 유발(=주입 신호) — 따옴표 제외하고 거부 지문 재생성")
+            print(f"    [필터맵] {method} {url} (param={target!r}) — 종합 카나리가 SQL 에러 유발(=주입 신호) — 따옴표 제외하고 거부 지문 재생성")
             composite = BASELINE + ''.join(t for t in _FILTER_PROBE_TOKENS if t not in ("'", '"'))
             resp, _, _ = self._send(url, method, {**data, target: composite})
             if resp is None:
@@ -429,41 +433,65 @@ class DBDetect:
             return 'redirect'      # 리다이렉트 (인증 우회 가능성)
         return 'status_change'     # 기타 상태 코드 변화
 
-    # ── 반사 신호 (모든 전략 공용) ────────────────────────────────────────────
+    # ── 반사 신호 (모든 전략 공용 / recon 측은 층1·2까지만) ──────────────────────
+    #
+    # XSS 반사 탐지는 3층으로 나뉘는데, recon은 '싼 신호' 두 층만 책임진다(비싼 렌더는 XSS
+    # strategy의 몫). SQLi가 recon의 따옴표 프로브로 '관여 신호'만 받고 실제 탐지는 strategy가
+    # 하는 것과 같은 경계다.
+    #   층1 서버 반사 : 중립 코어가 서버 응답(requests)에 그대로 박히나 + 컨텍스트 + 꺾쇠 생존
+    #   층2 DOM 정적  : 서버엔 없어도 원본 HTML에 'URL 소스→위험 싱크' 패턴이 있으면 DOM 반사 의심
+    #   층3 렌더(X)   : Playwright로 실제 DOM 반사·실행을 확정 — 비싸고 XSS 전용이라 strategy가 함
+    #
+    # probe_reflection() 하나가 층1·2를 한 번에 재서 '반사 신호' 딕셔너리로 돌려준다.
 
-    # 생존을 측정하는 메타문자. 따옴표(',")는 문자열 컨텍스트 SQL을 깨서 반사 자체를
-    # 못 보게 만들 수 있으므로(=반사 사이트를 blind로 오판) 여기선 넣지 않는다 — 꺾쇠만
-    # 잰다. 따옴표 생존은 XSS strategy가 페이로드를 실제로 쏴 보고 exec_sig로 확인한다.
+    # 층1에서 생존을 측정하는 메타문자. 따옴표(',")는 문자열 컨텍스트 SQL을 깨서 반사 자체를
+    # 못 보게 만들 수 있으므로(=반사 사이트를 blind로 오판) 넣지 않고 꺾쇠만 잰다. 따옴표 생존은
+    # XSS strategy가 페이로드를 실제로 쏴 보고 exec_sig로 확인한다.
     _REFLECT_METACHARS = ('<', '>')
 
+    # 층2에서 찾는 DOM 반사 패턴: JS가 URL 등에서 입력을 읽는 '소스' → 위험 '싱크'로 흘리는 꼴.
+    # 서버 HTML엔 입력이 안 보여도(requests로 반사 X) 브라우저에선 JS가 DOM에 주입한다.
+    _DOM_SOURCES = ('location.search', 'location.hash', 'location.href',
+                    'document.url', 'document.documenturi', 'urlsearchparams')
+    _DOM_SINKS = ('innerhtml', 'outerhtml', 'insertadjacenthtml',
+                  'document.write', 'eval(')
+
     def probe_reflection(self, url: str, method: str, data: dict, target: str) -> dict | None:
-        """이 필드가 응답에 반사되는지 + 반사 위치(HTML 컨텍스트) + 꺾쇠 생존을 한 번에 잰다.
+        """이 필드의 '반사 신호'를 한 번에 잰다 — 층1(서버 반사) + 층2(DOM 정적 의심).
 
-        중립 코어(영숫자) 뒤에 'LT<GT>'를 붙여 보낸다. 따옴표가 없어 문자열 컨텍스트
-        SQL을 깨지 않으므로, 반사 사이트를 500 에러로 blind 오판하지 않는다.
+        중립 코어(영숫자) 뒤에 'LT<GT>'를 붙여 보낸다. 따옴표가 없어 문자열 컨텍스트 SQL을
+        깨지 않으므로, 반사 사이트를 500 에러로 blind 오판하지 않는다.
 
-        반환:
-          {'reflected': bool, 'contexts': [...], 'survived': [생존 메타문자], 'tested': ['<','>']}
-          None — 요청 실패 또는 WAF 차단(반사/blind 판정 불가)
+        반환(None=요청 실패/WAF 차단으로 판정 불가):
+          층1 성공 → {'reflected': True,  'contexts': [...], 'survived': [...], 'tested': ['<','>']}
+          층1 실패 → {'reflected': False, 'contexts': [], 'survived': [], 'tested': ['<','>'],
+                      (층2 적중 시) 'dom_suspect': True, 'dom_source': ..., 'dom_sink': ...}
         """
         core = 'fbsr' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-        probe = f"{core}LT<GT>"
-        resp, _elapsed, _err = self._send(url, method, {**data, target: probe})
+        resp, _elapsed, _err = self._send(url, method, {**data, target: f"{core}LT<GT>"})
         if resp is None:
             return None
         body = resp.text
         if self._detect_waf_body(body):
             return None
         tested = list(self._REFLECT_METACHARS)
-        if core not in body:
-            return {'reflected': False, 'contexts': [], 'survived': [], 'tested': tested}
-        contexts = self._reflection_contexts(body, core)
-        survived = []
-        if 'LT<' in body:
-            survived.append('<')
-        if 'GT>' in body:
-            survived.append('>')
-        return {'reflected': True, 'contexts': contexts, 'survived': survived, 'tested': tested}
+
+        # 층1 — 서버 반사: 코어가 서버 응답에 그대로 박혔나 + 컨텍스트 + 꺾쇠 생존
+        if core in body:
+            survived = [c for c, label in (('<', 'LT<'), ('>', 'GT>')) if label in body]
+            return {'reflected': True, 'contexts': self._reflection_contexts(body, core),
+                    'survived': survived, 'tested': tested}
+
+        # 층2 — DOM 정적: 서버엔 없지만 원본 HTML에 'URL 소스→위험 싱크'가 같이 있으면 DOM 반사
+        # 의심. 소스·싱크 공존만 보는 휴리스틱이라(실제 연결은 미확인) '의심 깃발'일 뿐 — 확정은
+        # XSS strategy의 브라우저 렌더(층3)가 한다.
+        result = {'reflected': False, 'contexts': [], 'survived': [], 'tested': tested}
+        low = body.lower()
+        src  = next((s for s in self._DOM_SOURCES if s in low), None)
+        sink = next((k for k in self._DOM_SINKS   if k in low), None)
+        if src and sink:
+            result.update({'dom_suspect': True, 'dom_source': src, 'dom_sink': sink})
+        return result
 
     def _reflection_contexts(self, body: str, marker: str) -> list[str]:
         """marker가 반사된 모든 위치의 HTML 컨텍스트를 분류한다. raw 문자열을 파서에 넣으면
@@ -594,7 +622,12 @@ class Recon:
                 if reflection is None:
                     print(f"    반사 여부 : 측정 불가 (요청 실패 또는 WAF 차단)")
                 elif not reflection.get('reflected'):
-                    print(f"    반사 여부 : 반사 안 됨 (blind)")
+                    if reflection.get('dom_suspect'):
+                        print(f"    반사 여부 : 서버 반사 없음 — DOM 반사 의심 "
+                              f"({reflection.get('dom_source')} → {reflection.get('dom_sink')}, "
+                              f"브라우저에서 확인 필요)")
+                    else:
+                        print(f"    반사 여부 : 반사 안 됨 (blind)")
                 else:
                     survived = reflection.get('survived') or []
                     tested   = reflection.get('tested') or []
