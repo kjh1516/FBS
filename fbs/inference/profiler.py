@@ -241,18 +241,25 @@ def _banded(evidence_base: float | None, prior: float) -> float:
 
 
 def _sqli_evidence(db: dict, block_ratio: float) -> tuple[float | None, str | None]:
-    """recon 신호 → SQLi 증거 클래스. (base, note) 또는 (None, None)."""
+    """recon 신호 → SQLi 증거 클래스. (base, note) 또는 (None, None).
+
+    상위 밴드는 'SQL 에러 시그니처'(detected_db)만이다 — 응답에서 실제 SQL 에러 패턴을 매칭한
+    것이라 SQL-특정적. 반면 '따옴표가 500/상태변화를 유발'은 그 자체로는 SQL 특정이 아니다:
+    잘 짠 앱은 SQLi여도 예외처리로 500을 안 내고, 백엔드 로직이 커지면 SQL과 무관한 앱 예외로도
+    500이 난다. 그래서 시그니처 없는 따옴표 반응은 '도달 입증(REACHED)'이 아니라 '정황
+    (SUGGESTIVE)'으로 둔다 — 실제 확정은 strategy의 boolean/union이 한다.
+    (추후 recon이 boolean 차분(probe≈다른 known 응답)을 따로 노출하면 그건 REACHED로 올릴
+    여지가 있다 — 지금은 sqli_signal에 섞여 있어 구분 못 함.)"""
     if db.get('detected_db'):
         return _CLS_CONFIRMED, f"SQL 에러 시그니처로 DB({db['detected_db']}) 확인 — 사실상 주입 확정"
-    # 따옴표가 쿼리를 깨뜨린 신호 = 입력이 SQL 인터프리터에 도달 → 도달 입증
-    if db.get('sqli_signal') and db.get('quote_char'):
-        return _CLS_REACHED, f"따옴표({db['quote_char']}) 신호로 쿼리 반응 확인 → 도달 입증"
+    # 시그니처 없는 따옴표/probe 반응 — 단순 반응이라 정황(500은 앱 예외일 수도)
+    if db.get('sqli_signal'):
+        q = db.get('quote_char')
+        why = f"따옴표({q}) 반응" if q else "probe 반응"
+        return _CLS_SUGGESTIVE, f"{why} — SQL 에러 시그니처 없음(단순 반응이라 정황)"
     # 선택적 필터 차단 = 개발자가 이 필드를 SQL로 인지하고 막았다 → 정황
     if db.get('waf_blocked') and block_ratio < _SELECTIVE_BLOCK_THRESHOLD:
         return _CLS_SUGGESTIVE, f"선택적 필터 차단(전역 {block_ratio:.0%})"
-    # 그 외 약신호(probe≈default 등). 균일 WAF는 유형을 못 가려 여기선 증거로 안 올림(iterate).
-    if db.get('sqli_signal'):
-        return _CLS_SUGGESTIVE, f"recon 약신호(db_hint={db.get('db_hint')})"
     return None, None
 
 
@@ -272,24 +279,33 @@ def _xss_evidence(db: dict) -> tuple[float | None, str | None]:
         if exec_ctx:
             return _CLS_SUGGESTIVE, f"실행 컨텍스트 반사({','.join(sorted(exec_ctx))}) — 꺾쇠 escape, breakout 미확인"
         return None, None
-    # 서버 반사는 없지만 DOM 싱크 반사 의심(JS가 URL→innerHTML 등) → 브라우저가 확정 → 도달급
+    # 서버 반사는 없지만 DOM 싱크 반사 의심(JS가 URL→innerHTML 등). 단 이건 '이 param이 싱크에
+    # 닿는다'를 측정한 게 아니라 '페이지에 DOM-XSS 모양 코드가 있다'는 약한 정적 신호다
+    # (innerHTML/location은 현대 페이지에 흔함). 그래서 '측정된 도달(REACHED)'이 아니라 '정황
+    # (SUGGESTIVE)'로 둔다 — 실제 SQL 증거(0.70+)가 올바르게 이기고, 다른 신호가 없으면 XSS가
+    # 최상위라 그대로 돌아 브라우저가 확정/기각한다(미발화면 strategy가 미보고).
     if refl.get('dom_suspect'):
-        return _CLS_REACHED, f"DOM 반사 의심({refl.get('dom_source')}→{refl.get('dom_sink')}) — 브라우저 확정 필요"
+        return _CLS_SUGGESTIVE, f"DOM 반사 의심({refl.get('dom_source')}→{refl.get('dom_sink')}) — 정적 신호, 브라우저 확정 필요"
     return None, None
 
 
-def _filter_map_evidence(filter_map: dict[str, bool] | None) -> dict[str, tuple[float, str]]:
-    """토큰별 필터 지도 → 유형별 정황(SUGGESTIVE) 증거. 막힌 토큰은 _FILTER_PROBE_TOKENS에서
-    자기 유형에만 기여한다(따옴표 차단이 xss로 번지지 않음)."""
+def _filter_map_evidence(filter_map: dict[str, str] | None) -> dict[str, tuple[float, str]]:
+    """토큰별 필터 지도(outcome: passed/removed/encoded/rejected) → 유형별 정황(SUGGESTIVE)
+    증거. _FILTER_PROBE_TOKENS에서 자기 유형에만 기여한다(따옴표 차단이 xss로 번지지 않음).
+
+    'removed'(입력 제거)·'rejected'(차단 페이지)만 기여한다 — '그 유형을 의식한 필터'라 정황.
+    'encoded'(출력 이스케이프, 예: '→&#39;)는 기여하지 않는다 — 그건 그 공격을 '중화'한 것이라
+    성공 신호가 아니고, 특히 백엔드 주입형(sqli 등)은 출력 인코딩과 무관(char는 쿼리에 그대로
+    도달)하므로 'encoded'를 필터로 세면 가짜 신호가 된다. 'passed'도 당연히 제외."""
     if not filter_map:
         return {}
     by_vuln: dict[str, list[str]] = {}
-    for token, blocked in filter_map.items():
-        if not blocked:
+    for token, outcome in filter_map.items():
+        if outcome not in ('removed', 'rejected'):
             continue
         for vuln in _FILTER_PROBE_TOKENS.get(token, {}):
-            by_vuln.setdefault(vuln, []).append(token)
-    return {v: (_CLS_SUGGESTIVE, f"필터 차단 토큰 {toks}") for v, toks in by_vuln.items()}
+            by_vuln.setdefault(vuln, []).append(f"{token}({outcome})")
+    return {v: (_CLS_SUGGESTIVE, f"필터된 토큰 {toks}") for v, toks in by_vuln.items()}
 
 
 def _assemble_hints(field_hints: dict, group: dict, t_boost: dict,

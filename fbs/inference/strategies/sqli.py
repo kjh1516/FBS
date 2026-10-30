@@ -139,8 +139,11 @@ class SQLiStrategy(BaseStrategy):
         # recon이 거부-지문으로 학습한 밴 토큰 집합. 페이로드 사전검열(회피)과 차단 판정
         # (payload-aware)에 쓴다 — 밴 토큰이 든 페이로드는 필터 거부가 확실하고, 우리 우회
         # 변형으로 그 키워드를 못 없애면 요청을 낭비하지 않는다.
+        # filter_map은 토큰별 outcome('passed'/'removed'/'encoded'/'rejected'). SQL 관점에서
+        # '밴'은 입력이 쿼리에 못 닿게 하는 것 = removed(입력 제거)·rejected(차단)뿐이다. encoded는
+        # 출력 이스케이프라 char는 쿼리에 그대로 도달하므로 밴이 아니다(passed도 당연히 아님).
         filter_map = surface.extra.get('filter_map') or {}
-        banned = {t for t, b in filter_map.items() if b}
+        banned = {t for t, o in filter_map.items() if o in ('removed', 'rejected')}
         if banned:
             self._banned_tokens[(surface.url, surface.param)] = banned
             print(f"    [SQLi] recon 필터 지도: 밴 토큰 {sorted(banned)} — 페이로드 회피/차단 판정에 사용")

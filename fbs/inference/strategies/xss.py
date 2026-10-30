@@ -8,7 +8,7 @@ from html import escape as html_escape
 import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
-from fbs.inference.waf import classify_waf_block
+from fbs.inference.waf import classify_waf_block, XSS_EVASION_TRANSFORMS
 from fbs.inference.strategies.base import BaseStrategy
 
 """
@@ -134,14 +134,14 @@ class XSSStrategy(BaseStrategy):
         return False
 
     def priority(self, surface: AttackSurface) -> float:
-        """XSS 우선순위 — profiler의 xss hint 점수를 쓰되, 필드명 힌트가 없어도 메타문자가
-        이스케이프 없이 반사되면(reflects_html) XSS가 사실상 확정적이므로 강한 점수(0.7)로
-        올린다. 엔진은 이 값과 다른 전략(예: SQLi의 sqli hint)을 비교해 더 높은 하나만 돌린다
-        — 그래서 반사되지 않는 로그인 필드(sqli 0.8 > xss 0.4)에선 XSS가 아예 시작되지 않는다."""
-        base = surface.extra.get('hints', {}).get('xss', 0.0)
-        if surface.extra.get('reflects_html'):
-            return max(base, 0.7)
-        return base
+        """XSS 우선순위 = profiler가 밴드 모델로 매긴 xss hint 그대로.
+
+        예전엔 reflects_html이면 0.7로 끌어올리는 보정이 있었지만, 이제 반사의 '질'은
+        profiler `_xss_evidence`가 증거 클래스로 반영한다(서버반사+꺾쇠생존=REACHED 0.70,
+        DOM 정적 의심=SUGGESTIVE 0.40). 그 보정을 남겨두면 약한 dom_suspect(흔한 innerHTML/
+        location 코드만으로도 섬)까지 0.70으로 올라가 실제 SQLi(0.70)를 잘못 밀어낸다 — 그래서
+        제거하고 hint를 그대로 쓴다."""
+        return surface.extra.get('hints', {}).get('xss', 0.0)
 
     def run(self, surface: AttackSurface) -> list[VulnResult]:
         # ① recon이 측정한 반사 신호 소비 — 반사 검사는 스캐너 전체에서 recon 한 곳으로 통일.
@@ -216,8 +216,15 @@ class XSSStrategy(BaseStrategy):
                     self._register_marker(surface, marker, ctx, payload)
                     candidates.append(cand)
                     break  # 컨텍스트당 첫 성공 페이로드 하나면 충분
-                else:
-                    print(f"      · {ctx}: 반사됐으나 이스케이프됨(실행 불가) — 정탐 아님")
+
+                # 꺾쇠는 살아남아(프루닝 통과) 여기 왔는데 exec_sig가 안 남았다 = 핸들러/태그
+                # 키워드가 필터에 변형/제거된 것(출력 인코딩이면 애초에 프루닝됐을 것). 반사는
+                # 되니 일반 변형(대소문자/공백)으로 '원형 생존'하는 변형을 측정으로 찾는다.
+                evaded = self._try_evade_payload(surface, base_fields, ctx, template, sig_template, marker)
+                if evaded:
+                    candidates.append(evaded)
+                    break
+                print(f"      · {ctx}: 반사됐으나 이스케이프/필터됨 + 우회 실패 — 정탐 아님")
 
         if not candidates:
             print("    [XSS] 실행 가능한 후보 없음 — 취약점 아님")
@@ -227,7 +234,11 @@ class XSSStrategy(BaseStrategy):
         fired = self._run_browser_confirm(surface, candidates)
 
         if fired is None:
-            # Playwright 미가용 — raw 반사까지만 확인됨
+            # Playwright 미가용. 서버 raw 반사는 확인됐으니 MEDIUM으로 보고하되, DOM 경로는
+            # raw 반사 근거가 애초에 없어(추정뿐) Playwright 없이는 확인 불가 → 미보고(오탐 방지).
+            if not server_reflected:
+                print("    [XSS] DOM 싱크 추정인데 Playwright 미설치 — 확인 불가, 미보고")
+                return []
             best = candidates[0]
             print("    [XSS] Playwright 미설치 — 실행 확정 불가, 반사 근거로 MEDIUM 보고")
             return [self._make_result(surface, best, confirmed=False,
@@ -239,11 +250,47 @@ class XSSStrategy(BaseStrategy):
                 return [self._make_result(surface, cand, confirmed=True,
                                            alert_msg=fired[cand['marker']])]
 
-        # raw 반사는 됐지만 브라우저에서 발화 안 함(CSP 등 가능성)
+        # 브라우저 미발화. 서버 raw 반사가 확인된 경우에만 "실행만 미확정(CSP 등)"으로 MEDIUM.
+        # DOM 경로는 dom_suspect 추정만 있었으므로, 미발화 = 실제 싱크로 안 흐른다는 뜻 → 반사
+        # 증거가 0이라 미보고(innerHTML/location만 흔한 페이지의 오탐을 여기서 차단).
+        if not server_reflected:
+            print("    [XSS] DOM 싱크 추정이었으나 브라우저 실행 미관측 — dom_suspect 오탐으로 판단, 미보고")
+            return []
         best = candidates[0]
         print("    [XSS] raw 반사 확인됐으나 브라우저 실행 미관측(CSP 등 가능) — MEDIUM 보고")
         return [self._make_result(surface, best, confirmed=False,
                                    note='raw 반사 확인, 브라우저 실행 미관측(CSP 등 가능)')]
+
+    # ── 필터 우회 (SQLi _try_evade와 같은 구조, predicate만 다름) ──────────────
+
+    def _try_evade_payload(self, surface: AttackSurface, base_fields: dict, ctx: str,
+                           template: str, sig_template: str, marker: str) -> dict | None:
+        """기본 페이로드가 필터돼 exec_sig가 원형으로 안 남을 때, 일반 변형(XSS_EVASION_TRANSFORMS:
+        키워드 대소문자·공백→탭)을 적용해 '원형 생존'하는 변형을 측정으로 찾는다.
+
+        SQLi._try_evade와 구조는 같다 — 변형 세트를 적용해 보내고 생존을 판정. 다른 건
+        predicate뿐: SQL은 '거부됐나', XSS는 '변형된 exec_sig가 응답에 원형으로 남았나'.
+        변형은 marker/alert(JS)를 건드리지 않으므로, 살아남으면 그대로 브라우저 확정으로 넘어간다.
+        (대체 벡터 다양화는 범위 밖 — 변형만.)"""
+        base_payload = template.format(M=marker)
+        base_sig = sig_template.format(M=marker)
+        for name, transform in XSS_EVASION_TRANSFORMS:
+            v_payload = transform(base_payload)
+            if v_payload == base_payload:
+                continue  # 이 변형이 아무것도 안 바꿈 — 요청 아낌
+            v_sig = transform(base_sig)
+            p_status, p_body, _ = self._send(surface, {**base_fields, surface.param: v_payload})
+            if p_status is None:
+                continue
+            blocked, _, _ = classify_waf_block(p_status, p_body)
+            if blocked:
+                continue
+            if v_sig in p_body:
+                print(f"      · {ctx}: 우회 성공({name}) — 변형 후 실행 시그니처 원형 생존")
+                self._register_marker(surface, marker, ctx, v_payload)
+                return {'context': ctx, 'payload': v_payload, 'marker': marker,
+                        'fields': {**base_fields, surface.param: v_payload}}
+        return None
 
     # ── 요청 전송 ────────────────────────────────────────────────────────────
 
@@ -410,6 +457,32 @@ class XSSStrategy(BaseStrategy):
             f'</body></html>'
         )
 
+    # ── 임팩트 판정 (헤더 정적) ───────────────────────────────────────────────
+
+    def _assess_cookie_impact(self, surface: AttackSurface) -> dict:
+        """크롤이 저장한 쿠키의 HttpOnly 플래그로 'XSS가 document.cookie로 쿠키를 탈취할 수
+        있는가'를 헤더 기반(정적)으로 판정한다.
+
+        동적 재현(내 브라우저에 쿠키를 심어 읽어오기)은 CTF처럼 피해자가 곧 나인 상황에선
+        '내가 넣은 걸 내가 읽는' 순환이라 의미가 없다. 반면 HttpOnly 플래그는 실제 서버가
+        세운 것이라, '이 쿠키가 JS로 읽히는가'를 그대로 말해준다. (crawl이 Set-Cookie에서
+        뜬 건 bool, 요청 Cookie에서만 본 건 None=플래그 미상.)"""
+        cookies = (surface.page or {}).get('cookies') or []
+        readable = [c.get('name') for c in cookies if (c.get('flags') or {}).get('httponly') is False]
+        httponly = [c.get('name') for c in cookies if (c.get('flags') or {}).get('httponly') is True]
+        unknown  = [c.get('name') for c in cookies if (c.get('flags') or {}).get('httponly') is None]
+        if readable:
+            verdict = f"HttpOnly 없는 쿠키 {readable} 존재 → document.cookie로 쿠키 탈취 가능"
+        elif httponly and not unknown:
+            verdict = f"쿠키 {httponly} 전부 HttpOnly → document.cookie 탈취 불가 (XSS 자체는 유효)"
+        elif httponly:
+            verdict = f"HttpOnly 쿠키 {httponly} / 플래그 미상 {unknown} → 탈취 가부 일부 미상"
+        elif unknown:
+            verdict = f"쿠키 {unknown} 플래그 미상(크롤이 Set-Cookie 못 봄) → HttpOnly 판정 불가"
+        else:
+            verdict = "크롤 세션에 쿠키 없음 → HttpOnly 판정 불가 (탈취 대상 없음)"
+        return {'verdict': verdict, 'js_readable': readable, 'httponly': httponly, 'unknown': unknown}
+
     # ── 결과 생성 ────────────────────────────────────────────────────────────
 
     def _make_result(self, surface: AttackSurface, cand: dict,
@@ -422,6 +495,9 @@ class XSSStrategy(BaseStrategy):
             evidence = f"응답에 실행 시그니처가 이스케이프 없이 반사됨 — 컨텍스트 {cand['context']}"
             if note:
                 evidence += f" ({note})"
+        # 임팩트: 실행이 확정됐을 때만 쿠키 탈취 가부를 판정한다(반사만으론 실행 미확정이라 보류).
+        # evidence에 붙이지 않고 detail에 따로 담는다 — 엔진이 '임팩트:' 별도 줄로 찍어 가독성 유지.
+        impact = self._assess_cookie_impact(surface) if confirmed else None
         return VulnResult(
             surface=surface,
             vuln_type='XSS',
@@ -435,5 +511,6 @@ class XSSStrategy(BaseStrategy):
                 'confirmed_by': 'browser' if confirmed else 'reflection',
                 'alert_message': alert_msg,
                 'note': note,
+                'cookie_impact': impact,
             },
         )

@@ -292,6 +292,10 @@ class InferenceEngine:
                 for r in results:
                     print(f"    ══ 최종 취약점 확정 ═══════════════════════════")
                     print(f"    [{r.severity}] {r.vuln_type} | payload=\"{r.payload}\"")
+                    print(f"    근거   : {r.evidence}")
+                    impact = (r.detail or {}).get('cookie_impact')
+                    if impact and impact.get('verdict'):
+                        print(f"    임팩트 : {impact['verdict']}")
                     print(f"    ═══════════════════════════════════════════════")
             else:
                 print(f"    · 취약점 없음")

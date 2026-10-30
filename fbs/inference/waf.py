@@ -157,6 +157,18 @@ BLOCK_STATUS_CODES      = {403, 406, 444, 503, 999}
 RATE_LIMIT_STATUS_CODES = {429}
 
 
+def match_block_keywords(body_lower: str, keywords) -> list[str]:
+    """차단 키워드를 '단어 경계(\\b...\\b)'로 매칭한 목록을 돌려준다.
+
+    단순 부분 문자열(`kw in body`)로 보면 'hack'이 'dreamhack' 안에서 걸려 오탐이 난다 —
+    드림핵 챌린지는 거의 모든 페이지에 'dreamhack'(로고/브랜딩)이 있어 상시 가짜 WAF가 떴다.
+    단어 경계로 보면 'hack'은 단독 단어일 때만 매칭되고 'dreamhack'·'waffle' 같은 포함어는
+    안 걸린다. (상태코드 동반 조건은 쓰지 않는다 — 200으로 'blocked' 본문만 주는 커스텀
+    WAF를 놓치기 때문.) recon._detect_waf_body도 이 함수를 공유해 매칭 규칙을 동기화한다."""
+    return [kw for kw in keywords
+            if re.search(r'\b' + re.escape(kw) + r'\b', body_lower)]
+
+
 # ── 차단 페이지 판별기 (공용 — SQLiStrategy 등에서도 그대로 재사용) ──────────────
 
 def classify_waf_block(status: int | None, body: str) -> tuple[bool, str | None, list[str]]:
@@ -178,7 +190,7 @@ def classify_waf_block(status: int | None, body: str) -> tuple[bool, str | None,
             if pattern in body_lower:
                 return True, waf_name, [f"block_page_signature: {pattern!r}"]
 
-    matched = [kw for kw in GENERIC_BLOCK_KEYWORDS if kw in body_lower]
+    matched = match_block_keywords(body_lower, GENERIC_BLOCK_KEYWORDS)
     if matched:
         evidence = [f"generic_keywords: {matched[:3]}"]
         if status in BLOCK_STATUS_CODES:
@@ -384,6 +396,35 @@ EVASION_TRANSFORMS = [
 ]
 
 _DIALECT_ONLY_TRANSFORMS = {'substr_no_comma': ('MySQL', 'PostgreSQL')}
+
+
+# ── XSS 전용 우회 변형 (SQL과 같은 구조, 다만 HTML/JS 문맥에 안전한 것만) ────────────
+# SQL의 _evade_case_mix는 SQL 키워드만 섞고, inline_comment(/**/) 등은 HTML을 깨뜨린다.
+# XSS는 HTML 태그/이벤트 핸들러 이름만 대소문자를 섞어야 한다 — JS(alert)와 마커는 대소문자
+# 민감/식별자라 건드리면 실행·귀속이 깨진다. alt_whitespace(공백→탭)는 HTML 속성 구분자로
+# 유효해 그대로 재사용한다. (대체 벡터 다양화는 범위 밖 — 변형만.)
+_XSS_KEYWORDS_RE = re.compile(
+    r'\b(on\w+|script|img|svg|iframe|body|details|video|audio|autofocus)\b',
+    re.IGNORECASE,
+)
+
+
+def _evade_xss_case(payload: str) -> str:
+    """HTML 태그/이벤트 핸들러 키워드만 대소문자를 섞는다. HTML은 태그·속성명이 대소문자
+    무관이라 실행은 보존되고, 대소문자 그대로 비교/치환하는 필터(예: lower()로 검사 후 원문의
+    소문자만 치환)는 깨진다. JS·마커는 키워드 집합 밖이라 안 건드린다. 매치 단위로 결정적이라
+    payload와 exec_sig에 각각 적용해도 같은 결과가 나온다(생존 판정에 필요)."""
+    def _mix(m: re.Match) -> str:
+        s = m.group(0)
+        return ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(s))
+    return _XSS_KEYWORDS_RE.sub(_mix, payload)
+
+
+XSS_EVASION_TRANSFORMS = [
+    ('xss_case',       _evade_xss_case),
+    ('alt_whitespace', _evade_alt_whitespace),
+    ('xss_case+ws',    lambda p: _evade_alt_whitespace(_evade_xss_case(p))),
+]
 
 
 def apply_named_evasion(name: str, payload: str) -> str:
