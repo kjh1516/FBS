@@ -450,7 +450,7 @@ class DBDetect:
 
     @staticmethod
     def _detect_waf_body(body: str) -> bool:
-        # 단어 경계 매칭(waf.match_block_keywords 공유) — 'hack'이 'dreamhack'에 걸리는 오탐 방지.
+        # 단어 경계 매칭(waf.match_block_keywords 공유) — 'hack'이 긴 단어/브랜드명에 포함돼 걸리는 오탐 방지.
         return bool(match_block_keywords(body.lower(), _WAF_BODY_SIGNATURES))
 
     @staticmethod

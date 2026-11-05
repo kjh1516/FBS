@@ -1,0 +1,12 @@
+# FBS — runtime dependencies (Python 3.10+, tested on 3.11)
+#
+# 설치 후 Playwright 브라우저 바이너리도 받아야 합니다:
+#   pip install -r requirements.txt
+#   playwright install chromium
+
+scrapy==2.14.1
+scrapy-playwright==0.0.46
+playwright==1.58.0
+requests==2.32.5
+beautifulsoup4==4.14.3
+fake-useragent==2.2.0

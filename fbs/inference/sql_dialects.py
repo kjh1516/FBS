@@ -26,7 +26,7 @@ SQL_DIALECTS: dict[str, dict] = {
     'MySQL': {
         'ord_fn':     lambda x: f"ASCII({x})",
         # SUBSTR은 MySQL에서 SUBSTRING의 별칭이라 동작이 같으면서, 'substring'을 밴하는
-        # 필터(드림핵 reset_db 등)를 피한다. SUBSTR도 밴이면 MID로 바꿔야 하지만 그건 추후.
+        # 필터를 피한다. SUBSTR도 밴이면 MID로 바꿔야 하지만 그건 추후.
         'substr_fn':  lambda x, p, l: f"SUBSTR({x},{p},{l})",
         'concat':     lambda a, b: f"CONCAT({a},{b})",
         'current_db': "database()",

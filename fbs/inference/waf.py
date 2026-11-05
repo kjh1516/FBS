@@ -160,11 +160,12 @@ RATE_LIMIT_STATUS_CODES = {429}
 def match_block_keywords(body_lower: str, keywords) -> list[str]:
     """차단 키워드를 '단어 경계(\\b...\\b)'로 매칭한 목록을 돌려준다.
 
-    단순 부분 문자열(`kw in body`)로 보면 'hack'이 'dreamhack' 안에서 걸려 오탐이 난다 —
-    드림핵 챌린지는 거의 모든 페이지에 'dreamhack'(로고/브랜딩)이 있어 상시 가짜 WAF가 떴다.
-    단어 경계로 보면 'hack'은 단독 단어일 때만 매칭되고 'dreamhack'·'waffle' 같은 포함어는
-    안 걸린다. (상태코드 동반 조건은 쓰지 않는다 — 200으로 'blocked' 본문만 주는 커스텀
-    WAF를 놓치기 때문.) recon._detect_waf_body도 이 함수를 공유해 매칭 규칙을 동기화한다."""
+    단순 부분 문자열(`kw in body`)로 보면 'hack'이 'hackathon'·'lifehack' 같은 긴 단어나
+    브랜드명/로고 텍스트 안에서 걸려 오탐이 난다 — 그런 단어가 모든 페이지에 깔려 있으면
+    상시 가짜 WAF가 뜬다. 단어 경계로 보면 'hack'은 단독 단어일 때만 매칭되고 'hackathon'·
+    'waffle'(←'waf') 같은 포함어는 안 걸린다. (상태코드 동반 조건은 쓰지 않는다 — 200으로
+    'blocked' 본문만 주는 커스텀 WAF를 놓치기 때문.) recon._detect_waf_body도 이 함수를
+    공유해 매칭 규칙을 동기화한다."""
     return [kw for kw in keywords
             if re.search(r'\b' + re.escape(kw) + r'\b', body_lower)]
 

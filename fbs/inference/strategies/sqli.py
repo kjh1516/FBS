@@ -531,11 +531,11 @@ class SQLiStrategy(BaseStrategy):
           2) 벤더 시그니처/rate-limit(classify_waf_block의 강한 판정)이면 → 확실한 WAF 차단.
 
         그 외(밴 토큰 없음 + 벤더 시그니처 아님)는 거부로 단정하지 '않는다'. 예전엔 제네릭 키워드
-        ('hack' 등) 단독 매치를 길이 비교로 재검증했는데(1811 vs 1831 해킹), reset_db처럼 거부
-        페이지가 성공/정상 페이지와 같은 앱에서는 성공 응답까지 '차단'으로 오인해 신호를 잃었다.
+        ('hack' 등) 단독 매치를 길이 비교로 재검증했는데(1811 vs 1831 해킹), 거부 페이지가 성공/
+        정상 페이지와 거의 같은 앱에서는 성공 응답까지 '차단'으로 오인해 신호를 잃었다.
         밴은 filter_map으로 이미 정확히 알고, 진짜 인프라 WAF는 벤더 시그니처로 잡히므로, 애매한
         제네릭 판정은 무시하는 게 오탐이 적다(거부지문은 recon의 밴 학습에만 쓰고 여기선 안 쓴다 —
-        reset_db는 거부==성공 페이지라 지문으로도 이 둘을 못 가르기 때문)."""
+        거부==성공 페이지인 앱은 지문으로도 이 둘을 못 가르기 때문)."""
         if self._banned_in(surface, payload) is not None:
             return True
         blocked, name, _ = classify_waf_block(status, body)
@@ -960,8 +960,8 @@ class SQLiStrategy(BaseStrategy):
             #
             # 동시에 '무행(side-effect-free)'이어야 한다 — 바깥을 SELECT 0으로 하면 서브쿼리 값이
             # 0 → 'OR 0'이라 행을 반환하지 않는다. 로그인 폼 WHERE에 행이 반환되면 앱이 로그인
-            # 성공으로 처리하거나 더블체크/리셋/잠금/로깅 같은 부작용을 내는데(실측: reset_db는
-            # 인젝션이 행을 반환할 때마다 admin 비번 리셋), 지연만 목적인 SLEEP/BENCHMARK는 값을
+            # 성공으로 처리하거나 더블체크/리셋/잠금/로깅 같은 부작용을 내는데(실측: 어떤 타깃은
+            # 인젝션이 행을 반환할 때마다 계정 비번을 리셋), 지연만 목적인 SLEEP/BENCHMARK는 값을
             # SELECT 0으로 버려 무행으로 만든다 — 예전 SELECT 1은 행을 반환해 이 부작용이 있었다.
             ('MySQL_OR',   f"{q} OR (SELECT 0 FROM (SELECT SLEEP(5))x) #"),
             ('MySQL_AND',  f"{q} AND (SELECT 0 FROM (SELECT SLEEP(5))x) #"),
@@ -1747,8 +1747,8 @@ class SQLiStrategy(BaseStrategy):
     @staticmethod
     def _timed_expr(timefn: str, seconds: int, benchmark_n: int, run: bool) -> str:
         """run=True면 지연을, False면 즉시(0) 반환하는 표현식을 만든다. benchmark는 SLEEP
-        같은 지연 함수를 막는 필터를 CPU 반복 연산으로 우회한다(이 세션의 드림핵 타깃이 SLEEP은
-        무력화하고 BENCHMARK만 통한 사례처럼)."""
+        같은 지연 함수를 막는 필터를 CPU 반복 연산으로 우회한다(SLEEP은 무력화되고 BENCHMARK만
+        통과하는 타깃을 겨냥한 대안)."""
         if timefn == 'sleep':
             return f"SLEEP({seconds})" if run else "0"
         if timefn == 'benchmark':
@@ -1767,7 +1767,7 @@ class SQLiStrategy(BaseStrategy):
         중요(무행/side-effect-free): 오라클 페이로드는 절대 '행을 반환하면 안 된다'. 로그인 폼
         WHERE에 `OR (SELECT 1 ...)`처럼 참이 되는 값을 넣으면 행이 반환돼, 앱이 로그인 성공으로
         처리하거나(더블체크/리셋/잠금/로깅 등) 심지어 데이터를 바꾸는 부작용이 생긴다(실측:
-        reset_db는 인젝션이 행을 반환할 때마다 admin 비번을 리셋해 추출 자체를 자멸시켰다).
+        어떤 타깃은 인젝션이 행을 반환할 때마다 계정 비번을 리셋해 추출 자체를 자멸시켰다).
         BENCHMARK/SLEEP은 둘 다 '0'을 반환하므로 `IF(cond, 지연, 0)`의 값은 항상 0이다. 이를
         파생 테이블 (SELECT IF(...))x로 감싸 한 번만 materialize하고(행마다 반복 평가 방지 —
         맨 스칼라로 넣으면 행 수만큼 곱해져 타임아웃남), 바깥을 SELECT 0으로 해 값 0 → `OR 0`이라
