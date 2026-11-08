@@ -7,7 +7,7 @@ import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
 from fbs.inference.waf import classify_waf_block, try_evade, visible_text, diff_score, apply_named_evasion, EVASION_TRANSFORMS
-from fbs.inference.sql_dialects import SQL_DIALECTS, DIALECT_PROBE_ORDER, ERROR_SIGNATURES, detect_db_from_error
+from fbs.inference.sql_dialects import SQL_DIALECTS, DIALECT_PROBE_ORDER, detect_db_from_error, extract_error_snippet
 from fbs.inference.strategies.base import BaseStrategy
 
 """
@@ -657,21 +657,6 @@ class SQLiStrategy(BaseStrategy):
 
     # ── 요청 전송 ────────────────────────────────────────────────────────────
 
-    def _base_fields(self, surface: AttackSurface) -> dict:
-        """target 필드와 함께 보낼 나머지 필드의 기본값을 구성한다.
-
-        profiler가 크롤링 시점의 실제 값(form input value 등)을 all_params에
-        담아 넘겨주므로, 가능하면 'test' 더미 대신 그 값을 그대로 쓴다 —
-        숫자형 필드에 대한 arithmetic 프로브가 여기에 의존한다.
-        """
-        if surface.surface_type == 'url_param':
-            raw  = (surface.page or {}).get('params') or {}
-            data = {k: (v[0] if isinstance(v, list) and v else 'test') for k, v in raw.items()}
-        else:
-            data = dict(surface.extra.get('all_params') or {})
-        data.setdefault(surface.param, 'test')
-        return data
-
     def _send(self, surface: AttackSurface, data: dict, timeout: int | None = None):
         """(status, body, elapsed) — 실패 시 (None, '', elapsed)."""
         timeout = timeout or self.TIMEOUT
@@ -687,18 +672,6 @@ class SQLiStrategy(BaseStrategy):
             return resp.status_code, resp.text, time.monotonic() - start
         except Exception:
             return None, '', time.monotonic() - start
-
-    def _extract_snippet(self, body: str, context: int = 200) -> str | None:
-        """에러 시그니처 주변 텍스트를 추출한다 — 사람이 읽을 근거로 그대로 보여주기 위함."""
-        lower = body.lower()
-        for sigs in ERROR_SIGNATURES.values():
-            for sig in sigs:
-                idx = lower.find(sig)
-                if idx != -1:
-                    start = max(0, idx - 50)
-                    end = min(len(body), idx + context)
-                    return body[start:end].strip()
-        return None
 
     # ── 0. 멱등성 프로브 (stateful 여부 + 노이즈 측정) ────────────────────────
 
@@ -766,7 +739,7 @@ class SQLiStrategy(BaseStrategy):
                 'baseline_status': baseline_status,
                 'attack_status':   status,
                 'evidence_kind':   'body' if error_in_body else 'status',
-                'error_snippet':   self._extract_snippet(body) if error_in_body else None,
+                'error_snippet':   extract_error_snippet(body) if error_in_body else None,
                 'waf_evaded':      waf_evaded,
             }
         return None
@@ -1039,7 +1012,7 @@ class SQLiStrategy(BaseStrategy):
                     'baseline_status': baseline_status,
                     'attack_status':   status,
                     'evidence_kind':   'body',
-                    'error_snippet':   self._extract_snippet(body),
+                    'error_snippet':   extract_error_snippet(body),
                     'waf_evaded':      waf_evaded,
                 }
             elif status_error and fallback is None:

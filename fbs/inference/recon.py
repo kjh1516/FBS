@@ -6,7 +6,7 @@ import difflib
 import requests
 from urllib.parse import urljoin
 
-from fbs.inference.sql_dialects import ERROR_SIGNATURES, detect_db_from_error
+from fbs.inference.sql_dialects import detect_db_from_error, extract_error_snippet
 from fbs.inference.waf import visible_text, diff_score, match_block_keywords
 
 BASELINE = 'john35912'
@@ -44,18 +44,26 @@ _WAF_BODY_SIGNATURES = frozenset([
 # 안 번진다 — 예를 들어 따옴표가 막혔다고 xss 점수가 오르면 안 되니까. 특정 CTF/타겟의 실제
 # 필터 목록을 그대로 베끼지 않고, 취약점 유형별 대표 토큰으로 일반화해뒀다.
 _FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
-    # SQLi
-    "'":           {'sqli': 0.5},
-    '"':           {'sqli': 0.4},
+    # ── 중립 (여러 취약점에 공용) ────────────────────────────────────────────
+    # 빈 매핑({}) = 걸려도 특정 유형을 못 가리키므로 hint엔 기여하지 않는다. 다만 프로브는
+    # 하고(strategy가 'filter_map에서 이게 막혔다'를 읽어 페이로드 선택/회피에 씀), minimal-
+    # token 축소에도 참여한다. 실무에서 이것들만 거는 필터는 유형 판별이 안 돼, 걸렸을 때의
+    # 가중은 후속(전략 실패 후 재진입 등) 단계에서 판단한다. (가중은 _filter_map_evidence가
+    # 빈 매핑을 건너뛰어 자동으로 0이 된다.)
+    "'":  {}, '"':  {},                         # 문자열 구분자 (SQLi·XSS 속성 등 공용)
+    '$':  {},                                   # 변수/템플릿 마커 (SSTI·JS·PHP)
+    ' ':  {}, ',':  {}, '%':  {},               # 공백·구분자·와일드카드
+    '-':  {}, '+':  {}, '*':  {}, '/':  {},     # 산술/구조 원자 ('../'·'/*' 귀속에 필요)
+    '(':  {}, ')':  {},                         # 함수 호출 구문 (alert()·서브쿼리 등 공용)
+    ';':  {}, '|':  {}, '`':  {},               # 문장 구분·파이프·백틱 (CmdI·SQL·JS, cmdi 미구현)
+
+    # ── SQLi ─────────────────────────────────────────────────────────────────
     '--':          {'sqli': 0.4},
     '#':           {'sqli': 0.3},
     '/*':          {'sqli': 0.3},
     'union':       {'sqli': 0.5},
     'select':      {'sqli': 0.5},
-    '$':           {'sqli': 0.4},
     'sleep':       {'sqli': 0.3},
-    # SQLi 열거/추출용 — 막히면 SQLi 강한 신호이자, strategy가 페이로드에서 회피해야 할 토큰.
-    # 거부-지문 판정 덕에 SQL 에러(=인젝션 신호)를 밴으로 오분류하지 않는다.
     'order':       {'sqli': 0.5},
     'having':      {'sqli': 0.4},
     'like':        {'sqli': 0.4},
@@ -65,41 +73,32 @@ _FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
     'benchmark':   {'sqli': 0.4},
     'database':    {'sqli': 0.5},
     'information_schema': {'sqli': 0.5},
-    ',':           {'sqli': 0.2},
-    '%':           {'sqli': 0.3},
-    # 원자 SQL 연산자/구조/공백 토큰 — 공백·or·and·from까지 막는 아주 빡빡한 블랙리스트 WAF를
-    # 정확히 짚기 위함. (1) 이게 있어야 'order'/'onerror'/'information_schema'가 사실은 'or'
-    # 때문에 걸린 것임을 minimal-token 축소가 올바르게 귀속한다. (2) sqli.py가 이 원자 밴을
-    # 알아야 페이로드를 '밴'으로 인지하고, 기존 ||/&& 치환 + 공백 제거 우회(symbolic_no_space)를
-    # 실제로 발동시킨다 — 예: "' OR '1'='1' #" → "'||'1'='1'#"(공백·or 제거, 밴 0개).
+    # 'or'/'and'/'from' — SQL 논리/키워드 원자(막히면 SQL 방어 신호). 원자라 minimal-token
+    # 축소가 'order'/'information_schema' 등을 이쪽에 귀속하고, sqli.py가 밴을 인지해
+    # ||/&& 치환·공백 제거 우회(symbolic_no_space)를 발동한다.
     'or':          {'sqli': 0.4},
     'and':         {'sqli': 0.4},
     'from':        {'sqli': 0.4},
-    ' ':           {'sqli': 0.2},
-    '-':           {'sqli': 0.2},
-    '+':           {'sqli': 0.2},
-    '*':           {'sqli': 0.2},
-    # '/'는 SQL 주석(/**/)·나눗셈에 쓰이는 원자 문자. 이게 토큰으로 있어야 '../'·'/*'가
-    # 사실은 '/' 때문에 걸린 것임을 minimal-token 축소가 귀속한다(안 그러면 '../'가 독립
-    # 밴으로 남아 path_traversal 힌트를 잘못 올림). '.'은 흔히 안 막혀서 넣지 않는다.
-    '/':           {'sqli': 0.2},
-    # XSS
+
+    # ── XSS ──────────────────────────────────────────────────────────────────
     '<':           {'xss': 0.5},
     '>':           {'xss': 0.3},
     'script':      {'xss': 0.5},
     'onerror':     {'xss': 0.5},
     'javascript:': {'xss': 0.4},
-    # SSTI
+    # 'on' — 이벤트 핸들러 원자. 많은 XSS 필터가 'on'을 부분 문자열로 막는다. 이게 있어야
+    # 'onerror'·'union'("uni-on")·'information_schema'("informati-on")가 사실은 'on' 때문에
+    # 걸린 것임을 minimal-token 축소가 귀속한다(SQL 쪽 'or' 원자와 같은 역할).
+    'on':          {'xss': 0.4},
+
+    # ── SSTI ─────────────────────────────────────────────────────────────────
     '{{':          {'ssti': 0.5},
     '}}':          {'ssti': 0.3},
     '__class__':   {'ssti': 0.5},
-    # Path traversal
+
+    # ── Path traversal ───────────────────────────────────────────────────────
     '../':         {'path_traversal': 0.5},
     '..\\':        {'path_traversal': 0.4},
-    # Command injection
-    ';':           {'command_injection': 0.3},
-    '|':           {'command_injection': 0.3},
-    '`':           {'command_injection': 0.4},
 }
 
 # 길이 유사 판정 임계값 (절댓값, 텍스트 유사도 계산 전 빠른 필터)
@@ -251,7 +250,7 @@ class DBDetect:
                 'length_delta':       length_delta,
                 'probe_like_default': probe_like_default,
                 'default_similarity': default_similarity,
-                'error_snippet':      self._extract_snippet(body) if db_type else None,
+                'error_snippet':      extract_error_snippet(body) if db_type else None,
                 'elapsed':            round(elapsed, 3),
                 'db_type':            db_type,
                 'send_error':         send_error,
@@ -314,22 +313,28 @@ class DBDetect:
         필터를 가정하지 않고 변형/거부를 '측정'하며, 토큰은 일반화된 _FILTER_PROBE_TOKENS를 쓴다."""
         normal_text = visible_text(baseline_body or '')
 
-        # 페이지 요청별 흔들림 + 누적형 감지용 benign×2 (두 형태 공통 전처리)
+        # 누적형 감지 + 노이즈 측정용 benign 연속 3회. 누적형(memo)은 '같은 요청마다 응답이
+        # 일정량 커진다'로 식별한다. baseline_body(페이지 로드 시점)를 기준으로 쓰면 안 된다 —
+        # 이 함수 전에 error/reflection 프로브가 이미 memo에 누적시켜 normal_text가 뒤처져 있어,
+        # 첫 step만 그 누적분만큼 부풀어 '일정성' 검사가 깨진다(그래서 memo를 못 걸렀다). 대신
+        # 연속 3회를 fresh로 보내 '연속 증가분(d1,d2)'이 일정한지로 본다 — 이전 누적과 무관하다.
+        n0, _, _ = self._send(url, method, {**data, target: BASELINE})
         n1, _, _ = self._send(url, method, {**data, target: BASELINE})
         n2, _, _ = self._send(url, method, {**data, target: BASELINE})
+        t0 = visible_text(n0.text) if n0 is not None else normal_text
         t1 = visible_text(n1.text) if n1 is not None else normal_text
         t2 = visible_text(n2.text) if n2 is not None else normal_text
 
-        # 누적형(append-only) 가드 — memo처럼 매번 일정량 커지면 판정 보류(스팸·오탐 방지).
-        step1, step2 = len(t1) - len(normal_text), len(t2) - len(t1)
-        if (n1 is not None and n2 is not None
-                and step1 > _FILTER_MIN_DIFF_FLOOR and step2 > _FILTER_MIN_DIFF_FLOOR
-                and min(step1, step2) >= 0.5 * max(step1, step2)):
+        # 누적형(append-only) 가드 — 연속 증가분이 둘 다 양수 + 서로 비슷하면 메모형으로 보고 보류.
+        d1, d2 = len(t1) - len(t0), len(t2) - len(t1)
+        if (n0 is not None and n1 is not None and n2 is not None
+                and d1 > _FILTER_MIN_DIFF_FLOOR and d2 > _FILTER_MIN_DIFF_FLOOR
+                and min(d1, d2) >= 0.5 * max(d1, d2)):
             print(f"    [필터맵] {method} {url} (param={target!r}) — 누적형 엔드포인트 추정: "
-                  f"동일 benign 입력('{BASELINE}')을 연달아 2회 보냈더니 visible-text가 매번 일정량 증가")
-            print(f"             (len {len(normal_text)}→{len(t1)}→{len(t2)}, step +{step1}/+{step2}, "
-                  f"증가 일정도 {min(step1,step2)/max(step1,step2):.0%}≥50% → 입력이 전역 누적되는 메모형 추정)")
-            print(f"             거부지문 비교가 오염돼 신뢰 불가 → 필터 지도 판정 보류(종합/토큰 프로브 생략)")
+                  f"동일 benign 입력('{BASELINE}')을 연달아 보냈더니 응답이 매번 일정량 증가")
+            print(f"             (연속 visible-text len {len(t0)}→{len(t1)}→{len(t2)}, 증가분 +{d1}/+{d2}, "
+                  f"일정도 {min(d1,d2)/max(d1,d2):.0%}≥50% → 입력이 전역 누적되는 메모형)")
+            print(f"             필터 지도 판정 보류(종합/토큰 프로브 생략)")
             return None
 
         # 반사되면 반사형(변형 측정), 아니면 응답형(거부 지문)
@@ -351,6 +356,7 @@ class DBDetect:
         if self._reflected_outcome(resp.text, ''.join(tokens)) == 'passed':
             return None
 
+        print(f"        필터 감지 — 토큰 {len(tokens)}개 개별 확인 중...", flush=True)
         outcomes: dict[str, str] = {}
         for token in tokens:
             t_resp, _, _ = self._send(url, method, {**data, target: BASELINE + token})
@@ -375,7 +381,10 @@ class DBDetect:
         (raw body로 봐야 인코딩·태그 생존을 그대로 관측한다.)"""
         idx = body.rfind(BASELINE)
         if idx == -1:
-            return 'removed'   # 앵커조차 안 돌아옴 = 입력이 통째로 걸림
+            # 앵커(중립 영숫자)조차 안 돌아옴 = 입력이 '통째로' 거부됨(reject형: "filtered!!!"
+            # 같은 고정 응답). token만 잘린 strip형과 구분해야 한다 — 중첩 우회는 strip형에만
+            # 통하기 때문(reject형은 중첩해도 token이 들어있어 또 거부됨).
+            return 'rejected'
         seg = body[idx + len(BASELINE):]
         if seg.startswith(token):
             return 'passed'
@@ -411,6 +420,7 @@ class DBDetect:
         if diff_score(normal_text, reject_text) <= threshold:
             return None  # 정상과 노이즈 수준 차이 = 반응하는 필터 없음
 
+        print(f"        필터 감지 — 토큰 {len(_FILTER_PROBE_TOKENS)}개 개별 확인 중...", flush=True)
         outcomes: dict[str, str] = {}
         for token in _FILTER_PROBE_TOKENS:
             t_resp, _, _ = self._send(url, method, {**data, target: BASELINE + token})
@@ -572,19 +582,6 @@ class DBDetect:
         return 'html'
 
     @staticmethod
-    def _extract_snippet(body: str, context: int = 200) -> str | None:
-        """에러 시그니처 주변 텍스트를 추출한다."""
-        lower = body.lower()
-        for sigs in ERROR_SIGNATURES.values():
-            for sig in sigs:
-                idx = lower.find(sig)
-                if idx != -1:
-                    start = max(0, idx - 50)
-                    end   = min(len(body), idx + context)
-                    return body[start:end].strip()
-        return None
-
-    @staticmethod
     def _diff_snippet(base: str, target: str, max_len: int = 300) -> str | None:
         """target에서 base 대비 새로 추가된 텍스트를 추출한다."""
         matcher = difflib.SequenceMatcher(None, base, target, autojunk=False)
@@ -605,7 +602,8 @@ class Recon:
     def run(self, pages: list[dict]) -> list[dict]:
         """각 페이지의 모든 필드에 baseline 값을 전송하고 응답을 page['recon']에 저장한다."""
         print(f"\n# [리콘] {len(pages)}개 페이지 프로브 시작")
-        for page in pages:
+        for i, page in enumerate(pages, 1):
+            print(f"  [{i}/{len(pages)}] 프로브 중: {page['url']}", flush=True)
             page['recon'] = self._probe_page(page)
 
         self._annotate_block_ratio(pages)
@@ -731,6 +729,7 @@ class Recon:
         results['__exposed__'] = self._probe_exposed(base_url, page.get('tech_stack') or {})
 
         for param in (page.get('params') or {}):
+            print(f"      · param={param!r} 프로브", flush=True)
             resp, elapsed = self._send(base_url, 'GET', {param: BASELINE})
             results[param] = self._record(resp, elapsed)
             results[param]['db'] = db_detect.run(
@@ -756,6 +755,7 @@ class Recon:
                     continue
                 if inp.get('type') in ('submit', 'button', 'image', 'reset'):
                     continue
+                print(f"      · form {name!r} 프로브", flush=True)
                 data = {**all_inputs, name: BASELINE}
                 resp, elapsed = self._send(action, method, data)
                 results[name] = self._record(resp, elapsed)
@@ -774,6 +774,7 @@ class Recon:
         for param in (page.get('hidden_params') or []):
             if param in results:
                 continue
+            print(f"      · hidden param={param!r} 프로브", flush=True)
             resp, elapsed = self._send(base_url, 'GET', {param: BASELINE})
             results[param] = self._record(resp, elapsed)
             results[param]['db'] = db_detect.run(
@@ -791,6 +792,7 @@ class Recon:
                 continue
             action       = entry.get('action') or page['url']
             known_fields = entry.get('known_fields') or {}
+            print(f"      · hidden POST {name!r} 프로브", flush=True)
             data = {**known_fields, name: BASELINE}
             resp, elapsed = self._send(action, 'POST', data)
             results[name] = self._record(resp, elapsed)

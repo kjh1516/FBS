@@ -30,6 +30,20 @@ class BaseStrategy(ABC):
         필드명 힌트 외의 신호(예: XSS의 reflects_html)를 반영하려면 하위 전략에서 재정의한다."""
         return surface.extra.get('hints', {}).get(self.VULN_TYPE, 0.0)
 
+    def _base_fields(self, surface: 'AttackSurface') -> dict:
+        """target 필드와 함께 보낼 나머지 필드의 기본값을 구성한다(SQLi·XSS 전략 공용).
+
+        profiler가 크롤링 시점의 실제 값(form input value 등)을 all_params에 담아 넘기므로,
+        가능하면 'test' 더미 대신 그 값을 그대로 쓴다 — 숫자형 필드 arithmetic 프로브 등이
+        여기에 의존한다."""
+        if surface.surface_type == 'url_param':
+            raw  = (surface.page or {}).get('params') or {}
+            data = {k: (v[0] if isinstance(v, list) and v else 'test') for k, v in raw.items()}
+        else:
+            data = dict(surface.extra.get('all_params') or {})
+        data.setdefault(surface.param, 'test')
+        return data
+
     @abstractmethod
     def run(self, surface: 'AttackSurface') -> list['VulnResult']:
         """probe → analyze → reattack 전 과정을 실행하고 결과를 반환."""

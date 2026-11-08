@@ -67,3 +67,17 @@ def detect_db_from_error(body: str) -> str | None:
         if any(sig in lower for sig in sigs):
             return db
     return None
+
+
+def extract_error_snippet(body: str, context: int = 200) -> str | None:
+    """에러 시그니처 주변 텍스트를 추출한다 — 사람이 읽을 근거로 그대로 보여주기 위함.
+    (recon·sqli가 공유 — ERROR_SIGNATURES와 같은 파일에 둔다.)"""
+    lower = body.lower()
+    for sigs in ERROR_SIGNATURES.values():
+        for sig in sigs:
+            idx = lower.find(sig)
+            if idx != -1:
+                start = max(0, idx - 50)
+                end   = min(len(body), idx + context)
+                return body[start:end].strip()
+    return None

