@@ -59,9 +59,10 @@ fbs/
 ├─ pipelines.py, items.py  # 크롤 결과 → SQLite
 └─ inference/              # 단계 B: 추론 엔진
    ├─ engine.py            #   파이프라인 총괄
-   ├─ recon.py             #   공용 신호 수집 (반사·필터맵·WAF)
+   ├─ recon.py             #   신호 수집 허브 (반사·필터맵·차단비율)
    ├─ profiler.py          #   증거 클래스 기반 우선순위 점수
-   ├─ waf.py               #   차단 판별 + 우회 변형 세트
+   ├─ validation.py        #   필터·WAF 탐지(baseline 차분) + 우회 변형
+   ├─ compare.py           #   범용 응답 비교 (visible_text·diff_score)
    ├─ sql_dialects.py      #   DB 방언 테이블
    └─ strategies/          #   취약점별 탐지·확정
       ├─ sqli.py
