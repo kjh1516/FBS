@@ -8,7 +8,7 @@ import requests
 from fbs.inference.models import AttackSurface, VulnResult
 from fbs.inference.profiler import Profiler
 from fbs.inference.recon import Recon, DBDetect
-from fbs.inference.waf import WafDetector
+from fbs.inference.validation import WafDetector
 from fbs.inference.strategies.base import BaseStrategy
 
 """

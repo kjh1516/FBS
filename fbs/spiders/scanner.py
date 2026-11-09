@@ -7,7 +7,8 @@ from scrapy.spiders import CrawlSpider
 from urllib.parse import urlparse, urljoin, parse_qs
 from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload
 from fbs.items import PageItem, ButtonResultItem
-from fbs.inference.waf import classify_waf_block, EVASION_TRANSFORMS, visible_text, diff_score
+from fbs.inference.validation import classify_waf_block, EVASION_TRANSFORMS
+from fbs.inference.compare import visible_text, diff_score
 from scrapy_playwright.page import PageMethod
 
 sys.stdout.reconfigure(encoding='utf-8')

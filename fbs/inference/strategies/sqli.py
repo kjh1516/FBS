@@ -1,12 +1,12 @@
 import concurrent.futures
 import re
 import string
-import time
 
 import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
-from fbs.inference.waf import classify_waf_block, try_evade, visible_text, diff_score, apply_named_evasion, EVASION_TRANSFORMS
+from fbs.inference.validation import classify_waf_block, try_evade, apply_named_evasion, EVASION_TRANSFORMS
+from fbs.inference.compare import visible_text, diff_score
 from fbs.inference.sql_dialects import SQL_DIALECTS, DIALECT_PROBE_ORDER, detect_db_from_error, extract_error_snippet
 from fbs.inference.strategies.base import BaseStrategy
 
@@ -656,22 +656,6 @@ class SQLiStrategy(BaseStrategy):
         return status, body, elapsed, used_payload, True
 
     # ── 요청 전송 ────────────────────────────────────────────────────────────
-
-    def _send(self, surface: AttackSurface, data: dict, timeout: int | None = None):
-        """(status, body, elapsed) — 실패 시 (None, '', elapsed)."""
-        timeout = timeout or self.TIMEOUT
-        enctype = surface.extra.get('enctype') or ''
-        start = time.monotonic()
-        try:
-            if surface.method == 'GET':
-                resp = self.session.get(surface.url, params=data, timeout=timeout)
-            elif 'application/json' in enctype:
-                resp = self.session.request(surface.method, surface.url, json=data, timeout=timeout)
-            else:
-                resp = self.session.request(surface.method, surface.url, data=data, timeout=timeout)
-            return resp.status_code, resp.text, time.monotonic() - start
-        except Exception:
-            return None, '', time.monotonic() - start
 
     # ── 0. 멱등성 프로브 (stateful 여부 + 노이즈 측정) ────────────────────────
 

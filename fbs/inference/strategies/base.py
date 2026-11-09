@@ -1,4 +1,6 @@
+import time
 from abc import ABC, abstractmethod
+
 from fbs.inference.models import AttackSurface, VulnResult
 
 
@@ -19,6 +21,9 @@ class BaseStrategy(ABC):
 
     # 이 전략이 대응하는 취약점 유형 키 (profiler hints의 키와 동일: 'sqli' | 'xss' | ...).
     VULN_TYPE: str = ''
+
+    # HTTP 요청 타임아웃(초) 기본값 — 하위 전략이 필요시 재정의(예: SQLi time-based는 더 길게).
+    TIMEOUT = 10
 
     @abstractmethod
     def can_handle(self, surface: 'AttackSurface') -> bool:
@@ -43,6 +48,23 @@ class BaseStrategy(ABC):
             data = dict(surface.extra.get('all_params') or {})
         data.setdefault(surface.param, 'test')
         return data
+
+    def _send(self, surface: 'AttackSurface', data: dict, timeout: int | None = None):
+        """(status, body, elapsed) — 실패 시 (None, '', elapsed). GET은 쿼리스트링, JSON enctype은
+        json=, 그 외는 form data=로 보낸다. SQLi·XSS 전략 공용(self.session/self.TIMEOUT 사용)."""
+        timeout = timeout or self.TIMEOUT
+        enctype = surface.extra.get('enctype') or ''
+        start = time.monotonic()
+        try:
+            if surface.method == 'GET':
+                resp = self.session.get(surface.url, params=data, timeout=timeout)
+            elif 'application/json' in enctype:
+                resp = self.session.request(surface.method, surface.url, json=data, timeout=timeout)
+            else:
+                resp = self.session.request(surface.method, surface.url, data=data, timeout=timeout)
+            return resp.status_code, resp.text, time.monotonic() - start
+        except Exception:
+            return None, '', time.monotonic() - start
 
     @abstractmethod
     def run(self, surface: 'AttackSurface') -> list['VulnResult']:

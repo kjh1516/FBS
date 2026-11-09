@@ -1,25 +1,31 @@
 import re
-import difflib
 
 import requests
-from bs4 import BeautifulSoup
+
+from fbs.inference.sql_dialects import detect_db_from_error
+from fbs.inference.compare import visible_text, diff_score
 
 """
-WAF(Web Application Firewall) 탐지 + 우회 + 응답 비교 공용 모듈.
+입력 검증(input validation) 탐지 공용 모듈 — 앱 필터든 WAF든 "내가 보낸 입력에 앞단이
+어떻게 반응하나"를 재는 하나의 일로 통합한다. (예전 waf.py + recon의 필터맵 코어를 합침.)
 
-web_scanner/pipelines/waf.py에 있던 능동 스캔(baseline 5개 → probe 5개 →
-evasion 6개, 필드당 최대 16개 요청)을 통째로 옮기는 대신 범위를 줄여서 가져온다:
-  - passive: 헤더/쿠키/Server 문자열로 벤더 특정 (요청 없음)
-  - classify_waf_block(): 상태코드+본문만 보고 이 응답이 WAF 차단 페이지인지 판단
-  - EVASION_TRANSFORMS: 차단된 payload를 재시도할 때 쓰는 범용 문자열 변환들
-  - visible_text()/diff_score(): 두 응답이 실제로 다른지 비교하는 공용 유틸
+핵심 원칙은 **baseline 차분**: "본문에 차단 문구가 있나"(절대값)가 아니라 "정상 응답 대비
+반응이 바뀌었나"로 본다 — 정상 페이지가 자기 소스에 가진 문구('Access denied' 같은)를
+WAF로 오탐하던 문제를 구조적으로 제거한다. "필터냐 WAF냐"는 이 측정 위에 얹는 해석일 뿐.
 
-이것들이 전부 여기 모여있는 이유는 SQLiStrategy(fbs/inference/strategies/sqli.py,
-동기적 requests 기반)와 scanner.py(fbs/spiders/, 비동기 Scrapy 콜백 기반) 양쪽에서
-같은 로직을 써야 하기 때문이다 — 크롤러가 숨겨진 POST 파라미터를 퍼징할 때도
-WAF 차단 판별·우회·응답 비교가 SQLi 전략과 동일해야 신호가 일관된다. classify_waf_block()
-은 recon/profiler → strategy로 흐르는 quote_char와 같은 패턴으로 surface.extra['waf_info']에
-실려 다닌다.
+구성:
+  - 반응 프리미티브: classify_reflected_reaction()(반사형 passed/removed/encoded/rejected),
+    reduce_substring_bans(), FILTER_PROBE_TOKENS(프로브 vocabulary)
+  - 차단 판별: classify_waf_block()(baseline 받으면 차분 게이팅), WafDetector(페이지 passive
+    지문 + 양성-상태코드 가드된 active)
+  - 귀속: KNOWN_WAF_SIGNATURES(헤더/쿠키 passive), BLOCK_PAGE_SIGNATURES/GENERIC_BLOCK_KEYWORDS
+  - 우회: EVASION_TRANSFORMS / XSS_EVASION_TRANSFORMS / try_evade()
+  - 비교 유틸: visible_text() / diff_score()
+
+여기 모아둔 이유: recon(DBDetect, 동기 requests)·scanner.py(비동기 Scrapy)·SQLiStrategy/
+XSSStrategy가 전부 같은 측정 로직을 써야 신호가 일관되기 때문. recon은 FILTER_PROBE_TOKENS·
+반응 분류기·GENERIC_BLOCK_KEYWORDS를 그대로 공유하고(별도 테이블 폐지), 결과는
+surface.extra(filter_map/waf_info)로 profiler/strategy에 흐른다.
 """
 
 # ── 시그니처 (web_scanner/pipelines/waf.py에서 그대로 포팅) ─────────────────────
@@ -97,6 +103,10 @@ KNOWN_WAF_SIGNATURES = {
     },
 }
 
+# 벤더 '고유' 문자열만 둔다 — 'request blocked'·'not acceptable'·'error code: 403'처럼 정상
+# 앱도 쓰는 일반 문구를 벤더 리스트에 두면 틀린 벤더명으로 귀속된다('access denied'→Akamai
+# 오탐과 같은 계열). block 의도 문구는 GENERIC_BLOCK_KEYWORDS('blocked' 등)가 이미 커버하므로
+# 여기서 빼도 탐지는 유지되고(단 'Unknown/Custom WAF'로), 상태코드는 BLOCK_STATUS_CODES가 본다.
 BLOCK_PAGE_SIGNATURES = {
     'Cloudflare': [
         'attention required! | cloudflare',
@@ -104,29 +114,31 @@ BLOCK_PAGE_SIGNATURES = {
         'error 1010',
     ],
     'AWS WAF': [
-        'awswaf', 'request blocked',
+        'awswaf',
     ],
     'Akamai': [
-        'access denied', 'akamai ghost', 'reference&#32;&#35;',
+        # 'access denied'는 정상 앱도 흔히 쓰는 문구(예: 페이지 JS의 alert('Access denied ...'))라
+        # 벤더 특정 시그니처에서 뺀다 — 일반 키워드(GENERIC_BLOCK_KEYWORDS)로만 남겨 baseline
+        # 차분/상태코드 corroboration을 받게 한다. 'akamai ghost'·'reference #'는 고유해 유지.
+        'akamai ghost', 'reference&#32;&#35;',
     ],
     'Imperva / Incapsula': [
         'incapsula incident id', 'powered by incapsula',
     ],
     'ModSecurity': [
-        'mod_security', 'modsecurity', 'not acceptable',
+        'mod_security', 'modsecurity',
     ],
     'F5 BIG-IP ASM': [
-        'the requested url was rejected', 'support id',
+        'the requested url was rejected',
     ],
     'Sucuri': [
         'access denied - sucuri website firewall', 'sucuri cloudproxy',
     ],
     'Azure Front Door / Azure WAF': [
-        'microsoft azure application gateway', 'error code: 403',
-        'the request is blocked', 'azure',
+        'microsoft azure application gateway',
     ],
     'Google Cloud Armor': [
-        'your client does not have permission', '403. that', "that's an error",
+        'your client does not have permission', "that's an error",
     ],
     'Nginx + Naxsi': [
         'naxsi', '&#36;naxsi_fmt',
@@ -146,15 +158,24 @@ GENERIC_BLOCK_KEYWORDS = [
     'bot detected', 'automated request',
     'your ip has been blocked',
     'this request has been blocked',
-    # CTF/개인 프로젝트 앱들이 흔히 쓰는 자체 필터 거부 문구 — recon.py의
-    # _WAF_BODY_SIGNATURES와 반드시 동기화해서 유지한다. 여기 없으면
-    # classify_waf_block()이 "차단 아님"으로 오판해서 SQLiStrategy가 우회
-    # 시도 자체를 안 하고, 필터 거부 응답을 진짜 앱 반응으로 착각해버린다.
+    # CTF/개인 프로젝트 앱들이 흔히 쓰는 자체 필터 거부 문구. recon의 거부 지문 탐지도
+    # 이 테이블을 그대로 공유한다(예전엔 recon._WAF_BODY_SIGNATURES로 따로 들고 있다가
+    # "동기화 유지" 부담이 있었으나, validation 통합으로 단일 테이블화했다).
     'hack', 'attack', 'illegal', 'detected',
 ]
 
 BLOCK_STATUS_CODES      = {403, 406, 444, 503, 999}
 RATE_LIMIT_STATUS_CODES = {429}
+
+# recon의 반사/쿼트 프로빙(DBDetect._detect_waf_body)이 쓰는 '거부 본문' 보수적 키워드셋.
+# 그 자리는 baseline 없이 절대값으로 보므로(차분 아님) GENERIC_BLOCK_KEYWORDS보다 좁게
+# 유지한다 — 'denied'·'forbidden' 같은 흔한 단어까지 넣으면 정상 페이지를 WAF-차단으로
+# 오판해 반사 탐지를 통째로 스킵해버린다(native 콘텐츠 오탐). classify_waf_block은 더 넓은
+# GENERIC을 쓰되 baseline 차분/상태코드로 거르므로 괜찮다 — 쓰임이 달라 의도적으로 분리.
+REFLECTION_BLOCK_KEYWORDS = frozenset([
+    'hack', 'blocked', 'attack', 'detected', 'illegal',
+    'not allowed', 'bad request', 'security violation', 'waf', 'firewall',
+])
 
 
 def match_block_keywords(body_lower: str, keywords) -> list[str]:
@@ -164,34 +185,43 @@ def match_block_keywords(body_lower: str, keywords) -> list[str]:
     브랜드명/로고 텍스트 안에서 걸려 오탐이 난다 — 그런 단어가 모든 페이지에 깔려 있으면
     상시 가짜 WAF가 뜬다. 단어 경계로 보면 'hack'은 단독 단어일 때만 매칭되고 'hackathon'·
     'waffle'(←'waf') 같은 포함어는 안 걸린다. (상태코드 동반 조건은 쓰지 않는다 — 200으로
-    'blocked' 본문만 주는 커스텀 WAF를 놓치기 때문.) recon._detect_waf_body도 이 함수를
-    공유해 매칭 규칙을 동기화한다."""
+    'blocked' 본문만 주는 커스텀 WAF를 놓치기 때문.) recon의 거부 지문 탐지도 이 함수 +
+    같은 GENERIC_BLOCK_KEYWORDS를 그대로 공유한다(별도 테이블 폐지)."""
     return [kw for kw in keywords
             if re.search(r'\b' + re.escape(kw) + r'\b', body_lower)]
 
 
 # ── 차단 페이지 판별기 (공용 — SQLiStrategy 등에서도 그대로 재사용) ──────────────
 
-def classify_waf_block(status: int | None, body: str) -> tuple[bool, str | None, list[str]]:
-    """(차단여부, WAF 이름, 근거) — 상태코드+본문만 보고 판단한다 (baseline 비교 없이).
+def classify_waf_block(status: int | None, body: str,
+                       baseline: str | None = None) -> tuple[bool, str | None, list[str]]:
+    """(차단여부, WAF 이름, 근거) — 이 응답이 WAF/앞단 거부인지 판단.
 
-    원본의 _analyze_response()는 baseline과 비교해서 헤더 변화/본문 유사도까지
-    보지만, 여기서는 매 프로브 응답을 baseline 없이도 즉시 판단할 수 있도록
-    벤더별 차단 페이지 시그니처 + 제네릭 키워드 + 상태코드만으로 좁혔다.
+    baseline(정상 응답 본문)을 주면 '차분 게이팅'을 한다: 차단 시그니처/키워드가
+    baseline에도 똑같이 들어 있으면 그건 우리 요청에 대한 '반응'이 아니라 그 페이지가
+    원래 가진 native 콘텐츠다(예: 안내문·JS 문자열의 'Access denied'). 그런 토큰은
+    차단 근거에서 제외한다 — WAF 차단은 정의상 정상과 '달라지는' 반응이기 때문. 이게
+    validation 통합의 핵심 원칙(절대값 → baseline 차분)의 최소 구현이다.
+    baseline=None이면 예전처럼 본문만 보고 판단한다(baseline을 모르는 per-probe 호출용).
     """
     if status is None or not body:
         return False, None, []
     body_lower = body.lower()
+    base_lower = baseline.lower() if baseline else ''
 
     if status in RATE_LIMIT_STATUS_CODES:
         return True, 'Rate Limit (429)', [f"status_code: {status} (요청 속도 제한, WAF 차단은 아님)"]
 
     for waf_name, patterns in BLOCK_PAGE_SIGNATURES.items():
         for pattern in patterns:
-            if pattern in body_lower:
+            # baseline에 이미 있는 시그니처는 그 페이지 native 콘텐츠 → 차단 반응 아님
+            if pattern in body_lower and pattern not in base_lower:
                 return True, waf_name, [f"block_page_signature: {pattern!r}"]
 
     matched = match_block_keywords(body_lower, GENERIC_BLOCK_KEYWORDS)
+    if base_lower:
+        native = set(match_block_keywords(base_lower, GENERIC_BLOCK_KEYWORDS))
+        matched = [kw for kw in matched if kw not in native]
     if matched:
         evidence = [f"generic_keywords: {matched[:3]}"]
         if status in BLOCK_STATUS_CODES:
@@ -201,31 +231,218 @@ def classify_waf_block(status: int | None, body: str) -> tuple[bool, str | None,
     return False, None, []
 
 
-# ── 응답 비교 공용 유틸 (boolean/blind/ORDER BY 경계/POST 퍼징이 전부 공유) ─────────
+# ── 반응 측정 프리미티브 (baseline 차분) ──────────────────────────────────────────
+# validation의 핵심: "입력에 앞단이 어떻게 반응하나"를 baseline과 비교해서 잰다. 필터맵
+# (recon, per-surface 오케스트레이션)과 전략의 per-payload 게이트가 이 토큰 vocabulary와
+# 반응 분류기를 공유한다 — 필터냐 WAF냐는 이 측정 위에 얹는 해석일 뿐이다.
 
-def visible_text(body: str) -> str:
-    """HTML 태그·스크립트·스타일을 걷어내고 눈에 보이는 텍스트만 남긴다. hidden input 값,
-    CSRF 토큰, script 안의 타임스탬프처럼 요청마다 바뀌는 잡음이 raw body 길이/문자 비교에
-    그대로 섞여 들어가면 실제 신호(응답 행 수 변화 등)가 노이즈에 묻혀 오판하기 쉽다 —
-    정규화된 텍스트로 비교하면 이런 잡음이 상당수 걸러진다."""
-    if not body:
-        return ''
-    soup = BeautifulSoup(body, 'html.parser')
-    for tag in soup(['script', 'style']):
-        tag.decompose()
-    return soup.get_text(separator=' ', strip=True)
+# 토큰 하나하나를 특정 vuln-type에 매핑해두는 참조 테이블(필터맵 프로브 vocabulary).
+# profiler가 필터맵 결과를 hints 점수로 바꿀 때 이 가중치를 쓰는데, 토큰 하나는 자기한테
+# 매핑된 vuln-type에만 점수를 주고 다른 유형엔 절대 안 번진다(따옴표 차단이 xss로 번지면
+# 안 됨). 빈 매핑({}) = 걸려도 특정 유형을 못 가리키므로 hint엔 기여 안 함(중립 토큰). 특정
+# CTF/타겟의 실제 필터 목록을 베끼지 않고, 취약점 유형별 대표 토큰으로 일반화해뒀다.
+FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
+    # ── 중립 (여러 취약점에 공용) ────────────────────────────────────────────
+    "'":  {}, '"':  {},                         # 문자열 구분자 (SQLi·XSS 속성 등 공용)
+    '$':  {},                                   # 변수/템플릿 마커 (SSTI·JS·PHP)
+    ' ':  {}, ',':  {}, '%':  {},               # 공백·구분자·와일드카드
+    '-':  {}, '+':  {}, '*':  {}, '/':  {},     # 산술/구조 원자 ('../'·'/*' 귀속에 필요)
+    '(':  {}, ')':  {},                         # 함수 호출 구문 (alert()·서브쿼리 등 공용)
+    ';':  {}, '|':  {}, '`':  {},               # 문장 구분·파이프·백틱 (CmdI·SQL·JS, cmdi 미구현)
+
+    # ── SQLi ─────────────────────────────────────────────────────────────────
+    '--':          {'sqli': 0.4},
+    '#':           {'sqli': 0.3},
+    '/*':          {'sqli': 0.3},
+    'union':       {'sqli': 0.5},
+    'select':      {'sqli': 0.5},
+    'sleep':       {'sqli': 0.3},
+    'order':       {'sqli': 0.5},
+    'having':      {'sqli': 0.4},
+    'like':        {'sqli': 0.4},
+    'substr':      {'sqli': 0.4},
+    'substring':   {'sqli': 0.4},
+    'ascii':       {'sqli': 0.4},
+    'benchmark':   {'sqli': 0.4},
+    'database':    {'sqli': 0.5},
+    'information_schema': {'sqli': 0.5},
+    # 'or'/'and'/'from' — SQL 논리/키워드 원자. 원자라 minimal-token 축소가 'order'/
+    # 'information_schema' 등을 이쪽에 귀속하고, sqli.py가 밴을 인지해 ||/&& 치환·공백 제거
+    # 우회(symbolic_no_space)를 발동한다.
+    'or':          {'sqli': 0.4},
+    'and':         {'sqli': 0.4},
+    'from':        {'sqli': 0.4},
+
+    # ── XSS ──────────────────────────────────────────────────────────────────
+    '<':           {'xss': 0.5},
+    '>':           {'xss': 0.3},
+    'script':      {'xss': 0.5},
+    'onerror':     {'xss': 0.5},
+    'javascript:': {'xss': 0.4},
+    # 'on' — 이벤트 핸들러 원자. 'onerror'·'union'("uni-on")·'information_schema'가 사실은
+    # 'on' 때문에 걸린 것임을 minimal-token 축소가 귀속한다(SQL 쪽 'or' 원자와 같은 역할).
+    'on':          {'xss': 0.4},
+
+    # ── SSTI ─────────────────────────────────────────────────────────────────
+    '{{':          {'ssti': 0.5},
+    '}}':          {'ssti': 0.3},
+    '__class__':   {'ssti': 0.5},
+
+    # ── Path traversal ───────────────────────────────────────────────────────
+    '../':         {'path_traversal': 0.5},
+    '..\\':        {'path_traversal': 0.4},
+}
 
 
-def diff_score(text_a: str, text_b: str) -> int:
-    """두 텍스트 사이 실제로 달라진(삽입/삭제/치환) 구간 길이의 합 — difflib opcode 기반.
-    전체 길이 차이만 보면 "길이는 비슷한데 일부만 바뀐" 미세한 변화를 놓치기 때문에,
-    boolean/blind/ORDER BY 경계 탐지/POST 파라미터 퍼징이 전부 이 함수를 공용으로 쓴다."""
-    matcher = difflib.SequenceMatcher(None, text_a, text_b, autojunk=False)
-    return sum(
-        max(i2 - i1, j2 - j1)
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
-        if tag != 'equal'
-    )
+def classify_reflected_reaction(body: str, anchor: str, token: str) -> str:
+    """반사형 반응 분류 — 응답에서 anchor(영숫자, 항상 생존) 바로 뒤에 token이 어떻게
+    반사됐나로 outcome을 잰다. passed/encoded/removed/rejected.
+      - token 그대로         → passed
+      - 자리에 HTML 엔티티    → encoded (출력 이스케이프. &lt; &#39; &#x27; 등 어느 형태든
+                               &#?\\w+; 패턴으로 봄. 백엔드엔 도달, 출력만 변형 → 필터 아님)
+      - 그 외(사라짐/잘림)    → removed (백엔드가 token을 strip)
+      - anchor조차 안 돌아옴  → rejected (입력이 '통째로' 거부됨: "filtered!!!" 같은 고정 응답)
+    rejected와 removed를 가르는 게 중요하다 — 중첩 우회(토큰 사이에 토큰 끼우기)는 strip형
+    (removed)에만 통하고 reject형엔 안 통하기 때문. raw body로 봐야 인코딩·태그 생존을 그대로
+    관측한다. (예전 recon._reflected_outcome — validation 통합으로 anchor를 인자로 받게 일반화.)"""
+    idx = body.rfind(anchor)
+    if idx == -1:
+        return 'rejected'
+    seg = body[idx + len(anchor):]
+    if seg.startswith(token):
+        return 'passed'
+    if any(not c.isalnum() for c in token) and re.match(r'&#?\w+;', seg):
+        return 'encoded'
+    return 'removed'
+
+
+def reduce_substring_bans(outcomes: dict[str, str]) -> dict[str, str]:
+    """더 짧은 '걸린' 토큰이 부분 문자열로 든 토큰은 그 짧은 토큰 탓이지 독립 밴이 아니다 —
+    앱 필터가 substring 매칭이면(예: '$'가 걸리면 '$where'도 덩달아) 중복/교차유형으로 hints가
+    부푼다. 그런 토큰은 passed로 되돌린다. (예전 recon._reduce_substring_bans.)"""
+    banned = [t for t, o in outcomes.items() if o != 'passed']
+    for t in banned:
+        if any(other != t and other in t for other in banned):
+            outcomes[t] = 'passed'
+    return outcomes
+
+
+# ── 필터맵 프로버 (토큰별 outcome 측정, baseline 차분) ────────────────────────────
+# recon이 이 프로버로 per-surface 필터 지도를 수집한다. 실제 전송은 호출부가
+# send_fn(url, method, data) -> (resp, elapsed, err) 콜백으로 주입한다(try_evade와 같은
+# 패턴) — "무엇을 보내 어떻게 판정하나"만 여기 두고 전송 방식엔 독립적이다. 결과(outcome
+# dict)는 recon이 받아 surface.extra['filter_map']로 흘려보낸다.
+
+_FILTER_MIN_DIFF_FLOOR = 1  # 거부 지문 판정 바닥값. 실제 임계값은 페이지 노이즈로 max(noise*2, floor).
+
+
+def probe_filter_map(send_fn, url, method, data, target, baseline_body, anchor,
+                     reflection=None) -> dict[str, str] | None:
+    """필터 지도 — 토큰별 outcome('passed'/'removed'/'encoded'/'rejected').
+
+    필터는 두 형태로 드러난다:
+      · 반사형: 'anchor+token'을 보내 token이 출력에 생존하는지로 변형을 직접 관측
+                (passed/removed/encoded). 몰래 sanitize하는 필터를 잡는다.
+      · 응답형: 반사 안 되면 응답이 '거부 페이지'가 되는지로 판정(passed/rejected).
+    반환 None = 반응하는 필터 없음(또는 누적형 보류). anchor는 영숫자 프로브 마커(recon.BASELINE)."""
+    normal_text = visible_text(baseline_body or '')
+
+    # 누적형(memo) 감지 + 노이즈 측정용 benign 연속 3회. baseline_body를 기준으로 쓰면 안 된다 —
+    # 이 함수 전 프로브가 이미 memo에 누적시켜 normal_text가 뒤처져 첫 step만 부풀기 때문. 연속
+    # 증가분(d1,d2)이 둘 다 양수 + 서로 비슷하면 전역 누적 메모형으로 보고 판정 보류.
+    n0, _, _ = send_fn(url, method, {**data, target: anchor})
+    n1, _, _ = send_fn(url, method, {**data, target: anchor})
+    n2, _, _ = send_fn(url, method, {**data, target: anchor})
+    t0 = visible_text(n0.text) if n0 is not None else normal_text
+    t1 = visible_text(n1.text) if n1 is not None else normal_text
+    t2 = visible_text(n2.text) if n2 is not None else normal_text
+    d1, d2 = len(t1) - len(t0), len(t2) - len(t1)
+    if (n0 is not None and n1 is not None and n2 is not None
+            and d1 > _FILTER_MIN_DIFF_FLOOR and d2 > _FILTER_MIN_DIFF_FLOOR
+            and min(d1, d2) >= 0.5 * max(d1, d2)):
+        print(f"    [필터맵] {method} {url} (param={target!r}) — 누적형 엔드포인트 추정: "
+              f"동일 benign 입력('{anchor}')을 연달아 보냈더니 응답이 매번 일정량 증가")
+        print(f"             (연속 visible-text len {len(t0)}→{len(t1)}→{len(t2)}, 증가분 +{d1}/+{d2}, "
+              f"일정도 {min(d1,d2)/max(d1,d2):.0%}≥50% → 입력이 전역 누적되는 메모형)")
+        print(f"             필터 지도 판정 보류(종합/토큰 프로브 생략)")
+        return None
+
+    if reflection and reflection.get('reflected'):
+        return _filter_map_reflective(send_fn, url, method, data, target, anchor)
+    return _filter_map_rejective(send_fn, url, method, data, target, normal_text, t1, t2, anchor)
+
+
+def _filter_map_reflective(send_fn, url, method, data, target, anchor) -> dict[str, str] | None:
+    """반사형: 'anchor+token'을 보내 token이 출력에 어떻게 반사되는지로 outcome 판정.
+    passed(그대로 생존)/encoded(엔티티 변형)/removed(사라짐·잘림)."""
+    tokens = list(FILTER_PROBE_TOKENS)
+    # 싼 선검사: 전부 이어붙여 한 번에 — 통째로 생존하면 반응하는 필터 없음.
+    composite = anchor + ''.join(tokens)
+    resp, _, _ = send_fn(url, method, {**data, target: composite})
+    if resp is None:
+        return None
+    if classify_reflected_reaction(resp.text, anchor, ''.join(tokens)) == 'passed':
+        return None
+
+    print(f"        필터 감지 — 토큰 {len(tokens)}개 개별 확인 중...", flush=True)
+    outcomes: dict[str, str] = {}
+    for token in tokens:
+        t_resp, _, _ = send_fn(url, method, {**data, target: anchor + token})
+        if t_resp is None:
+            outcomes[token] = 'removed'
+            continue
+        # 5xx/SQL 에러 = 토큰이 필터를 통과해 백엔드까지 도달(주입 신호) → 걸린 게 아님.
+        if t_resp.status_code >= 500 or detect_db_from_error(t_resp.text):
+            outcomes[token] = 'passed'
+            continue
+        outcomes[token] = classify_reflected_reaction(t_resp.text, anchor, token)
+    return reduce_substring_bans(outcomes)
+
+
+def _filter_map_rejective(send_fn, url, method, data, target,
+                          normal_text, t1, t2, anchor) -> dict[str, str] | None:
+    """응답형(거부 지문): 반사 안 되는 엔드포인트에서 토큰이 '차단 페이지'를 유발하는지로
+    판정한다. 임계값은 페이지 노이즈로 동적으로 잡는다(max(noise*2, floor))."""
+    noise = max(diff_score(normal_text, t1), diff_score(normal_text, t2))
+    threshold = max(noise * 2, _FILTER_MIN_DIFF_FLOOR)
+
+    composite = anchor + ''.join(FILTER_PROBE_TOKENS.keys())
+    resp, _, _ = send_fn(url, method, {**data, target: composite})
+    if resp is None:
+        return None
+
+    # 종합 카나리가 500/SQL에러면 거부 지문이 '에러 페이지'로 오염됨 — 따옴표 빼고 재생성.
+    if resp.status_code >= 500 or detect_db_from_error(resp.text):
+        print(f"    [필터맵] {method} {url} (param={target!r}) — 종합 카나리가 SQL 에러 유발(=주입 신호) — 따옴표 제외하고 거부 지문 재생성")
+        composite = anchor + ''.join(t for t in FILTER_PROBE_TOKENS if t not in ("'", '"'))
+        resp, _, _ = send_fn(url, method, {**data, target: composite})
+        if resp is None:
+            return None
+
+    reject_text = visible_text(resp.text)
+    if diff_score(normal_text, reject_text) <= threshold:
+        return None  # 정상과 노이즈 수준 차이 = 반응하는 필터 없음
+
+    print(f"        필터 감지 — 토큰 {len(FILTER_PROBE_TOKENS)}개 개별 확인 중...", flush=True)
+    outcomes: dict[str, str] = {}
+    for token in FILTER_PROBE_TOKENS:
+        t_resp, _, _ = send_fn(url, method, {**data, target: anchor + token})
+        if t_resp is None:
+            outcomes[token] = 'passed'
+            continue
+        if t_resp.status_code >= 500 or detect_db_from_error(t_resp.text):
+            outcomes[token] = 'passed'
+            continue
+        is_reject = diff_score(visible_text(t_resp.text), reject_text) <= threshold
+        outcomes[token] = 'rejected' if is_reject else 'passed'
+    return reduce_substring_bans(outcomes)
+
+
+def detect_waf_body(body: str) -> bool:
+    """body에 '거부 본문' 키워드가 (단어경계로) 있는지 — recon의 반사/쿼트 프로빙이 baseline
+    없이 쓰는 보수적 절대값 체크(REFLECTION_BLOCK_KEYWORDS). 'hack'이 긴 단어에 포함돼 걸리는
+    오탐은 match_block_keywords의 단어경계가 막는다."""
+    return bool(match_block_keywords(body.lower(), REFLECTION_BLOCK_KEYWORDS))
 
 
 # ── WAF 우회 변형 ─────────────────────────────────────────────────────────────
@@ -627,6 +844,13 @@ class WafDetector:
             else:
                 status, body = self._fetch(url)
             active_blocked, active_name, active_evidence = classify_waf_block(status, body)
+            # baseline은 양성(benign) 요청이라, 정상(차단 코드 아님) 응답은 정의상 차단 페이지가
+            # 아니다 — 본문에 'denied' 같은 문구가 있어도 그 페이지 native 콘텐츠일 뿐이다. 여기선
+            # 비교할 두 번째 응답이 없어(단일 fetch) diff를 못 재므로, '양성 요청이 차단/레이트리밋
+            # 상태코드로 돌아왔을 때'만 본문 기반 판정을 신뢰한다. (공격 응답의 200 커스텀 WAF는
+            # 전략 단계에서 baseline 차분으로 따로 잡는다.)
+            if active_blocked and status not in BLOCK_STATUS_CODES and status not in RATE_LIMIT_STATUS_CODES:
+                active_blocked = False
 
             if passive:
                 waf_info = {

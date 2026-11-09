@@ -1,4 +1,3 @@
-import re
 import time
 import random
 import string
@@ -7,7 +6,7 @@ import requests
 from urllib.parse import urljoin
 
 from fbs.inference.sql_dialects import detect_db_from_error, extract_error_snippet
-from fbs.inference.waf import visible_text, diff_score, match_block_keywords
+from fbs.inference.validation import probe_filter_map, detect_waf_body
 
 BASELINE = 'john35912'
 
@@ -31,86 +30,10 @@ DB_PROBES_BY_QUOTE: dict[str, str] = {
     '"': '"',
 }
 
-_WAF_BODY_SIGNATURES = frozenset([
-    'hack', 'blocked', 'attack', 'detected', 'illegal',
-    'not allowed', 'bad request', 'security violation', 'waf', 'firewall',
-])
-
-# 토큰 하나하나를 특정 vuln-type에 매핑해두는 참조 테이블. DBDetect._probe_filter_map()의
-# 1단계(종합 카나리, 전체 토큰을 이어붙여서 "필터가 존재하는지"만 vuln-type 무관하게 1번에
-# 확인)와 2단계(반응이 있을 때만, 토큰마다 따로 보내서 정확히 뭐가 막히는지 지도를 만듦) 양쪽
-# 다 이 딕셔너리의 키(토큰 목록)를 그대로 쓴다. profiler.py가 2단계 결과를 hints 점수로 바꿀 때
-# 이 가중치를 쓰는데, 토큰 하나는 자기한테 매핑된 vuln-type에만 점수를 주고 다른 유형엔 절대
-# 안 번진다 — 예를 들어 따옴표가 막혔다고 xss 점수가 오르면 안 되니까. 특정 CTF/타겟의 실제
-# 필터 목록을 그대로 베끼지 않고, 취약점 유형별 대표 토큰으로 일반화해뒀다.
-_FILTER_PROBE_TOKENS: dict[str, dict[str, float]] = {
-    # ── 중립 (여러 취약점에 공용) ────────────────────────────────────────────
-    # 빈 매핑({}) = 걸려도 특정 유형을 못 가리키므로 hint엔 기여하지 않는다. 다만 프로브는
-    # 하고(strategy가 'filter_map에서 이게 막혔다'를 읽어 페이로드 선택/회피에 씀), minimal-
-    # token 축소에도 참여한다. 실무에서 이것들만 거는 필터는 유형 판별이 안 돼, 걸렸을 때의
-    # 가중은 후속(전략 실패 후 재진입 등) 단계에서 판단한다. (가중은 _filter_map_evidence가
-    # 빈 매핑을 건너뛰어 자동으로 0이 된다.)
-    "'":  {}, '"':  {},                         # 문자열 구분자 (SQLi·XSS 속성 등 공용)
-    '$':  {},                                   # 변수/템플릿 마커 (SSTI·JS·PHP)
-    ' ':  {}, ',':  {}, '%':  {},               # 공백·구분자·와일드카드
-    '-':  {}, '+':  {}, '*':  {}, '/':  {},     # 산술/구조 원자 ('../'·'/*' 귀속에 필요)
-    '(':  {}, ')':  {},                         # 함수 호출 구문 (alert()·서브쿼리 등 공용)
-    ';':  {}, '|':  {}, '`':  {},               # 문장 구분·파이프·백틱 (CmdI·SQL·JS, cmdi 미구현)
-
-    # ── SQLi ─────────────────────────────────────────────────────────────────
-    '--':          {'sqli': 0.4},
-    '#':           {'sqli': 0.3},
-    '/*':          {'sqli': 0.3},
-    'union':       {'sqli': 0.5},
-    'select':      {'sqli': 0.5},
-    'sleep':       {'sqli': 0.3},
-    'order':       {'sqli': 0.5},
-    'having':      {'sqli': 0.4},
-    'like':        {'sqli': 0.4},
-    'substr':      {'sqli': 0.4},
-    'substring':   {'sqli': 0.4},
-    'ascii':       {'sqli': 0.4},
-    'benchmark':   {'sqli': 0.4},
-    'database':    {'sqli': 0.5},
-    'information_schema': {'sqli': 0.5},
-    # 'or'/'and'/'from' — SQL 논리/키워드 원자(막히면 SQL 방어 신호). 원자라 minimal-token
-    # 축소가 'order'/'information_schema' 등을 이쪽에 귀속하고, sqli.py가 밴을 인지해
-    # ||/&& 치환·공백 제거 우회(symbolic_no_space)를 발동한다.
-    'or':          {'sqli': 0.4},
-    'and':         {'sqli': 0.4},
-    'from':        {'sqli': 0.4},
-
-    # ── XSS ──────────────────────────────────────────────────────────────────
-    '<':           {'xss': 0.5},
-    '>':           {'xss': 0.3},
-    'script':      {'xss': 0.5},
-    'onerror':     {'xss': 0.5},
-    'javascript:': {'xss': 0.4},
-    # 'on' — 이벤트 핸들러 원자. 많은 XSS 필터가 'on'을 부분 문자열로 막는다. 이게 있어야
-    # 'onerror'·'union'("uni-on")·'information_schema'("informati-on")가 사실은 'on' 때문에
-    # 걸린 것임을 minimal-token 축소가 귀속한다(SQL 쪽 'or' 원자와 같은 역할).
-    'on':          {'xss': 0.4},
-
-    # ── SSTI ─────────────────────────────────────────────────────────────────
-    '{{':          {'ssti': 0.5},
-    '}}':          {'ssti': 0.3},
-    '__class__':   {'ssti': 0.5},
-
-    # ── Path traversal ───────────────────────────────────────────────────────
-    '../':         {'path_traversal': 0.5},
-    '..\\':        {'path_traversal': 0.4},
-}
-
 # 길이 유사 판정 임계값 (절댓값, 텍스트 유사도 계산 전 빠른 필터)
 _LENGTH_THRESHOLD = 100
 # 텍스트 유사도 임계값 (SequenceMatcher.ratio 기준)
 _SIMILAR_RATIO = 0.85
-
-# 거부 지문 캘리브레이션(_probe_filter_map)의 판정 바닥값. 실제 임계값은 페이지 자체의 요청별
-# 흔들림(noise)을 재서 max(noise*2, 이 값)으로 동적으로 잡는다 — 고정 절댓값을 쓰면 응답이
-# "Good"/"blocked"처럼 짧은 페이지에선 진짜 필터 변화(diff 몇 자)를 놓치고(오탐), 세션토큰 등
-# 노이즈가 큰 페이지에선 노이즈를 필터로 착각한다. noise=0인 결정적 페이지에서만 이 값이 쓰인다.
-_FILTER_MIN_DIFF_FLOOR = 1
 
 
 class DBDetect:
@@ -237,7 +160,7 @@ class DBDetect:
             # WAF 차단 — baseline과 다른 길이 + 차단 키워드
             blocked_this_quote = (
                 length is not None and baseline_length is not None
-                and length != baseline_length and self._detect_waf_body(body)
+                and length != baseline_length and detect_waf_body(body)
             )
             if blocked_this_quote:
                 waf_blocked = True
@@ -281,7 +204,7 @@ class DBDetect:
         # 위 waf_blocked는 '/"만으로 판단해서 SQLi 편향이다 — XSS/SSTI 등 다른 유형만 막는
         # 필터는 따옴표에 반응 안 해서 여기선 안 잡힌다. filter_map은 그것과 별개로, 반사되면
         # 토큰 생존을 직접 측정(반사형), 아니면 거부 지문(응답형)으로 토큰별 outcome을 낸다.
-        filter_map = self._probe_filter_map(url, method, data, target, baseline_body, reflection)
+        filter_map = probe_filter_map(self._send, url, method, data, target, baseline_body, BASELINE, reflection)
 
         return {
             'case':             case,
@@ -299,153 +222,6 @@ class DBDetect:
             'detected_db':      detected_db,
         }
 
-    def _probe_filter_map(self, url: str, method: str, data: dict, target: str,
-                           baseline_body: str | None,
-                           reflection: dict | None = None) -> dict[str, str] | None:
-        """필터 지도 — 토큰별 outcome('passed'/'removed'/'encoded'/'rejected').
-
-        필터는 두 형태로 드러난다:
-          · 반사형: 반사되는 엔드포인트는 'BASELINE+token'을 보내 token이 출력에 생존하는지로
-                    변형을 직접 관측한다(passed/removed/encoded). 차단 없이 몰래 제거·인코딩하는
-                    sanitize 필터를 잡는다(거부지문으론 안 보임).
-          · 응답형: 반사 안 되면 응답이 '거부 페이지'가 되는지로 판정한다(passed/rejected).
-        outcome != 'passed'면 그 토큰이 걸린 것. 반환 None = 반응하는 필터 없음(또는 판정 보류).
-        필터를 가정하지 않고 변형/거부를 '측정'하며, 토큰은 일반화된 _FILTER_PROBE_TOKENS를 쓴다."""
-        normal_text = visible_text(baseline_body or '')
-
-        # 누적형 감지 + 노이즈 측정용 benign 연속 3회. 누적형(memo)은 '같은 요청마다 응답이
-        # 일정량 커진다'로 식별한다. baseline_body(페이지 로드 시점)를 기준으로 쓰면 안 된다 —
-        # 이 함수 전에 error/reflection 프로브가 이미 memo에 누적시켜 normal_text가 뒤처져 있어,
-        # 첫 step만 그 누적분만큼 부풀어 '일정성' 검사가 깨진다(그래서 memo를 못 걸렀다). 대신
-        # 연속 3회를 fresh로 보내 '연속 증가분(d1,d2)'이 일정한지로 본다 — 이전 누적과 무관하다.
-        n0, _, _ = self._send(url, method, {**data, target: BASELINE})
-        n1, _, _ = self._send(url, method, {**data, target: BASELINE})
-        n2, _, _ = self._send(url, method, {**data, target: BASELINE})
-        t0 = visible_text(n0.text) if n0 is not None else normal_text
-        t1 = visible_text(n1.text) if n1 is not None else normal_text
-        t2 = visible_text(n2.text) if n2 is not None else normal_text
-
-        # 누적형(append-only) 가드 — 연속 증가분이 둘 다 양수 + 서로 비슷하면 메모형으로 보고 보류.
-        d1, d2 = len(t1) - len(t0), len(t2) - len(t1)
-        if (n0 is not None and n1 is not None and n2 is not None
-                and d1 > _FILTER_MIN_DIFF_FLOOR and d2 > _FILTER_MIN_DIFF_FLOOR
-                and min(d1, d2) >= 0.5 * max(d1, d2)):
-            print(f"    [필터맵] {method} {url} (param={target!r}) — 누적형 엔드포인트 추정: "
-                  f"동일 benign 입력('{BASELINE}')을 연달아 보냈더니 응답이 매번 일정량 증가")
-            print(f"             (연속 visible-text len {len(t0)}→{len(t1)}→{len(t2)}, 증가분 +{d1}/+{d2}, "
-                  f"일정도 {min(d1,d2)/max(d1,d2):.0%}≥50% → 입력이 전역 누적되는 메모형)")
-            print(f"             필터 지도 판정 보류(종합/토큰 프로브 생략)")
-            return None
-
-        # 반사되면 반사형(변형 측정), 아니면 응답형(거부 지문)
-        if reflection and reflection.get('reflected'):
-            return self._filter_map_reflective(url, method, data, target)
-        return self._filter_map_rejective(url, method, data, target, normal_text, t1, t2)
-
-    def _filter_map_reflective(self, url: str, method: str, data: dict,
-                                target: str) -> dict[str, str] | None:
-        """반사형: 'BASELINE+token'을 보내 token이 출력에 어떻게 반사되는지로 outcome 판정.
-        passed(그대로 생존) / encoded(엔티티 등으로 변형) / removed(사라짐·잘림). 차단 없이
-        몰래 sanitize하는 필터를 이 방식이 잡는다."""
-        tokens = list(_FILTER_PROBE_TOKENS)
-        # 싼 선검사: 전부 이어붙여 한 번에 — 통째로 그대로 생존하면 반응하는 필터 없음.
-        composite = BASELINE + ''.join(tokens)
-        resp, _, _ = self._send(url, method, {**data, target: composite})
-        if resp is None:
-            return None
-        if self._reflected_outcome(resp.text, ''.join(tokens)) == 'passed':
-            return None
-
-        print(f"        필터 감지 — 토큰 {len(tokens)}개 개별 확인 중...", flush=True)
-        outcomes: dict[str, str] = {}
-        for token in tokens:
-            t_resp, _, _ = self._send(url, method, {**data, target: BASELINE + token})
-            if t_resp is None:
-                outcomes[token] = 'removed'
-                continue
-            # 5xx/SQL 에러 = 토큰이 필터를 통과해 백엔드까지 도달(주입 신호) → 걸린 게 아님.
-            if t_resp.status_code >= 500 or detect_db_from_error(t_resp.text):
-                outcomes[token] = 'passed'
-                continue
-            outcomes[token] = self._reflected_outcome(t_resp.text, token)
-        return self._reduce_substring_bans(outcomes)
-
-    @staticmethod
-    def _reflected_outcome(body: str, token: str) -> str:
-        """응답에서 BASELINE 앵커 바로 뒤에 token이 어떻게 반사됐나 → passed/encoded/removed.
-        앵커(BASELINE)는 영숫자라 항상 생존하므로, 그 바로 뒤 문자열을 본다.
-          - token 그대로         → passed
-          - 자리에 HTML 엔티티    → encoded (출력 이스케이프: 특정 인코딩을 박지 않고 &#?\\w+; 패턴으로
-                                   본다. &lt; &#39; &#x27; &quot; 등 어느 형태든. 백엔드엔 도달, 출력만 변형)
-          - 그 외(사라짐/잘림)    → removed
-        (raw body로 봐야 인코딩·태그 생존을 그대로 관측한다.)"""
-        idx = body.rfind(BASELINE)
-        if idx == -1:
-            # 앵커(중립 영숫자)조차 안 돌아옴 = 입력이 '통째로' 거부됨(reject형: "filtered!!!"
-            # 같은 고정 응답). token만 잘린 strip형과 구분해야 한다 — 중첩 우회는 strip형에만
-            # 통하기 때문(reject형은 중첩해도 token이 들어있어 또 거부됨).
-            return 'rejected'
-        seg = body[idx + len(BASELINE):]
-        if seg.startswith(token):
-            return 'passed'
-        # token에 특수문자가 있고(엔티티로 인코딩 가능), 그 자리에 HTML 엔티티가 있으면 encoded.
-        # 애매하면 removed보다 encoded로 보는 게 안전하다 — encoded는 힌트 기여가 0이라 오탐 없음.
-        if any(not c.isalnum() for c in token) and re.match(r'&#?\w+;', seg):
-            return 'encoded'
-        return 'removed'
-
-    def _filter_map_rejective(self, url: str, method: str, data: dict, target: str,
-                               normal_text: str, t1: str, t2: str) -> dict[str, str] | None:
-        """응답형(거부 지문): 반사 안 되는 엔드포인트에서 토큰이 '차단 페이지'를 유발하는지로
-        판정한다. 임계값은 페이지 노이즈로 동적으로 잡는다(max(noise*2, floor)).
-          - 거부 지문과 노이즈 수준으로 일치 → rejected
-          - 정상 수준 / 에러·행 변화(주입 신호) → passed"""
-        noise = max(diff_score(normal_text, t1), diff_score(normal_text, t2))
-        threshold = max(noise * 2, _FILTER_MIN_DIFF_FLOOR)
-
-        composite = BASELINE + ''.join(_FILTER_PROBE_TOKENS.keys())
-        resp, _, _ = self._send(url, method, {**data, target: composite})
-        if resp is None:
-            return None
-
-        # 종합 카나리가 500/SQL에러면 거부 지문이 '에러 페이지'로 오염됨 — 따옴표 빼고 재생성.
-        if resp.status_code >= 500 or detect_db_from_error(resp.text):
-            print(f"    [필터맵] {method} {url} (param={target!r}) — 종합 카나리가 SQL 에러 유발(=주입 신호) — 따옴표 제외하고 거부 지문 재생성")
-            composite = BASELINE + ''.join(t for t in _FILTER_PROBE_TOKENS if t not in ("'", '"'))
-            resp, _, _ = self._send(url, method, {**data, target: composite})
-            if resp is None:
-                return None
-
-        reject_text = visible_text(resp.text)
-        if diff_score(normal_text, reject_text) <= threshold:
-            return None  # 정상과 노이즈 수준 차이 = 반응하는 필터 없음
-
-        print(f"        필터 감지 — 토큰 {len(_FILTER_PROBE_TOKENS)}개 개별 확인 중...", flush=True)
-        outcomes: dict[str, str] = {}
-        for token in _FILTER_PROBE_TOKENS:
-            t_resp, _, _ = self._send(url, method, {**data, target: BASELINE + token})
-            if t_resp is None:
-                outcomes[token] = 'passed'
-                continue
-            # 5xx/SQL 에러 = 필터 통과해 쿼리 도달(주입 신호) → 거부 아님.
-            if t_resp.status_code >= 500 or detect_db_from_error(t_resp.text):
-                outcomes[token] = 'passed'
-                continue
-            is_reject = diff_score(visible_text(t_resp.text), reject_text) <= threshold
-            outcomes[token] = 'rejected' if is_reject else 'passed'
-        return self._reduce_substring_bans(outcomes)
-
-    @staticmethod
-    def _reduce_substring_bans(outcomes: dict[str, str]) -> dict[str, str]:
-        """더 짧은 '걸린' 토큰이 부분 문자열로 든 토큰은 그 짧은 토큰 탓이지 독립 밴이 아니다 —
-        앱 필터가 substring 매칭이면(예: '$'가 걸리면 '$where'도 덩달아) 중복/교차유형으로
-        hints가 부푼다. 그런 토큰은 passed로 되돌린다."""
-        banned = [t for t, o in outcomes.items() if o != 'passed']
-        for t in banned:
-            if any(other != t and other in t for other in banned):
-                outcomes[t] = 'passed'
-        return outcomes
-
     def _send(self, url: str, method: str, data: dict) -> tuple[requests.Response | None, float, str | None]:
         start = time.monotonic()
         try:
@@ -457,11 +233,6 @@ class DBDetect:
         except Exception as e:
             # 예외를 삼키지 않고 유형을 남긴다 — 타임아웃/연결 끊김도 그 자체로 신호일 수 있음
             return None, time.monotonic() - start, f'{type(e).__name__}: {e}'
-
-    @staticmethod
-    def _detect_waf_body(body: str) -> bool:
-        # 단어 경계 매칭(waf.match_block_keywords 공유) — 'hack'이 긴 단어/브랜드명에 포함돼 걸리는 오탐 방지.
-        return bool(match_block_keywords(body.lower(), _WAF_BODY_SIGNATURES))
 
     @staticmethod
     def _classify_status(probe: int | None, baseline: int | None) -> str | None:
@@ -515,7 +286,7 @@ class DBDetect:
         if resp is None:
             return None
         body = resp.text
-        if self._detect_waf_body(body):
+        if detect_waf_body(body):
             return None
         tested = list(self._REFLECT_METACHARS)
 

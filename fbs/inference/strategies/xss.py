@@ -8,7 +8,7 @@ from html import escape as html_escape
 import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
-from fbs.inference.waf import classify_waf_block, XSS_EVASION_TRANSFORMS
+from fbs.inference.validation import classify_waf_block, XSS_EVASION_TRANSFORMS
 from fbs.inference.strategies.base import BaseStrategy
 
 """
@@ -235,7 +235,7 @@ class XSSStrategy(BaseStrategy):
                 p_status, p_body, _ = self._send(surface, {**base_fields, surface.param: payload})
                 if p_status is None:
                     continue
-                blocked, waf_name, _ = classify_waf_block(p_status, p_body)
+                blocked, waf_name, _ = classify_waf_block(p_status, p_body, baseline=baseline_body)
                 if blocked:
                     print(f"      · {ctx}: 차단됨({waf_name}) — XSS 전용 우회는 미구현, 스킵")
                     continue
@@ -248,7 +248,7 @@ class XSSStrategy(BaseStrategy):
                 # 꺾쇠는 살아남아(프루닝 통과) 여기 왔는데 exec_sig가 안 남았다 = 핸들러/태그
                 # 키워드가 필터에 변형/제거된 것(출력 인코딩이면 애초에 프루닝됐을 것). 반사는
                 # 되니 일반 변형(대소문자/공백)으로 '원형 생존'하는 변형을 측정으로 찾는다.
-                evaded = self._try_evade_payload(surface, base_fields, ctx, template, sig_template, marker, stripped)
+                evaded = self._try_evade_payload(surface, base_fields, ctx, template, sig_template, marker, stripped, baseline_body)
                 if evaded:
                     candidates.append(evaded)
                     break
@@ -300,7 +300,7 @@ class XSSStrategy(BaseStrategy):
 
     def _try_evade_payload(self, surface: AttackSurface, base_fields: dict, ctx: str,
                            template: str, sig_template: str, marker: str,
-                           stripped: set) -> dict | None:
+                           stripped: set, baseline_body: str = '') -> dict | None:
         """기본 페이로드가 필터돼 exec_sig가 원형으로 안 남을 때, 변형을 적용해 '원형 생존'하는
         변형을 측정으로 찾는다. 변형 소스는 두 갈래:
           · 일반 변형(XSS_EVASION_TRANSFORMS): 키워드 대소문자·공백→탭·괄호→백틱
@@ -325,7 +325,7 @@ class XSSStrategy(BaseStrategy):
             p_status, p_body, _ = self._send(surface, {**base_fields, surface.param: v_payload})
             if p_status is None:
                 continue
-            blocked, _, _ = classify_waf_block(p_status, p_body)
+            blocked, _, _ = classify_waf_block(p_status, p_body, baseline=baseline_body)
             if blocked:
                 continue
             if v_sig in p_body:
@@ -341,25 +341,6 @@ class XSSStrategy(BaseStrategy):
         (예: 'on'→'oonn', 'script'→'sscriptcript'). strip형 필터 우회용 — 첫 occurrence만."""
         nested = token[:1] + token + token[1:]
         return s.replace(token, nested, 1)
-
-    # ── 요청 전송 ────────────────────────────────────────────────────────────
-
-    def _send(self, surface: AttackSurface, data: dict, timeout: int | None = None):
-        """(status, body, elapsed) — 실패 시 (None, '', 0.0)."""
-        import time
-        timeout = timeout or self.TIMEOUT
-        enctype = surface.extra.get('enctype') or ''
-        start = time.monotonic()
-        try:
-            if surface.method == 'GET':
-                resp = self.session.get(surface.url, params=data, timeout=timeout)
-            elif 'application/json' in enctype:
-                resp = self.session.request(surface.method, surface.url, json=data, timeout=timeout)
-            else:
-                resp = self.session.request(surface.method, surface.url, data=data, timeout=timeout)
-            return resp.status_code, resp.text, time.monotonic() - start
-        except Exception:
-            return None, '', time.monotonic() - start
 
     # ── 마커 ─────────────────────────────────────────────────────────────────
 

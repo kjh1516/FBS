@@ -1,7 +1,7 @@
 import re
 
 from fbs.inference.models import AttackSurface
-from fbs.inference.recon import _FILTER_PROBE_TOKENS
+from fbs.inference.validation import FILTER_PROBE_TOKENS
 
 # ── 필드명 가중치 테이블 ──────────────────────────────────────────────────────
 # 키: 필드명에 포함된 부분 문자열 (소문자). 단 길이가 _SHORT_KEYWORD_MAXLEN 이하인
@@ -291,7 +291,7 @@ def _xss_evidence(db: dict) -> tuple[float | None, str | None]:
 
 def _filter_map_evidence(filter_map: dict[str, str] | None) -> dict[str, tuple[float, str]]:
     """토큰별 필터 지도(outcome: passed/removed/encoded/rejected) → 유형별 정황(SUGGESTIVE)
-    증거. _FILTER_PROBE_TOKENS에서 자기 유형에만 기여한다(따옴표 차단이 xss로 번지지 않음).
+    증거. FILTER_PROBE_TOKENS에서 자기 유형에만 기여한다(따옴표 차단이 xss로 번지지 않음).
 
     'removed'(입력 제거)·'rejected'(차단 페이지)만 기여한다 — '그 유형을 의식한 필터'라 정황.
     'encoded'(출력 이스케이프, 예: '→&#39;)는 기여하지 않는다 — 그건 그 공격을 '중화'한 것이라
@@ -303,7 +303,7 @@ def _filter_map_evidence(filter_map: dict[str, str] | None) -> dict[str, tuple[f
     for token, outcome in filter_map.items():
         if outcome not in ('removed', 'rejected'):
             continue
-        for vuln in _FILTER_PROBE_TOKENS.get(token, {}):
+        for vuln in FILTER_PROBE_TOKENS.get(token, {}):
             by_vuln.setdefault(vuln, []).append(f"{token}({outcome})")
     return {v: (_CLS_SUGGESTIVE, f"필터된 토큰 {toks}") for v, toks in by_vuln.items()}
 
