@@ -17,6 +17,7 @@ class PageItem(scrapy.Item):
     hidden_post_params = scrapy.Field()
     _fuzz_update     = scrapy.Field()
     security_headers = scrapy.Field()
+    page_signals     = scrapy.Field()   # passive: {redirect, gate_hints}
 
 
 class ButtonResultItem(scrapy.Item):

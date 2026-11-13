@@ -60,7 +60,7 @@ class InferenceEngine:
             p = dict(row)
             for key in ('params', 'response_headers', 'cookies',
                         'tech_stack', 'forms', 'hidden_params', 'hidden_post_params',
-                        'security_headers'):
+                        'security_headers', 'page_signals'):
                 raw = p.get(key)
                 if raw:
                     try:
@@ -274,6 +274,36 @@ class InferenceEngine:
         print(f"\n# [추론 시작] strategy {len(self.strategies)}개 실행\n")
         for i, surface in enumerate(surfaces, 1):
             print(f"  [{i}/{len(surfaces)}] {surface.surface_type} | {surface.method} {surface.url} | param={surface.param}")
+
+            # 입력-무관 응답(stub/인증벽) — recon 반응 프로파일이 "입력을 바꿔도 응답이 안 변한다"로
+            # 측정한 표면. 주입(SQLi/XSS)은 입력이 처리돼야 성립하므로 공격해도 무의미하다 → 스킵.
+            # 게이트는 '측정된' input_sensitive로만 한다 — 크롤러의 redirect 신호는 정적
+            # HTML이라 on-load/on-click 구분을 못 해 단독 게이트하면 과잉 스킵이다. redirect·
+            # gate_hints는 '왜 stub인지' 사유로만 덧붙인다(인증벽이면 보통 둘이 함께 뜬다).
+            beh = surface.extra.get('behavior')
+            if beh and beh.get('input_sensitive') is False:
+                # input_sensitive는 '영숫자' 프로브만 보므로 "따옴표→500" 같은 반응은 못 본다.
+                # 로그인 폼은 틀린 자격증명을 전부 같은 페이지로 돌려줘 겉보기엔 입력-무관이지만,
+                # recon이 반응(quote→에러/DB시그니처/반사/필터)을 하나라도 잡았으면 실제로는
+                # 입력을 처리(쿼리까지 도달)하는 것이니 stub로 보고 스킵하면 안 된다(SQLi 오탐 스킵).
+                refl = surface.extra.get('reflection') or {}
+                reacted = bool(
+                    surface.extra.get('quote_char')
+                    or surface.extra.get('detected_db')
+                    or refl.get('reflected') or refl.get('dom_suspect')
+                    or any(o != 'passed' for o in (surface.extra.get('filter_map') or {}).values())
+                )
+                if not reacted:
+                    psig = (surface.page or {}).get('page_signals') or {}
+                    ctx = []
+                    redir = psig.get('redirect')
+                    if redir:
+                        ctx.append(f"로드 시 이탈→{redir.get('target')}")
+                    if psig.get('gate_hints'):
+                        ctx.append(f"요구 추정:{','.join(psig['gate_hints'])}")
+                    ctx_str = f" [{' | '.join(ctx)}]" if ctx else ''
+                    print(f"    · 스킵 — 입력-무관 응답(stub/인증벽 추정, noise={beh.get('noise')}){ctx_str}: 주입 대상 아님")
+                    continue
 
             # 이 표면을 처리할 수 있는 전략들 중 '우선순위(profiler hint 점수)가 가장 높은 하나'만
             # 실행한다 — 한 필드에 SQLi·XSS 등 여러 전략을 전부 돌리지 않는다. 프로파일링이 가장

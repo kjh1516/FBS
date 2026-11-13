@@ -5,7 +5,7 @@ import json as _json
 import scrapy
 from scrapy.spiders import CrawlSpider
 from urllib.parse import urlparse, urljoin, parse_qs
-from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload
+from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload, detect_client_redirect, extract_gate_hints
 from fbs.items import PageItem, ButtonResultItem
 from fbs.inference.validation import classify_waf_block, EVASION_TRANSFORMS
 from fbs.inference.compare import visible_text, diff_score
@@ -243,6 +243,7 @@ class ScannerSpider(CrawlSpider):
         item['hidden_params']      = []
         item['hidden_post_params'] = []
         item['_fuzz_update']       = False
+        item['page_signals']       = {}
         return item
 
     @staticmethod
@@ -338,6 +339,14 @@ class ScannerSpider(CrawlSpider):
                 'value':   meta_csp,
             }
         item['security_headers'] = security_headers
+
+        # 패시브 페이지 신호 — 크롤 응답에서 바로 읽는다(추가 요청 없음). 로드 시 이탈
+        # (meta refresh / JS location = 인증벽·인터스티셜·플랫폼 래퍼) + alert 문구에서
+        # 뽑은 접근 요구 키워드(예: 'admin'). 추론 단계가 공격 표면 게이팅/사유에 쓴다.
+        item['page_signals'] = {
+            'redirect':   detect_client_redirect(response.text),
+            'gate_hints': extract_gate_hints(response.text),
+        }
 
         cookies = self._collect_cookies(response)
         item['cookies'] = cookies
@@ -576,30 +585,30 @@ class ScannerSpider(CrawlSpider):
         already_clicked = response.meta.get('btn_already_clicked', frozenset())
         raw_buttons     = discover_pm.result or []
 
-        # 버튼 클릭(또는 리다이렉트)으로만 도달하는 페이지는 정적 크롤(parse_item)이
-        # 한 번도 못 보고 지나갈 수 있다 — 그러면 그 페이지의 폼/필드 퍼징이 통째로
-        # 스킵된다(실측: /에서 버튼 눌러 /login에 도달했는데 login 폼이 전혀 스캔 안 됨).
-        # parse_playwright_rendered(SPA 경로)가 이미 쓰는 것과 같은 패턴 — 렌더링된
-        # HTML에서 폼을 뽑아 즉시 퍼징한다. _fuzz_get_params/_fuzz_post_params 내부에
-        # 이미 URL/폼 action 단위 중복 방지가 있어서, 이 URL이 parse_item으로도 이미
-        # 방문됐었다면 여기선 조용히 스킵되니 매번 호출해도 안전하다.
-        item = self._new_page_item(page_url, response, depth)
-        # 버튼 클릭(예: "로그인 페이지로 이동")이 세션을 발급하는 POST를 거쳤을 수 있다 —
-        # 그 세션 쿠키를 여기서 안 챙기면 추론 단계가 재사용할 쿠키가 없어서, 세션 필요한
-        # 페이지(예: /login)에 대한 이후 페이로드가 전부 조용히 리다이렉트당한다(실측 확인).
-        item['cookies'] = self._collect_cookies(response)
-        forms = self._extract_forms_from_rendered(response.text, page_url)
-        item['forms'] = forms
-        yield item
+        # 버튼 클릭/리다이렉트로만 도달하는 페이지는 정적 크롤(parse_item)이 한 번도 못 보고
+        # 지나갈 수 있다(실측: /에서 버튼 눌러 /login 도달했는데 login 폼이 전혀 스캔 안 됨) —
+        # 그런 '버튼-전용' 페이지에서만 렌더링된 HTML에서 폼을 뽑아 즉시 퍼징한다. 이미
+        # parse_item이 방문한 페이지(_processed_urls에 있음)면 폼 추출/출력/yield/퍼징을 거기서
+        # 이미 했으므로 여기서 또 하면 '폼 발견'이 두 번 찍히고 페이지도 한 번 더 렌더된다 —
+        # 그래서 이미 처리된 URL이면 폼 블록 전체를 건너뛴다(버튼 탐색은 아래에서 계속).
+        if page_url not in self._processed_urls:
+            item = self._new_page_item(page_url, response, depth)
+            # 버튼 클릭(예: "로그인 페이지로 이동")이 세션을 발급하는 POST를 거쳤을 수 있어
+            # 그 세션 쿠키를 챙긴다 — 안 그러면 추론 단계가 재사용할 쿠키가 없어 세션 필요한
+            # 페이지에 대한 이후 페이로드가 전부 조용히 리다이렉트당한다(실측 확인).
+            item['cookies'] = self._collect_cookies(response)
+            forms = self._extract_forms_from_rendered(response.text, page_url)
+            item['forms'] = forms
+            yield item
 
-        if forms:
-            self._print_forms(forms)
-            form_params  = {inp['name'] for f in forms for inp in f['inputs'] if inp.get('name')}
-            known_params = set(item['params'].keys()) | form_params
-            yield from self._fuzz_get_params(response, known_params, item)
-            for form in forms:
-                if form['method'] == 'POST':
-                    yield from self._fuzz_post_params(form, item)
+            if forms:
+                self._print_forms(forms)
+                form_params  = {inp['name'] for f in forms for inp in f['inputs'] if inp.get('name')}
+                known_params = set(item['params'].keys()) | form_params
+                yield from self._fuzz_get_params(response, known_params, item)
+                for form in forms:
+                    if form['method'] == 'POST':
+                        yield from self._fuzz_post_params(form, item)
 
         safe = []
         seen = set()

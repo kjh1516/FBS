@@ -23,6 +23,7 @@ class SQLitePipeline:
         ('hidden_params',      'TEXT',    True,  []),
         ('hidden_post_params', 'TEXT',    True,  []),
         ('security_headers',   'TEXT',    True,  {}),
+        ('page_signals',       'TEXT',    True,  {}),
     ]
 
     def __init__(self, db_path, target_url='', login_id=None, login_pw=None):

@@ -337,39 +337,20 @@ _FILTER_MIN_DIFF_FLOOR = 1  # 거부 지문 판정 바닥값. 실제 임계값�
 
 
 def probe_filter_map(send_fn, url, method, data, target, baseline_body, anchor,
-                     reflection=None) -> dict[str, str] | None:
+                     noise=0, reflection=None) -> dict[str, str] | None:
     """필터 지도 — 토큰별 outcome('passed'/'removed'/'encoded'/'rejected').
 
     필터는 두 형태로 드러난다:
       · 반사형: 'anchor+token'을 보내 token이 출력에 생존하는지로 변형을 직접 관측
                 (passed/removed/encoded). 몰래 sanitize하는 필터를 잡는다.
       · 응답형: 반사 안 되면 응답이 '거부 페이지'가 되는지로 판정(passed/rejected).
-    반환 None = 반응하는 필터 없음(또는 누적형 보류). anchor는 영숫자 프로브 마커(recon.BASELINE)."""
-    normal_text = visible_text(baseline_body or '')
-
-    # 누적형(memo) 감지 + 노이즈 측정용 benign 연속 3회. baseline_body를 기준으로 쓰면 안 된다 —
-    # 이 함수 전 프로브가 이미 memo에 누적시켜 normal_text가 뒤처져 첫 step만 부풀기 때문. 연속
-    # 증가분(d1,d2)이 둘 다 양수 + 서로 비슷하면 전역 누적 메모형으로 보고 판정 보류.
-    n0, _, _ = send_fn(url, method, {**data, target: anchor})
-    n1, _, _ = send_fn(url, method, {**data, target: anchor})
-    n2, _, _ = send_fn(url, method, {**data, target: anchor})
-    t0 = visible_text(n0.text) if n0 is not None else normal_text
-    t1 = visible_text(n1.text) if n1 is not None else normal_text
-    t2 = visible_text(n2.text) if n2 is not None else normal_text
-    d1, d2 = len(t1) - len(t0), len(t2) - len(t1)
-    if (n0 is not None and n1 is not None and n2 is not None
-            and d1 > _FILTER_MIN_DIFF_FLOOR and d2 > _FILTER_MIN_DIFF_FLOOR
-            and min(d1, d2) >= 0.5 * max(d1, d2)):
-        print(f"    [필터맵] {method} {url} (param={target!r}) — 누적형 엔드포인트 추정: "
-              f"동일 benign 입력('{anchor}')을 연달아 보냈더니 응답이 매번 일정량 증가")
-        print(f"             (연속 visible-text len {len(t0)}→{len(t1)}→{len(t2)}, 증가분 +{d1}/+{d2}, "
-              f"일정도 {min(d1,d2)/max(d1,d2):.0%}≥50% → 입력이 전역 누적되는 메모형)")
-        print(f"             필터 지도 판정 보류(종합/토큰 프로브 생략)")
-        return None
-
+    반환 None = 반응하는 필터 없음. anchor는 영숫자 프로브 마커(recon.BASELINE), noise는
+    호출부(recon)가 compare.profile_response로 미리 잰 페이지 노이즈(거부 임계 산정용).
+    누적형(memo) 가드는 여기서 안 한다 — recon이 behavior.accumulating으로 사전 게이트한다."""
     if reflection and reflection.get('reflected'):
         return _filter_map_reflective(send_fn, url, method, data, target, anchor)
-    return _filter_map_rejective(send_fn, url, method, data, target, normal_text, t1, t2, anchor)
+    normal_text = visible_text(baseline_body or '')
+    return _filter_map_rejective(send_fn, url, method, data, target, normal_text, noise, anchor)
 
 
 def _filter_map_reflective(send_fn, url, method, data, target, anchor) -> dict[str, str] | None:
@@ -400,10 +381,10 @@ def _filter_map_reflective(send_fn, url, method, data, target, anchor) -> dict[s
 
 
 def _filter_map_rejective(send_fn, url, method, data, target,
-                          normal_text, t1, t2, anchor) -> dict[str, str] | None:
+                          normal_text, noise, anchor) -> dict[str, str] | None:
     """응답형(거부 지문): 반사 안 되는 엔드포인트에서 토큰이 '차단 페이지'를 유발하는지로
-    판정한다. 임계값은 페이지 노이즈로 동적으로 잡는다(max(noise*2, floor))."""
-    noise = max(diff_score(normal_text, t1), diff_score(normal_text, t2))
+    판정한다. 임계값은 페이지 노이즈로 동적으로 잡는다(max(noise*2, floor)). noise는
+    호출부(recon)가 compare.profile_response로 미리 측정해 넘겨준다."""
     threshold = max(noise * 2, _FILTER_MIN_DIFF_FLOOR)
 
     composite = anchor + ''.join(FILTER_PROBE_TOKENS.keys())

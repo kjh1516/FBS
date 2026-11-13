@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 
 from fbs.inference.sql_dialects import detect_db_from_error, extract_error_snippet
 from fbs.inference.validation import probe_filter_map, detect_waf_body
+from fbs.inference.compare import profile_response
 
 BASELINE = 'john35912'
 
@@ -51,6 +52,25 @@ class DBDetect:
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
+        self._behavior: dict[tuple, dict] = {}   # (url, method) → 반응 프로파일 캐시
+
+    def _profile(self, url: str, method: str, data: dict, target: str) -> dict:
+        """(url, method) 엔드포인트의 반응 프로파일(noise/stateful/accumulating/input_sensitive)을
+        1회 측정해 캐시한다 — compare.profile_response 공용 프리미티브 사용. target 필드에 중립
+        토큰을 넣어 보내는 probe 클로저만 만들어 넘긴다(전송은 recon 세션)."""
+        key = (url, method)
+        cached = self._behavior.get(key)
+        if cached is not None:
+            return cached
+
+        def probe(value):
+            resp, _, _ = self._send(url, method, {**data, target: value})
+            return (resp.status_code if resp is not None else None,
+                    resp.text if resp is not None else '')
+
+        behavior = profile_response(probe)
+        self._behavior[key] = behavior
+        return behavior
 
     def run(self, url: str, method: str, data: dict, target: str,
             baseline_length: int | None = None,
@@ -201,10 +221,19 @@ class DBDetect:
         # filter_map보다 먼저 재서, 필터 지도가 반사형/응답형을 고르는 근거로 쓴다.
         reflection = self.probe_reflection(url, method, data, target)
 
+        # 엔드포인트 반응 프로파일(noise/stateful/accumulating/input_sensitive) — (url,method)당 1회.
+        # SQLi(noise/stateful)·filter_map(noise·accumulating 게이트)·profiler(input_sensitive)가 공용.
+        behavior = self._profile(url, method, data, target)
+
         # 위 waf_blocked는 '/"만으로 판단해서 SQLi 편향이다 — XSS/SSTI 등 다른 유형만 막는
         # 필터는 따옴표에 반응 안 해서 여기선 안 잡힌다. filter_map은 그것과 별개로, 반사되면
         # 토큰 생존을 직접 측정(반사형), 아니면 거부 지문(응답형)으로 토큰별 outcome을 낸다.
-        filter_map = probe_filter_map(self._send, url, method, data, target, baseline_body, BASELINE, reflection)
+        # 누적형(memo)이면 거부 지문/반사 측정이 오염되므로 필터 지도 판정을 보류한다.
+        if behavior['accumulating']:
+            filter_map = None
+        else:
+            filter_map = probe_filter_map(self._send, url, method, data, target,
+                                          baseline_body, BASELINE, behavior['noise'], reflection)
 
         return {
             'case':             case,
@@ -216,6 +245,7 @@ class DBDetect:
             'waf_blocked':      waf_blocked,
             'filter_map':       filter_map,
             'reflection':       reflection,
+            'behavior':         behavior,
             # detect_db_from_error()로 이미 확인된 DB 엔진 이름(SQL_DIALECTS의 키와 동일한
             # 표기: SQLite/MySQL/PostgreSQL/MSSQL/Oracle) — 지금까진 db_hint 문구를 만드는
             # 데만 쓰고 버렸는데, sqli.py가 재탐지 없이 그대로 재사용할 수 있게 노출한다.
@@ -381,6 +411,15 @@ class Recon:
 
         for page in pages:
             print(f"  URL: {page['url']}")
+            psig = page.get('page_signals') or {}
+            redir = psig.get('redirect')
+            if redir or psig.get('gate_hints'):
+                parts = []
+                if redir:
+                    parts.append(f"로드 시 이탈({redir.get('kind')}→{redir.get('target')})")
+                if psig.get('gate_hints'):
+                    parts.append(f"요구 추정 {psig['gate_hints']}")
+                print(f"  [페이지 신호] {' | '.join(parts)}")
             default = page['recon'].get('__default__', {})
             print(f"  [기본] status={default.get('status')} length={default.get('length')}")
             cache = page['recon'].get('__cache__')
@@ -400,8 +439,11 @@ class Recon:
                 flag = '★' if entry['status'] == 200 else '△'
                 note = '접근 차단' if entry['status'] == 403 else f"{entry['length']} bytes"
                 print(f"  {flag} [노출 파일] {entry['path']} → {entry['status']} ({note})")
+            methods = page['recon'].get('__methods__')
+            if methods:
+                print(f"  [메소드] 허용: {', '.join(methods['allow']) or '없음'} (OPTIONS {methods['status']})")
             for field, data in page['recon'].items():
-                if field in ('__default__', '__cache__', '__exposed__', '__block_ratio__'):
+                if field in ('__default__', '__cache__', '__exposed__', '__block_ratio__', '__methods__'):
                     continue
                 print(f"  [{field}] baseline: status={data['status']} length={data['length']} elapsed={data['elapsed']}s")
                 db = data.get('db', {})
@@ -412,6 +454,12 @@ class Recon:
                         print(f" | anomaly={db['baseline_anomaly']!r}", end='')
                     print()
                 print(f"    db_hint={db.get('db_hint')}")
+                beh = db.get('behavior')
+                if beh:
+                    flags = [k for k in ('stateful', 'accumulating') if beh.get(k)]
+                    sens = 'input-sensitive' if beh.get('input_sensitive') else '⚠ INPUT-무관(stub/인증벽 추정)'
+                    print(f"    반응      : noise={beh['noise']} | {sens}"
+                          + (f" [{', '.join(flags)}]" if flags else ''))
                 if db.get('waf_blocked'):
                     print(f"    ⚠ WAF 차단 의심 — baseline과 다른 길이 + 차단 키워드 감지")
                 elif db.get('sqli_signal'):
@@ -460,7 +508,7 @@ class Recon:
         total = blocked = 0
         for page in pages:
             for field, data in page['recon'].items():
-                if field in ('__default__', '__cache__', '__exposed__', '__block_ratio__'):
+                if field in ('__default__', '__cache__', '__exposed__', '__block_ratio__', '__methods__'):
                     continue
                 total += 1
                 if (data.get('db') or {}).get('waf_blocked'):
@@ -497,7 +545,8 @@ class Recon:
         default_body   = results['__default__']['body']
 
         results['__cache__']   = self._probe_cache(base_url, default_headers)
-        results['__exposed__'] = self._probe_exposed(base_url, page.get('tech_stack') or {})
+        results['__exposed__'] = self._probe_exposed(base_url, page.get('tech_stack') or {}, default_length)
+        results['__methods__'] = self._probe_methods(base_url)
 
         for param in (page.get('params') or {}):
             print(f"      · param={param!r} 프로브", flush=True)
@@ -624,8 +673,13 @@ class Recon:
             'cdn_headers':        cdn_headers if cdn_headers else None,
         }
 
-    def _probe_exposed(self, base_url: str, tech_stack: dict) -> list[dict]:
-        """언어/공통 노출 파일 목록을 탐지하고 200/403 응답을 기록한다."""
+    def _probe_exposed(self, base_url: str, tech_stack: dict, default_length: int | None = None) -> list[dict]:
+        """언어/공통 노출 파일 목록을 탐지하고 200/403 응답을 기록한다.
+
+        단, 서버가 '뭘 요청하든 같은 페이지'를 주는 catch-all(존재하지 않는 경로도 200 +
+        기본 페이지 본문)이면 모든 경로가 200으로 떠서 전부 오탐이 된다 — 그래서 default
+        페이지와 길이가 비슷한 200은 실제 노출 파일이 아니라고 보고 제외한다. 403은 '파일이
+        존재하나 접근 차단'이라 유의미하므로 그대로 기록한다."""
         language = tech_stack.get('language')
         paths = list(_EXPOSED_PATHS['base'])
         if language and language in _EXPOSED_PATHS:
@@ -636,13 +690,14 @@ class Recon:
             url = urljoin(base_url.rstrip('/') + '/', path)
             try:
                 resp = self.session.get(url, timeout=self.TIMEOUT, allow_redirects=False)
-                if resp.status_code in (200, 403):
-                    found.append({
-                        'path':   path,
-                        'url':    url,
-                        'status': resp.status_code,
-                        'length': len(resp.text),
-                    })
+                status = resp.status_code
+                if status == 403:
+                    found.append({'path': path, 'url': url, 'status': 403, 'length': len(resp.text)})
+                elif status == 200:
+                    length = len(resp.text)
+                    # default와 길이가 비슷하면 catch-all 응답(실제 파일 아님) → 제외
+                    if default_length is None or abs(length - default_length) > _LENGTH_THRESHOLD:
+                        found.append({'path': path, 'url': url, 'status': 200, 'length': length})
             except Exception:
                 pass
         return found
@@ -670,6 +725,19 @@ class Recon:
             return resp, time.monotonic() - start
         except Exception:
             return None, time.monotonic() - start
+
+    def _probe_methods(self, url: str) -> dict | None:
+        """OPTIONS로 엔드포인트가 허용하는 HTTP 메소드를 파악한다(응답의 Allow 헤더).
+        서버가 Allow를 안 주면(또는 요청 실패) None = '모름'. 여기선 '허용 메소드 목록'만
+        수집한다 — 실제로 다른 verb를 찔러보는 변조/우회는 전략 단계의 몫이다."""
+        resp, _ = self._send(url, 'OPTIONS', {})
+        if resp is None:
+            return None
+        allow = resp.headers.get('Allow') or resp.headers.get('allow')
+        if not allow:
+            return None
+        methods = sorted({m.strip().upper() for m in allow.split(',') if m.strip()})
+        return {'status': resp.status_code, 'allow': methods}
 
     @staticmethod
     def _record(resp: requests.Response | None, elapsed: float) -> dict:

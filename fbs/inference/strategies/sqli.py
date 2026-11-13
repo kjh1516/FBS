@@ -156,11 +156,15 @@ class SQLiStrategy(BaseStrategy):
             print("    [SQLi] baseline 요청 실패 — 스킵")
             return []
 
-        # 멱등성 프로브 — 이 엔드포인트가 stateful(시도 카운터/리셋/해커 감지 등으로 요청마다
-        # 응답이 바뀜)인지 판정하고, 페이지의 진짜 요청별 변동폭(page_noise)을 잰다. stateful이면
-        # content 기반 판정(boolean/content-blind)을 끄고 시간 기반 오라클로 전환한다. baseline_body를
-        # 첫 샘플로 재사용하며, 결과는 (url, method)로 캐싱돼 같은 폼의 다른 필드가 재사용한다.
-        stateful, page_noise, idem_trace = self._probe_idempotency(surface, base_fields, baseline_body)
+        # stateful(시도 카운터/리셋 등으로 요청마다 응답이 바뀜) 여부 + 요청별 변동폭(page_noise).
+        # stateful이면 content 기반 판정을 끄고 시간 기반 오라클로 전환한다. recon이 compare.
+        # profile_response로 (url,method)당 1회 측정해 surface.extra['behavior']에 실어주므로 그걸
+        # 그대로 소비한다(중복 측정 제거). behavior가 없는 표면(버튼 API 등)만 자체 멱등성 프로브로 폴백.
+        beh = surface.extra.get('behavior')
+        if beh is not None:
+            stateful, page_noise, idem_trace = beh.get('stateful', False), beh.get('noise', 0), None
+        else:
+            stateful, page_noise, idem_trace = self._probe_idempotency(surface, base_fields, baseline_body)
 
         # status만 바뀌고 본문 증거가 없는 약한 신호는 바로 확정 짓지 않고 보류해둔다 —
         # boolean 등 더 확실한 신호를 계속 찾아보고, 끝까지 아무것도 없으면 최후 수단으로 쓴다.
