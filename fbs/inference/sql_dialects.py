@@ -1,18 +1,16 @@
 """DB 엔진(SQLite/MySQL/PostgreSQL 등) 관련 정보를 한 곳에 모아둔 공용 모듈.
 
-recon.py(에러 메시지로 가볍게 힌트만)와 sqli.py(SQLiStrategy, 실제 추출 페이로드 구성 +
-확정 판정) 양쪽에서 같은 DB 판별 결과를 써야 서로 다른 결론이 안 나온다 — 예전엔
-ERROR_SIGNATURES가 두 파일에 각각 따로 정의돼 있다가 SQLite 항목이 미묘하게 갈라진
-적이 있어서(recon은 'no such function', sqli는 'no such function: sleep'), 이제 여기
-하나로 합쳤다.
+recon.py(에러 메시지로 가볍게 힌트만)와 sqli.py(SQLiStrategy, 실제 추출 페이로드 구성 + 확정 판정)
+양쪽이 같은 DB 판별 결과를 써야 서로 다른 결론이 안 나오므로, 에러 시그니처·방언 테이블을 여기 한
+곳에 둔다.
 
-SQL_DIALECTS는 SQLiStrategy의 blind boolean 추출이 DB 엔진마다 다른 함수/문법을 쓸 수
-있게 해주는 방언 테이블. LENGTH()는 SQLite/MySQL/PostgreSQL 세 곳 다 동일해서 여기
-포함하지 않고 호출부에서 그대로 하드코딩한다.
+SQL_DIALECTS는 SQLiStrategy의 blind boolean 추출이 DB 엔진마다 다른 함수/문법을 쓸 수 있게 해주는
+방언 테이블. LENGTH()는 SQLite/MySQL/PostgreSQL 세 곳 다 동일해서 여기 포함하지 않고 호출부에서 그대로
+하드코딩한다.
 
-current_db가 None인 건 "그 DB엔 현재 DB명이라는 개념 자체가 없다"는 뜻이 아니라
-(SQLite는 파일 하나가 곧 DB라 이름 개념이 약함) — blind 추출의 첫 단계(db명 알아내기)를
-스킵하고 바로 테이블 열거로 넘어가라는 신호로 쓴다.
+current_db가 None인 건 그 DB엔 현재 DB명이라는 개념 자체가 없다는 뜻이 아니라(SQLite는 파일 하나가
+곧 DB라 이름 개념이 약함) — blind 추출의 첫 단계(db명 알아내기)를 스킵하고 바로 테이블 열거로 넘어가라는
+신호로 쓴다.
 """
 
 SQL_DIALECTS: dict[str, dict] = {
@@ -25,8 +23,8 @@ SQL_DIALECTS: dict[str, dict] = {
     },
     'MySQL': {
         'ord_fn':     lambda x: f"ASCII({x})",
-        # SUBSTR은 MySQL에서 SUBSTRING의 별칭이라 동작이 같으면서, 'substring'을 밴하는
-        # 필터를 피한다. SUBSTR도 밴이면 MID로 바꿔야 하지만 그건 추후.
+        # SUBSTR은 MySQL에서 SUBSTRING의 별칭이라 동작이 같으면서, substring을 밴하는 필터를
+        # 피한다. SUBSTR도 밴이면 MID로 바꿔야 하지만 그건 추후.
         'substr_fn':  lambda x, p, l: f"SUBSTR({x},{p},{l})",
         'concat':     lambda a, b: f"CONCAT({a},{b})",
         'current_db': "database()",
@@ -45,8 +43,8 @@ SQL_DIALECTS: dict[str, dict] = {
 DIALECT_PROBE_ORDER = ['SQLite', 'MySQL', 'PostgreSQL']
 
 
-# recon.py/sqli.py가 각자 따로 들고 있던 것을 통합 — SQL_DIALECTS(3종)보다 넓게
-# MSSQL/Oracle까지 포함한다(에러 시그니처 매칭은 추출 문법과 달리 이 두 엔진도 커버 가능).
+# SQL_DIALECTS(3종)보다 넓게 MSSQL/Oracle까지 포함한다 — 에러 시그니처 매칭은 추출 문법과 달리
+# 이 두 엔진도 커버 가능하다.
 ERROR_SIGNATURES: dict[str, list[str]] = {
     'SQLite':     ['sqlite3.operationalerror', 'sqlite3.interfaceerror',
                    'no such function', 'unrecognized token'],

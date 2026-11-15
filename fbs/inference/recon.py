@@ -56,8 +56,8 @@ class DBDetect:
 
     def _profile(self, url: str, method: str, data: dict, target: str) -> dict:
         """(url, method) 엔드포인트의 반응 프로파일(noise/stateful/accumulating/input_sensitive)을
-        1회 측정해 캐시한다 — compare.profile_response 공용 프리미티브 사용. target 필드에 중립
-        토큰을 넣어 보내는 probe 클로저만 만들어 넘긴다(전송은 recon 세션)."""
+        1회 측정해 캐시한다 — compare.profile_response 공용 함수 사용. target 필드에 중립 토큰을 넣어
+        보내는 probe 클로저만 만들어 넘긴다(전송은 recon 세션)."""
         key = (url, method)
         cached = self._behavior.get(key)
         if cached is not None:
@@ -225,10 +225,10 @@ class DBDetect:
         # SQLi(noise/stateful)·filter_map(noise·accumulating 게이트)·profiler(input_sensitive)가 공용.
         behavior = self._profile(url, method, data, target)
 
-        # 위 waf_blocked는 '/"만으로 판단해서 SQLi 편향이다 — XSS/SSTI 등 다른 유형만 막는
-        # 필터는 따옴표에 반응 안 해서 여기선 안 잡힌다. filter_map은 그것과 별개로, 반사되면
-        # 토큰 생존을 직접 측정(반사형), 아니면 거부 지문(응답형)으로 토큰별 outcome을 낸다.
-        # 누적형(memo)이면 거부 지문/반사 측정이 오염되므로 필터 지도 판정을 보류한다.
+        # 위 waf_blocked는 따옴표('·")만으로 판단해서 SQLi 편향이다 — XSS/SSTI 등 다른 유형만 막는
+        # 필터는 따옴표에 반응 안 해서 여기선 안 잡힌다. filter_map은 그것과 별개로, 반사되면 토큰
+        # 생존을 직접 측정(반사형), 아니면 거부 지문(응답형)으로 토큰별 outcome을 낸다. 누적형(memo)이면
+        # 거부 지문/반사 측정이 오염되므로 필터 지도 판정을 보류한다.
         if behavior['accumulating']:
             filter_map = None
         else:
@@ -279,21 +279,20 @@ class DBDetect:
 
     # ── 반사 신호 (모든 전략 공용 / recon 측은 층1·2까지만) ──────────────────────
     #
-    # XSS 반사 탐지는 3층으로 나뉘는데, recon은 '싼 신호' 두 층만 책임진다(비싼 렌더는 XSS
-    # strategy의 몫). SQLi가 recon의 따옴표 프로브로 '관여 신호'만 받고 실제 탐지는 strategy가
-    # 하는 것과 같은 경계다.
+    # XSS 반사 탐지는 3층으로 나뉘는데, recon은 싼 신호 두 층만 책임진다(비싼 렌더는 XSS strategy의
+    # 몫). SQLi가 recon의 따옴표 프로브로 관여 신호만 받고 실제 탐지는 strategy가 하는 것과 같은 경계다.
     #   층1 서버 반사 : 중립 코어가 서버 응답(requests)에 그대로 박히나 + 컨텍스트 + 꺾쇠 생존
-    #   층2 DOM 정적  : 서버엔 없어도 원본 HTML에 'URL 소스→위험 싱크' 패턴이 있으면 DOM 반사 의심
+    #   층2 DOM 정적  : 서버엔 없어도 원본 HTML에 URL 소스→위험 싱크 패턴이 있으면 DOM 반사 의심
     #   층3 렌더(X)   : Playwright로 실제 DOM 반사·실행을 확정 — 비싸고 XSS 전용이라 strategy가 함
     #
-    # probe_reflection() 하나가 층1·2를 한 번에 재서 '반사 신호' 딕셔너리로 돌려준다.
+    # probe_reflection() 하나가 층1·2를 한 번에 재서 반사 신호 딕셔너리로 돌려준다.
 
     # 층1에서 생존을 측정하는 메타문자. 따옴표(',")는 문자열 컨텍스트 SQL을 깨서 반사 자체를
     # 못 보게 만들 수 있으므로(=반사 사이트를 blind로 오판) 넣지 않고 꺾쇠만 잰다. 따옴표 생존은
     # XSS strategy가 페이로드를 실제로 쏴 보고 exec_sig로 확인한다.
     _REFLECT_METACHARS = ('<', '>')
 
-    # 층2에서 찾는 DOM 반사 패턴: JS가 URL 등에서 입력을 읽는 '소스' → 위험 '싱크'로 흘리는 꼴.
+    # 층2에서 찾는 DOM 반사 패턴: JS가 URL 등에서 입력을 읽는 소스 → 위험 싱크로 흘리는 꼴.
     # 서버 HTML엔 입력이 안 보여도(requests로 반사 X) 브라우저에선 JS가 DOM에 주입한다.
     _DOM_SOURCES = ('location.search', 'location.hash', 'location.href',
                     'document.url', 'document.documenturi', 'urlsearchparams')
@@ -301,7 +300,7 @@ class DBDetect:
                   'document.write', 'eval(')
 
     def probe_reflection(self, url: str, method: str, data: dict, target: str) -> dict | None:
-        """이 필드의 '반사 신호'를 한 번에 잰다 — 층1(서버 반사) + 층2(DOM 정적 의심).
+        """이 필드의 반사 신호를 한 번에 잰다 — 층1(서버 반사) + 층2(DOM 정적 의심).
 
         중립 코어(영숫자) 뒤에 'LT<GT>'를 붙여 보낸다. 따옴표가 없어 문자열 컨텍스트 SQL을
         깨지 않으므로, 반사 사이트를 500 에러로 blind 오판하지 않는다.
@@ -326,9 +325,9 @@ class DBDetect:
             return {'reflected': True, 'contexts': self._reflection_contexts(body, core),
                     'survived': survived, 'tested': tested}
 
-        # 층2 — DOM 정적: 서버엔 없지만 원본 HTML에 'URL 소스→위험 싱크'가 같이 있으면 DOM 반사
-        # 의심. 소스·싱크 공존만 보는 휴리스틱이라(실제 연결은 미확인) '의심 깃발'일 뿐 — 확정은
-        # XSS strategy의 브라우저 렌더(층3)가 한다.
+        # 층2 — DOM 정적: 서버엔 없지만 원본 HTML에 URL 소스→위험 싱크가 같이 있으면 DOM 반사 의심.
+        # 소스·싱크 공존만 보는 휴리스틱이라(실제 연결은 미확인) 의심 깃발일 뿐 — 확정은 XSS strategy의
+        # 브라우저 렌더(층3)가 한다.
         result = {'reflected': False, 'contexts': [], 'survived': [], 'tested': tested}
         low = body.lower()
         src  = next((s for s in self._DOM_SOURCES if s in low), None)
@@ -676,10 +675,10 @@ class Recon:
     def _probe_exposed(self, base_url: str, tech_stack: dict, default_length: int | None = None) -> list[dict]:
         """언어/공통 노출 파일 목록을 탐지하고 200/403 응답을 기록한다.
 
-        단, 서버가 '뭘 요청하든 같은 페이지'를 주는 catch-all(존재하지 않는 경로도 200 +
-        기본 페이지 본문)이면 모든 경로가 200으로 떠서 전부 오탐이 된다 — 그래서 default
-        페이지와 길이가 비슷한 200은 실제 노출 파일이 아니라고 보고 제외한다. 403은 '파일이
-        존재하나 접근 차단'이라 유의미하므로 그대로 기록한다."""
+        단, 서버가 뭘 요청하든 같은 페이지를 주는 catch-all(존재하지 않는 경로도 200 + 기본 페이지
+        본문)이면 모든 경로가 200으로 떠서 전부 오탐이 된다 — 그래서 default 페이지와 길이가 비슷한
+        200은 실제 노출 파일이 아니라고 보고 제외한다. 403은 파일이 존재하나 접근 차단이라 유의미하므로
+        그대로 기록한다."""
         language = tech_stack.get('language')
         paths = list(_EXPOSED_PATHS['base'])
         if language and language in _EXPOSED_PATHS:
@@ -727,9 +726,9 @@ class Recon:
             return None, time.monotonic() - start
 
     def _probe_methods(self, url: str) -> dict | None:
-        """OPTIONS로 엔드포인트가 허용하는 HTTP 메소드를 파악한다(응답의 Allow 헤더).
-        서버가 Allow를 안 주면(또는 요청 실패) None = '모름'. 여기선 '허용 메소드 목록'만
-        수집한다 — 실제로 다른 verb를 찔러보는 변조/우회는 전략 단계의 몫이다."""
+        """OPTIONS로 엔드포인트가 허용하는 HTTP 메소드를 파악한다(응답의 Allow 헤더). 서버가 Allow를
+        안 주면(또는 요청 실패) None = 모름. 여기선 허용 메소드 목록만 수집한다 — 실제로 다른 verb를
+        찔러보는 변조/우회는 전략 단계의 몫이다."""
         resp, _ = self._send(url, 'OPTIONS', {})
         if resp is None:
             return None

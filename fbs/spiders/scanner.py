@@ -19,9 +19,9 @@ BLOCK_SIZE   = 45
 DEFAULT_WORDLIST = os.path.join(os.path.dirname(__file__), '..', 'wordlists', 'params.txt')
 
 # POST 폼 퍼징 진단용 probe 값 3종 (자세한 전략은 _fuzz_post_params 문서 참고).
-# "9 '"는 숫자 컨텍스트/문자열 컨텍스트 둘 다 깨뜨릴 수 있는 값이라 1순위로 시도하고,
-# 앱 자체 필터(sqli_filter류)에 막히면 우회를 먼저 시도한 뒤, 그래도 안 되면 특수문자
-# 없이 "타입 불일치"만으로 에러를 유발하는 숫자/문자열 두 값으로 나눠서 재시도한다.
+# 9 '는 숫자 컨텍스트/문자열 컨텍스트 둘 다 깨뜨릴 수 있는 값이라 1순위로 시도하고, 앱 자체 필터
+# (sqli_filter류)에 막히면 우회를 먼저 시도한 뒤, 그래도 안 되면 특수문자 없이 타입 불일치만으로
+# 에러를 유발하는 숫자/문자열 두 값으로 나눠서 재시도한다.
 POST_PROBE_AGGRESSIVE = "9 '"
 POST_PROBE_NUMERIC    = "9"
 POST_PROBE_ALPHA      = "abc"
@@ -228,10 +228,10 @@ class ScannerSpider(CrawlSpider):
 
     @staticmethod
     def _new_page_item(url, response, depth):
-        """PageItem 골격을 만든다. tech_stack/hidden_params/hidden_post_params을 None으로
-        비워두면 파이프라인의 _write_report()가 p.get(key, default)처럼 "키가 없을 때만"
-        기본값이 적용되는 패턴을 쓰고 있어서(키는 있는데 값이 None이면 기본값이 안 먹힘)
-        리포트 생성 단계에서 AttributeError로 죽는다 — 항상 빈 컨테이너로 명시 초기화한다."""
+        """PageItem 골격을 만든다. tech_stack/hidden_params/hidden_post_params을 None으로 비워두면
+        파이프라인의 _write_report()가 p.get(key, default)처럼 키가 없을 때만 기본값이 적용되는 패턴을
+        쓰고 있어서(키는 있는데 값이 None이면 기본값이 안 먹힘) 리포트 생성 단계에서 AttributeError로
+        죽는다 — 항상 빈 컨테이너로 명시 초기화한다."""
         item = PageItem()
         item['url']          = url
         item['status_code']  = response.status
@@ -341,8 +341,8 @@ class ScannerSpider(CrawlSpider):
         item['security_headers'] = security_headers
 
         # 패시브 페이지 신호 — 크롤 응답에서 바로 읽는다(추가 요청 없음). 로드 시 이탈
-        # (meta refresh / JS location = 인증벽·인터스티셜·플랫폼 래퍼) + alert 문구에서
-        # 뽑은 접근 요구 키워드(예: 'admin'). 추론 단계가 공격 표면 게이팅/사유에 쓴다.
+        # (meta refresh / JS location = 인증벽·인터스티셜·플랫폼 래퍼) + alert 문구에서 뽑은 접근 요구
+        # 키워드(예: admin). 추론 단계가 공격 표면 게이팅/사유에 쓴다.
         item['page_signals'] = {
             'redirect':   detect_client_redirect(response.text),
             'gate_hints': extract_gate_hints(response.text),
@@ -585,17 +585,16 @@ class ScannerSpider(CrawlSpider):
         already_clicked = response.meta.get('btn_already_clicked', frozenset())
         raw_buttons     = discover_pm.result or []
 
-        # 버튼 클릭/리다이렉트로만 도달하는 페이지는 정적 크롤(parse_item)이 한 번도 못 보고
-        # 지나갈 수 있다(실측: /에서 버튼 눌러 /login 도달했는데 login 폼이 전혀 스캔 안 됨) —
-        # 그런 '버튼-전용' 페이지에서만 렌더링된 HTML에서 폼을 뽑아 즉시 퍼징한다. 이미
-        # parse_item이 방문한 페이지(_processed_urls에 있음)면 폼 추출/출력/yield/퍼징을 거기서
-        # 이미 했으므로 여기서 또 하면 '폼 발견'이 두 번 찍히고 페이지도 한 번 더 렌더된다 —
+        # 버튼 클릭/리다이렉트로만 도달하는 페이지는 정적 크롤(parse_item)이 한 번도 못 보고 지나갈 수
+        # 있다(버튼을 눌러야 가는 로그인 페이지 등) — 그런 버튼-전용 페이지에서만 렌더링된 HTML에서 폼을
+        # 뽑아 즉시 퍼징한다. 이미 parse_item이 방문한 페이지(_processed_urls에 있음)면 폼 추출/출력/yield/
+        # 퍼징을 거기서 이미 했으므로 여기서 또 하면 폼 발견이 두 번 찍히고 페이지도 한 번 더 렌더된다 —
         # 그래서 이미 처리된 URL이면 폼 블록 전체를 건너뛴다(버튼 탐색은 아래에서 계속).
         if page_url not in self._processed_urls:
             item = self._new_page_item(page_url, response, depth)
-            # 버튼 클릭(예: "로그인 페이지로 이동")이 세션을 발급하는 POST를 거쳤을 수 있어
-            # 그 세션 쿠키를 챙긴다 — 안 그러면 추론 단계가 재사용할 쿠키가 없어 세션 필요한
-            # 페이지에 대한 이후 페이로드가 전부 조용히 리다이렉트당한다(실측 확인).
+            # 버튼 클릭(예: 로그인 페이지로 이동)이 세션을 발급하는 POST를 거쳤을 수 있어 그 세션
+            # 쿠키를 챙긴다 — 안 그러면 추론 단계가 재사용할 쿠키가 없어 세션 필요한 페이지에 대한
+            # 이후 페이로드가 전부 조용히 리다이렉트당한다.
             item['cookies'] = self._collect_cookies(response)
             forms = self._extract_forms_from_rendered(response.text, page_url)
             item['forms'] = forms
@@ -1041,12 +1040,11 @@ class ScannerSpider(CrawlSpider):
 
     # ── 퍼징 ──────────────────────────────────────────────────────────────────
     #
-    # GET 쿼리스트링 퍼징(_fuzz_get_params)과 POST 폼 퍼징(_fuzz_post_params)은
-    # "후보를 블록으로 나눠 diff 있는지 보고, 있으면 절반씩/이분탐색으로 좁혀간다"는
-    # 알고리즘 자체(_start_block_fuzzing ~ _bs_check_solo)를 그대로 공유한다.
-    # 전송 방식(GET 쿼리스트링 vs POST 폼 바디)과 변화 판정 방식만 다르므로, 그
-    # 차이를 `state` 딕셔너리(ctx + baseline_text) 하나로 캡슐화해서 콜백 체인
-    # 전체에 그대로 실어 나른다. ctx = {method, url, known_fields, probe_value}.
+    # GET 쿼리스트링 퍼징(_fuzz_get_params)과 POST 폼 퍼징(_fuzz_post_params)은 후보를 블록으로 나눠
+    # diff 있는지 보고, 있으면 절반씩/이분탐색으로 좁혀간다는 알고리즘 자체(_start_block_fuzzing ~
+    # _bs_check_solo)를 그대로 공유한다. 전송 방식(GET 쿼리스트링 vs POST 폼 바디)과 변화 판정 방식만
+    # 다르므로, 그 차이를 state 딕셔너리(ctx + baseline_text) 하나로 캡슐화해 콜백 체인 전체에 실어
+    # 나른다. ctx = {method, url, known_fields, probe_value}.
 
     @staticmethod
     def _load_wordlist(path):
@@ -1106,9 +1104,8 @@ class ScannerSpider(CrawlSpider):
     # ── POST 폼 퍼징 ─────────────────────────────────────────────────────────
 
     def _fuzz_post_params(self, form, item):
-        """폼마다 한 번, 진단(공격적 값 → 우회 재시도 → 숫자/문자열 dual-pass 폴백) 후
-        확정된 probe_value로 실제 이분탐색 퍼징을 시작한다. 자세한 설계 배경(왜 3단계인지,
-        known 필드에 왜 더미값만 쓰는지)은 대화 중 합의된 그대로다."""
+        """폼마다 한 번, 진단(공격적 값 → 우회 재시도 → 숫자/문자열 dual-pass 폴백) 후 확정된
+        probe_value로 실제 이분탐색 퍼징을 시작한다."""
         action, enctype = form['action'], form['enctype']
         if action in self._fuzzed_post_forms:
             return
@@ -1139,10 +1136,10 @@ class ScannerSpider(CrawlSpider):
     def _post_diagnose_step(self, response, candidates, known_fields, action, enctype, item, evade_index, probe_value):
         """공격적 값(POST_PROBE_AGGRESSIVE)이 앱 자체 필터에 막히는지 진단한다.
 
-        안 막히면 그 값 그대로 진행. 막히면 EVASION_TRANSFORMS를 하나씩 시도(적용할 게
-        없는 변형은 요청 없이 건너뜀). 그것도 다 실패하면 특수문자 없이 "타입 불일치"만으로
-        에러를 유발하는 숫자(9)/문자열(abc) 두 값으로 나눠 각각 독립적으로 퍼징한다 —
-        이 진단은 폼 하나당 딱 한 번만 하고, 결과(모드)를 이후 전체 퍼징에 재사용한다.
+        안 막히면 그 값 그대로 진행. 막히면 EVASION_TRANSFORMS를 하나씩 시도(적용할 게 없는 변형은
+        요청 없이 건너뜀). 그것도 다 실패하면 특수문자 없이 타입 불일치만으로 에러를 유발하는 숫자(9)/
+        문자열(abc) 두 값으로 나눠 각각 독립적으로 퍼징한다 — 이 진단은 폼 하나당 딱 한 번만 하고,
+        결과(모드)를 이후 전체 퍼징에 재사용한다.
         """
         tried_label = f'공격적 값 "{POST_PROBE_AGGRESSIVE}"' if evade_index is None else f'우회({EVASION_TRANSFORMS[evade_index][0]}) "{probe_value}"'
         blocked, waf_name, waf_evidence = classify_waf_block(response.status, response.text)
@@ -1200,11 +1197,11 @@ class ScannerSpider(CrawlSpider):
         return f"zzfbzcanary{uuid.uuid4().hex[:6]}"
 
     def _fuzz_start(self, state, candidates, item):
-        """실제 이분탐색(비용이 큼: 최소 log(n) 요청) 전에, 존재할 리 없는 카나리 파라미터
-        하나로 먼저 찔러본다. 카나리조차 baseline과 달라지면 이 폼/페이지는 '모르는 필드엔
-        무조건 다르게 반응'하는 걸로 봐야 해서, 그 뒤로 어떤 후보를 넣어도 diff가 날 텐데
-        그게 그 후보가 실제로 쓰여서인지 그냥 안 쓰는 필드라서인지 구분할 방법이 없다 —
-        그럴 땐 비싼 이분탐색을 아예 안 돌리고 여기서 요청 1개로 저렴하게 포기한다."""
+        """실제 이분탐색(비용이 큼: 최소 log(n) 요청) 전에, 존재할 리 없는 카나리 파라미터 하나로 먼저
+        찔러본다. 카나리조차 baseline과 달라지면 이 폼/페이지는 모르는 필드엔 무조건 다르게 반응하는
+        걸로 봐야 해서, 그 뒤로 어떤 후보를 넣어도 diff가 날 텐데 그게 그 후보가 실제로 쓰여서인지 그냥
+        안 쓰는 필드라서인지 구분할 방법이 없다 — 그럴 땐 비싼 이분탐색을 아예 안 돌리고 여기서 요청
+        1개로 저렴하게 포기한다."""
         canary = self._make_canary()
         yield self._build_fuzz_request(
             state, [canary], self._check_canary, cb_kwargs=dict(candidates=candidates, item=item, canary=canary),
@@ -1247,12 +1244,11 @@ class ScannerSpider(CrawlSpider):
                 state, blocks[0], self._check_single_block, cb_kwargs=dict(block=blocks[0], item=item),
             )
             return
-        # 페어 조합 전에 블록을 각각 단독으로 먼저 찔러본다 — _check_single_block/
-        # _single_split_step 경로가 "혼자서 무신호"를 확인한 뒤에야 anchor로 쓰는 것과 같은
-        # 원칙이다. 이걸 안 하면, 진짜 파라미터를 담은 블록이 어느 페어에서 우연히 anchor(b1)
-        # 역할로 쓰일 때 anchor 자신의 신호 때문에 search(b2) 쪽 이분탐색이 어느 절반을 골라도
-        # 항상 "변화 있음"만 보게 되어 b2 안의 무관한 임의 원소가 파라미터로 오탐되고, 정작
-        # anchor 자신은 검증 없이 그냥 넘어가 버린다.
+        # 페어 조합 전에 블록을 각각 단독으로 먼저 찔러본다 — _check_single_block/_single_split_step
+        # 경로가 혼자서 무신호를 확인한 뒤에야 anchor로 쓰는 것과 같은 원칙이다. 이걸 안 하면, 진짜
+        # 파라미터를 담은 블록이 어느 페어에서 우연히 anchor(b1) 역할로 쓰일 때 anchor 자신의 신호 때문에
+        # search(b2) 쪽 이분탐색이 어느 절반을 골라도 항상 변화 있음만 보게 되어 b2 안의 무관한 임의
+        # 원소가 파라미터로 오탐되고, 정작 anchor 자신은 검증 없이 넘어가 버린다.
         block_state = {'pending': len(blocks), 'silent_blocks': []}
         for block in blocks:
             yield self._build_fuzz_request(
@@ -1272,9 +1268,9 @@ class ScannerSpider(CrawlSpider):
             yield from self._start_pairwise_phase(block_state['silent_blocks'], item, state)
 
     def _start_pairwise_phase(self, blocks, item, state):
-        """단독으로는 무신호임이 이미 확인된 블록들끼리만 페어 조합을 시도한다 — 이 시점부턴
-        어느 쪽을 anchor로 써도 '혼자서는 무신호'가 보장돼 있어 이후 이분탐색(_bs_search)의
-        신호가 항상 search 쪽 부분집합 때문이라고 믿을 수 있다."""
+        """단독으로는 무신호임이 이미 확인된 블록들끼리만 페어 조합을 시도한다 — 이 시점부턴 어느 쪽을
+        anchor로 써도 혼자서는 무신호가 보장돼 있어 이후 이분탐색(_bs_search)의 신호가 항상 search 쪽
+        부분집합 때문이라고 믿을 수 있다."""
         if len(blocks) < 2:
             return
         for i in range(len(blocks)):
@@ -1361,10 +1357,9 @@ class ScannerSpider(CrawlSpider):
             )
 
     def _record_hidden_param(self, param, state, item, response):
-        """이분탐색이 '변화'를 확정한 시점의 응답을 넘겨받아, 그 신호가 WAF/앱 필터
-        차단(예: baby-sqlite의 "No Hack!")으로 인한 건지 확인한다. 차단이라면 발견 자체는
-        맞지만 지금 쓰고 있는 probe_value는 필터에 걸린다는 뜻이라, 그 파라미터 하나에
-        대해서만 EVASION_TRANSFORMS를 재시도해서 실제로 통과하는 값을 찾아본다."""
+        """이분탐색이 변화를 확정한 시점의 응답을 넘겨받아, 그 신호가 WAF/앱 필터 차단(거부 페이지)으로
+        인한 건지 확인한다. 차단이라면 발견 자체는 맞지만 지금 쓰고 있는 probe_value는 필터에 걸린다는
+        뜻이라, 그 파라미터 하나에 대해서만 EVASION_TRANSFORMS를 재시도해 실제로 통과하는 값을 찾아본다."""
         ctx = state['ctx']
         blocked, waf_name, waf_evidence = classify_waf_block(response.status, response.text)
         if not blocked:

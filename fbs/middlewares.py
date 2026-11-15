@@ -41,11 +41,11 @@ class FuzzAwareDepthMiddleware:
     """scrapy.spidermiddlewares.depth.DepthMiddleware와 동일하지만, is_fuzz 요청은
     depth 추적/제한 대상에서 아예 제외한다.
 
-    퍼징 체인(진단 → baseline → 카나리 → 이분탐색 분할...)은 링크를 더 깊이 크롤링하는 게
-    아니라 이미 발견한 페이지 하나에 대한 진단 요청들이 여러 홉에 걸쳐 이어지는 것뿐인데,
-    기본 DepthMiddleware는 이 홉들도 그냥 '크롤링 depth'로 세서 DEPTH_LIMIT을 넘기면
-    DEBUG 레벨로 조용히(LOG_LEVEL=WARNING이라 안 보임) 요청을 버린다. 42개 후보 이분탐색만
-    해도 log2(42)≈6단계가 더 필요해서 DEPTH_LIMIT을 늘리는 걸로는 근본 해결이 안 된다."""
+    퍼징 체인(진단 → baseline → 카나리 → 이분탐색 분할...)은 링크를 더 깊이 크롤링하는 게 아니라
+    이미 발견한 페이지 하나에 대한 진단 요청들이 여러 홉에 걸쳐 이어지는 것뿐인데, 기본 DepthMiddleware는
+    이 홉들도 그냥 크롤링 depth로 세서 DEPTH_LIMIT을 넘기면 DEBUG 레벨로 조용히(LOG_LEVEL=WARNING이라 안
+    보임) 요청을 버린다. 42개 후보 이분탐색만 해도 log2(42)≈6단계가 더 필요해서 DEPTH_LIMIT을 늘리는
+    걸로는 근본 해결이 안 된다."""
 
     def __init__(self, maxdepth, stats, verbose_stats=False, prio=1):
         self.maxdepth = maxdepth

@@ -312,9 +312,9 @@ _REDIRECT_JS_RE = re.compile(
 
 
 def detect_client_redirect(html: str) -> dict | None:
-    """응답 로드 시 브라우저가 다른 곳으로 이탈하는지 — meta refresh / JS location 패턴을
-    구조적으로만 본다(실행 없이 의도만 읽음). 인증벽/인터스티셜('/'·login으로 튕김)이나
-    플랫폼 래퍼(meta refresh) 식별용. 반환 {'kind':'meta'|'js', 'target': url} 또는 None."""
+    """응답 로드 시 브라우저가 다른 곳으로 이탈하는지 — meta refresh / JS location 패턴을 구조적으로만
+    본다(실행 없이 의도만 읽음). 인증벽/인터스티셜(/나 login으로 튕김)이나 플랫폼 래퍼(meta refresh)
+    식별용. 반환 {'kind':'meta'|'js', 'target': url} 또는 None."""
     if not html:
         return None
     m = _REDIRECT_META_RE.search(html)
@@ -326,7 +326,7 @@ def detect_client_redirect(html: str) -> dict | None:
     return None
 
 
-# 특정 문구를 하드코딩하지 않고, 접근/권한/인증 '요구'를 가리키는 일반화된 키워드셋.
+# 특정 문구를 하드코딩하지 않고, 접근/권한/인증 요구를 가리키는 일반화된 키워드셋.
 _GATE_KEYWORDS = (
     'admin', 'administrator', 'root', 'superuser', 'privilege', 'permission', 'role',
     'login', 'log in', 'sign in', 'signin', 'authenticate', 'authentication',
@@ -337,10 +337,9 @@ _ALERT_RE = re.compile(r'alert\s*\(\s*["\']([^"\']*)["\']', re.IGNORECASE)
 
 
 def extract_gate_hints(html: str) -> list[str]:
-    """응답의 alert() 메시지에서 '무엇이 필요한지'를 가리키는 범용 요구 키워드를 뽑는다
-    (예: 'Only admin can edit' → 'admin'). alert 문구는 사용자에게 보내는 가장 의도적인
-    메시지라 거기서만 뽑아 노이즈를 줄인다. 단어경계로 매칭. 인증벽일 때 '뭐가 필요한지'
-    라벨 + 추후 인증-인지 기능의 토대."""
+    """응답의 alert() 메시지에서 무엇이 필요한지를 가리키는 범용 요구 키워드를 뽑는다(예: Only admin
+    can edit → admin). alert 문구는 사용자에게 보내는 가장 의도적인 메시지라 거기서만 뽑아 노이즈를
+    줄인다. 단어경계로 매칭. 인증벽일 때 뭐가 필요한지 라벨 + 추후 인증-인지 기능의 토대."""
     if not html:
         return []
     messages = ' '.join(_ALERT_RE.findall(html)).lower()

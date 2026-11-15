@@ -14,9 +14,9 @@ class BaseStrategy(ABC):
       4. reattack    — 분석 결과 기반 정밀 페이로드 전송
     run()은 위 흐름을 오케스트레이션한다.
 
-    엔진은 한 공격 표면에 대해, can_handle이 True인 전략을 전부 돌리지 않고 priority()가
-    가장 높은 '하나'만 실행한다. 그 우선순위는 기본적으로 profiler가 매긴 해당 취약점
-    유형(VULN_TYPE)의 hint 점수다 — 즉 프로파일링에서 가장 유력하다고 본 유형이 이긴다.
+    엔진은 한 공격 표면에 대해, can_handle이 True인 전략을 전부 돌리지 않고 priority()가 가장 높은
+    하나만 실행한다. 그 우선순위는 기본적으로 profiler가 매긴 해당 취약점 유형(VULN_TYPE)의 hint
+    점수다 — 즉 프로파일링에서 가장 유력하다고 본 유형이 이긴다.
     """
 
     # 이 전략이 대응하는 취약점 유형 키 (profiler hints의 키와 동일: 'sqli' | 'xss' | ...).
@@ -38,9 +38,8 @@ class BaseStrategy(ABC):
     def _base_fields(self, surface: 'AttackSurface') -> dict:
         """target 필드와 함께 보낼 나머지 필드의 기본값을 구성한다(SQLi·XSS 전략 공용).
 
-        profiler가 크롤링 시점의 실제 값(form input value 등)을 all_params에 담아 넘기므로,
-        가능하면 'test' 더미 대신 그 값을 그대로 쓴다 — 숫자형 필드 arithmetic 프로브 등이
-        여기에 의존한다."""
+        profiler가 크롤링 시점의 실제 값(form input value 등)을 all_params에 담아 넘기므로, 가능하면
+        test 더미 대신 그 값을 그대로 쓴다 — 숫자형 필드 arithmetic 프로브 등이 여기에 의존한다."""
         if surface.surface_type == 'url_param':
             raw  = (surface.page or {}).get('params') or {}
             data = {k: (v[0] if isinstance(v, list) and v else 'test') for k, v in raw.items()}
