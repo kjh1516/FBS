@@ -156,7 +156,7 @@ GENERIC_BLOCK_KEYWORDS = [
     'bot detected', 'automated request',
     'your ip has been blocked',
     'this request has been blocked',
-    # CTF/개인 프로젝트 앱들이 흔히 쓰는 자체 필터 거부 문구. recon의 거부 지문 탐지도 이 테이블을
+    # 작은 앱·커스텀 서버가 흔히 쓰는 자체 필터 거부 문구. recon의 거부 지문 탐지도 이 테이블을
     # 그대로 공유한다(단일 테이블로 관리).
     'hack', 'attack', 'illegal', 'detected',
 ]

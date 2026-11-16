@@ -3,6 +3,8 @@ import zlib
 import json
 import re
 import random
+import time
+from http.cookiejar import DefaultCookiePolicy
 
 
 # ── User-Agent ────────────────────────────────────────────────────────────────
@@ -21,6 +23,32 @@ USER_AGENTS = [
 def pick_user_agent() -> str:
     """스캔 하나에 쓸 UA를 풀에서 한 번 고른다. 스캔 간에는 다양성이 있고 스캔 내에서는 고정."""
     return random.choice(USER_AGENTS)
+
+
+# ── 세션 쿠키 보호 ────────────────────────────────────────────────────────────
+
+class _ProtectAuthCookiePolicy(DefaultCookiePolicy):
+    """시드된 인증 쿠키가 '비워지거나 만료'되는 응답만 거부한다 — 주입이 /logout 302 등으로 세션을
+    날리는 오염은 막되, 서버의 정상 세션 리프레시(새 값)·새 쿠키 추가는 그대로 받는다. set_ok은
+    읽기 전용 집합만 보므로 여러 스레드가 동시에 호출해도 안전하다."""
+    def __init__(self, protected_names):
+        super().__init__()
+        self._protected = set(protected_names or ())
+
+    def set_ok(self, cookie, request):
+        if cookie.name in self._protected:
+            cleared = (not cookie.value) or (cookie.expires is not None and cookie.expires <= time.time())
+            if cleared:
+                return False   # 보호 쿠키를 비우려는 응답 거부(로그아웃형 오염 차단)
+        return super().set_ok(cookie, request)
+
+
+def protect_session_cookies(session, names) -> None:
+    """시드된 인증 쿠키(names)가 응답에 의해 삭제/만료되지 않게 보호한다. 값 갱신·새 쿠키는 허용 —
+    인증 사이트에선 세션 리프레시를 받아야 하므로 응답 쿠키를 통째로 막지는 않는다. names가 비면
+    (익명 스캔) 아무 정책도 걸지 않는다(기본 쿠키 처리 그대로)."""
+    if names:
+        session.cookies.set_policy(_ProtectAuthCookiePolicy(names))
 
 
 # ── Flask 세션 ───────────────────────────────────────────────────────────────

@@ -141,10 +141,9 @@ class XSSStrategy(BaseStrategy):
     def priority(self, surface: AttackSurface) -> float:
         """XSS 우선순위 = profiler가 밴드 모델로 매긴 xss hint 그대로.
 
-        반사의 질은 profiler _xss_evidence가 증거 클래스로 반영한다(서버반사+꺾쇠생존=REACHED 0.70,
-        DOM 정적 의심=SUGGESTIVE 0.40). reflects_html이면 0.7로 끌어올리는 식의 보정을 얹으면 약한
-        dom_suspect(흔한 innerHTML/location 코드만으로도 섬)까지 0.70으로 올라가 실제 SQLi(0.70)를 잘못
-        밀어내므로, 보정 없이 hint를 그대로 쓴다."""
+        반사의 질은 profiler _xss_signals가 누적(noisy-OR)으로 반영한다 — 꺾쇠 반사는 흔하므로 낮게
+        (0.3) 잡고, 실행 컨텍스트(js/attr) 반사가 겹칠 때만 올라간다. 여기서 별도 보정을 더하지 않고
+        hint를 그대로 쓴다(반사 하나로 XSS를 과대평가하지 않게)."""
         return surface.extra.get('hints', {}).get('xss', 0.0)
 
     def run(self, surface: AttackSurface) -> list[VulnResult]:
@@ -474,9 +473,9 @@ class XSSStrategy(BaseStrategy):
         """크롤이 저장한 쿠키의 HttpOnly 플래그로 XSS가 document.cookie로 쿠키를 탈취할 수 있는가를
         헤더 기반(정적)으로 판정한다.
 
-        동적 재현(내 브라우저에 쿠키를 심어 읽어오기)은 CTF처럼 피해자가 곧 나인 상황에선 내가 넣은 걸
-        내가 읽는 순환이라 의미가 없다. 반면 HttpOnly 플래그는 실제 서버가 세운 것이라, 이 쿠키가 JS로
-        읽히는가를 그대로 말해준다. (crawl이 Set-Cookie에서 뜬 건 bool, 요청 Cookie에서만 본 건 None=플래그 미상.)"""
+        동적 재현(내 브라우저에 쿠키를 심어 읽어오기)은 스캐너가 자기 세션으로 확인하는 상황이라 내가
+        넣은 걸 내가 읽는 순환이라 의미가 없다. 반면 HttpOnly 플래그는 실제 서버가 세운 것이라, 이 쿠키가
+        JS로 읽히는가를 그대로 말해준다. (crawl이 Set-Cookie에서 뜬 건 bool, 요청 Cookie에서만 본 건 None=플래그 미상.)"""
         cookies = (surface.page or {}).get('cookies') or []
         readable = [c.get('name') for c in cookies if (c.get('flags') or {}).get('httponly') is False]
         httponly = [c.get('name') for c in cookies if (c.get('flags') or {}).get('httponly') is True]

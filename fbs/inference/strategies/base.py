@@ -53,15 +53,22 @@ class BaseStrategy(ABC):
         json=, 그 외는 form data=로 보낸다. SQLi·XSS 전략 공용(self.session/self.TIMEOUT 사용)."""
         timeout = timeout or self.TIMEOUT
         enctype = surface.extra.get('enctype') or ''
+        # allow_redirects=False — 탐지 프로브는 리다이렉트를 따라가지 않는다. 따라가면 목적지
+        # 본문이 참/거짓 비교에 섞여 오라클이 뒤집히거나 평탄화된다. 302는 raw로 관측한다.
         start = time.monotonic()
         try:
             if surface.method == 'GET':
-                resp = self.session.get(surface.url, params=data, timeout=timeout)
+                resp = self.session.get(surface.url, params=data, timeout=timeout, allow_redirects=False)
             elif 'application/json' in enctype:
-                resp = self.session.request(surface.method, surface.url, json=data, timeout=timeout)
+                resp = self.session.request(surface.method, surface.url, json=data, timeout=timeout, allow_redirects=False)
             else:
-                resp = self.session.request(surface.method, surface.url, data=data, timeout=timeout)
-            return resp.status_code, resp.text, time.monotonic() - start
+                resp = self.session.request(surface.method, surface.url, data=data, timeout=timeout, allow_redirects=False)
+            status = resp.status_code
+            # 302는 안 따라가서 본문이 비어 있다. 목적지(Location)를 본문에 실어, 본문 diff를 쓰는
+            # 기존 오라클(boolean/반사 등)이 "다른 데로 리다이렉트됨"을 자동으로 신호로 보게 한다 —
+            # 같은 302라도 목적지가 다르면 다른 본문이 되어 로그인 우회 같은 신호가 살아난다.
+            body = f"[redirect {status} {resp.headers.get('Location', '')}]" if 300 <= status < 400 else resp.text
+            return status, body, time.monotonic() - start
         except Exception:
             return None, '', time.monotonic() - start
 

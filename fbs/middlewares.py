@@ -67,25 +67,31 @@ class FuzzAwareDepthMiddleware:
         prio = settings.getint('DEPTH_PRIORITY')
         return cls(maxdepth, crawler.stats, verbose, prio)
 
-    def process_spider_output(self, response, result, spider):
-        def _filter(request):
-            if not isinstance(request, Request):
-                return True
-            if request.meta.get('is_fuzz'):
-                return True
-            depth = response.meta.get('depth', 0) + 1
-            request.meta['depth'] = depth
-            if self.prio:
-                request.priority -= depth * self.prio
-            if self.maxdepth and depth > self.maxdepth:
-                logger.debug(
-                    "Ignoring link (depth > %(maxdepth)d): %(requrl)s ",
-                    {'maxdepth': self.maxdepth, 'requrl': request.url},
-                    extra={'spider': spider},
-                )
-                return False
-            if self.verbose_stats:
-                self.stats.inc_value(f'request_depth_count/{depth}', spider=spider)
-            self.stats.max_value('request_depth_max', depth, spider=spider)
+    def _keep(self, request, response) -> bool:
+        if not isinstance(request, Request):
             return True
-        return (r for r in result if _filter(r))
+        if request.meta.get('is_fuzz'):
+            return True
+        depth = response.meta.get('depth', 0) + 1
+        request.meta['depth'] = depth
+        if self.prio:
+            request.priority -= depth * self.prio
+        if self.maxdepth and depth > self.maxdepth:
+            logger.debug(
+                "Ignoring link (depth > %(maxdepth)d): %(requrl)s ",
+                {'maxdepth': self.maxdepth, 'requrl': request.url},
+            )
+            return False
+        if self.verbose_stats:
+            self.stats.inc_value(f'request_depth_count/{depth}')
+        self.stats.max_value('request_depth_max', depth)
+        return True
+
+    # spider 인자를 받지 않고(최신 Scrapy 시그니처), 동기·비동기 출력을 모두 지원한다.
+    def process_spider_output(self, response, result):
+        return (r for r in result if self._keep(r, response))
+
+    async def process_spider_output_async(self, response, result):
+        async for r in result:
+            if self._keep(r, response):
+                yield r

@@ -3,11 +3,11 @@ import random
 import string
 import difflib
 import requests
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from fbs.inference.sql_dialects import detect_db_from_error, extract_error_snippet
-from fbs.inference.validation import probe_filter_map, detect_waf_body
-from fbs.inference.compare import profile_response
+from fbs.inference.validation import probe_filter_map, detect_waf_body, classify_waf_block
+from fbs.inference.compare import profile_response, resolve_redirect
 
 BASELINE = 'john35912'
 
@@ -52,7 +52,8 @@ class DBDetect:
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
-        self._behavior: dict[tuple, dict] = {}   # (url, method) → 반응 프로파일 캐시
+        self._behavior: dict[tuple, dict] = {}        # (url, method) → 반응 프로파일 캐시
+        self._redirect_cache: dict[str, dict] = {}    # Location → 해석 결과 (path당 1회)
 
     def _profile(self, url: str, method: str, data: dict, target: str) -> dict:
         """(url, method) 엔드포인트의 반응 프로파일(noise/stateful/accumulating/input_sensitive)을
@@ -71,6 +72,24 @@ class DBDetect:
         behavior = profile_response(probe)
         self._behavior[key] = behavior
         return behavior
+
+    def _resolve_redirect(self, base_url: str, location: str) -> dict | None:
+        """302 목적지를 selective·scoped·cached로 한 번만 따라가 분류 수집한다
+        (compare.resolve_redirect 사용). 메인 세션은 no-store라 추종해도 쿠키가 안 바뀌고,
+        쿠키는 도메인 스코프라 외부로도 안 샌다. 반환: observe 관측 또는 None(재추종 안 함)."""
+        host = urlparse(base_url).hostname
+
+        def _in_scope(loc):
+            return urlparse(urljoin(base_url, loc)).hostname == host
+
+        def _fetch(loc):
+            try:
+                r = self.session.get(urljoin(base_url, loc), timeout=self.TIMEOUT, allow_redirects=True)
+                return r.status_code, r.text, None
+            except Exception:
+                return None
+
+        return resolve_redirect(location, _fetch, in_scope=_in_scope, cache=self._redirect_cache)
 
     def run(self, url: str, method: str, data: dict, target: str,
             baseline_length: int | None = None,
@@ -161,6 +180,15 @@ class DBDetect:
                 if triggering_quote is None:
                     triggering_quote = quote_char
 
+            # 302는 따라가지 않았으니(raw) Location만 포착해 신호로 둔다. 목적지가 WAF 차단
+            # 페이지면 selective resolve로 1회 확인해 waf_blocked로 라벨한다 — 302를 성공으로
+            # 오판하지 않게. (resolve는 캐시·스코프 제한, 메인 세션은 no-store라 안전)
+            location = resp.headers.get('Location') if resp is not None else None
+            if probe_status is not None and 300 <= probe_status < 400 and location:
+                dest = self._resolve_redirect(url, location)
+                if dest is not None and classify_waf_block(dest['status'], dest['text'])[0]:
+                    waf_blocked = True
+
             # Case A만: probe 길이 ≈ default → 텍스트 유사도 계산
             # Case C는 default ≈ baseline이므로 probe≈default 체크가 무의미해 건너뜀
             probe_like_default = False
@@ -189,6 +217,7 @@ class DBDetect:
                 'status':             probe_status,
                 'status_changed':     status_changed,
                 'status_signal':      status_signal,
+                'location':           location,
                 'length':             length,
                 'length_delta':       length_delta,
                 'probe_like_default': probe_like_default,
@@ -253,12 +282,15 @@ class DBDetect:
         }
 
     def _send(self, url: str, method: str, data: dict) -> tuple[requests.Response | None, float, str | None]:
+        # allow_redirects=False — 리다이렉트를 따라가면 목적지 본문이 측정에 섞여 신호가 오염된다.
+        # 302는 따라가지 않고 status+Location으로 관측(compare.observe)하고, 의미 있는 302만 따로
+        # resolve_redirect로 확인한다. 세션 쿠키 오염은 engine의 no-store 정책이 막는다.
         start = time.monotonic()
         try:
             if method == 'GET':
-                resp = self.session.get(url, params=data, timeout=self.TIMEOUT)
+                resp = self.session.get(url, params=data, timeout=self.TIMEOUT, allow_redirects=False)
             else:
-                resp = self.session.request(method, url, data=data, timeout=self.TIMEOUT)
+                resp = self.session.request(method, url, data=data, timeout=self.TIMEOUT, allow_redirects=False)
             return resp, time.monotonic() - start, None
         except Exception as e:
             # 예외를 삼키지 않고 유형을 남긴다 — 타임아웃/연결 끊김도 그 자체로 신호일 수 있음
@@ -493,8 +525,9 @@ class Recon:
                     sim      = f" sim={result['default_similarity']}" if result['default_similarity'] is not None else ''
                     st_sig   = f" ★{result['status_signal'].upper()}" if result.get('status_signal') else ''
                     st_chg   = f"→{result['status']}" if result.get('status_changed') else f"{result['status']}"
+                    loc      = f" →Location={result['location']}" if result.get('location') else ''
                     err      = f" | 요청 실패: {result['send_error']}" if result.get('send_error') else ''
-                    print(f"    error probe={payload!r:12s} status={st_chg}{st_sig} length={result['length']}{delta}{sim} db={db_type}{snippet}{err}")
+                    print(f"    error probe={payload!r:12s} status={st_chg}{st_sig}{loc} length={result['length']}{delta}{sim} db={db_type}{snippet}{err}")
         return pages
 
     @staticmethod
@@ -715,12 +748,13 @@ class Recon:
         return 'unknown'
 
     def _send(self, url: str, method: str, data: dict) -> tuple[requests.Response | None, float]:
+        # allow_redirects=False — 탐지 측정은 리다이렉트를 따라가지 않고 raw로 본다(DBDetect._send 참고).
         start = time.monotonic()
         try:
             if method == 'GET':
-                resp = self.session.get(url, params=data, timeout=self.TIMEOUT)
+                resp = self.session.get(url, params=data, timeout=self.TIMEOUT, allow_redirects=False)
             else:
-                resp = self.session.request(method, url, data=data, timeout=self.TIMEOUT)
+                resp = self.session.request(method, url, data=data, timeout=self.TIMEOUT, allow_redirects=False)
             return resp, time.monotonic() - start
         except Exception:
             return None, time.monotonic() - start

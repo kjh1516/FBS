@@ -26,11 +26,12 @@ class SQLitePipeline:
         ('page_signals',       'TEXT',    True,  {}),
     ]
 
-    def __init__(self, db_path, target_url='', login_id=None, login_pw=None):
+    def __init__(self, db_path, target_url='', login_id=None, login_pw=None, user_agent=None):
         self.db_path     = db_path
         self._target_url = target_url
         self._login_id   = login_id
         self._login_pw   = login_pw
+        self._user_agent = user_agent
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -39,6 +40,7 @@ class SQLitePipeline:
             crawler.settings.get('TARGET_URL', ''),
             crawler.settings.get('LOGIN_ID', None),
             crawler.settings.get('LOGIN_PW', None),
+            crawler.settings.get('USER_AGENT', None),
         )
 
     def open_spider(self, spider=None):
@@ -60,7 +62,7 @@ class SQLitePipeline:
             db_path=self.db_path,
             login_id=self._login_id,
             login_pw=self._login_pw,
-            user_agent=getattr(spider, 'user_agent', None),  # 크롤과 같은 UA 공유
+            user_agent=self._user_agent,  # 크롤과 같은 UA(USER_AGENT 설정) 공유
         ).run()
 
     def _create_tables(self):

@@ -216,85 +216,87 @@ def _group_hint_note(own: dict, merged: dict) -> str | None:
     return '형제 필드 신호 상속: ' + ', '.join(f'{v}+{w}' for v, w in boosted.items())
 
 
-# ── 점수 프레임: 증거 클래스 + prior ──────────────────────────────────────────
-# 힌트는 어느 전략을 먼저 돌릴지를 고르는 순위용이다(틀려도 fallback이 복구). 그래서 점수를 가산으로
-# 뭉개지 않고, 의미가 고정된 증거 클래스(큰 간격)로 배정하고 prior(이름/스택)는 밴드 안에서 동점처리로만
-# 얹는다. 규칙:
-#   - 클래스 간 간격 > prior 폭  → 측정된 증거가 이름 추측을 항상 이긴다.
-#   - prior만 있으면 PRIOR 밴드(≤0.39)에 머문다 — 이름만으론 증거 밴드에 못 들어간다.
-#   - 0.70 = 입력이 인터프리터에 도달한 걸 측정으로 확인 — SQLi·XSS 공통 의미라 비교 가능.
-# 세부 신호→클래스 배정은 문제를 풀며 계속 붙인다(지금은 지배적 신호만 연결).
-_CLS_CONFIRMED  = 0.90   # 측정이 주입/실행을 입증 (예: SQL 에러 시그니처)
-_CLS_REACHED    = 0.70   # 입력이 인터프리터에 도달 (따옴표로 쿼리 깨짐 / 실행가능 반사)
-_CLS_SUGGESTIVE = 0.40   # 정황 증거 (선택적 필터 차단, 토큰 차단, escape된 실행 컨텍스트)
-_PRIOR_CEIL     = 0.39   # prior(이름/스택) 단독 상한 — 증거 밴드엔 못 들어감
-_PRIOR_TIE      = 0.09   # 증거가 있을 때 prior 기여(밴드 내 동점처리용)
+# ── 점수 프레임: 신호 누적(noisy-OR) + prior ──────────────────────────────────
+# 힌트는 어느 전략을 먼저 돌릴지를 고르는 순위용이다(틀려도 fallback이 복구). 단일 신호로 확정에
+# 가까워지지 않게, 같은 종류 신호를 noisy-OR로 쌓는다 — 신호가 많을수록 높아지되 1에 수렴한다.
+# 실제 확정은 strategy(진짜 SQL 에러/브라우저 alert 발화)가 한다. 규칙:
+#   - 한 신호의 가중치는 modest(≤0.6) — 하나로는 확정 못 하고, 코로보레이션(누적)으로만 올라간다.
+#   - prior(이름/스택)만 있으면 PRIOR 밴드(≤0.39)에 머문다 — 이름만으론 증거 밴드에 못 들어간다.
+#   - 반사는 메모/검색 페이지에서 흔하므로 낮게 잡는다(반사 하나로 XSS를 확정하지 않는다).
+_W_SQL_ERROR_SIG    = 0.6    # 본문에 실제 DB 에러 시그니처 (가장 강하지만 여전히 <1)
+_W_SQL_QUOTE_BREAK  = 0.35   # 따옴표 → 500/상태변화 (앱 예외일 수도 있어 중간)
+_W_SELECTIVE_FILTER = 0.3    # 이 필드만 선택적 필터 차단 (개발자가 SQL로 인지)
+_W_FILTER_TOKEN     = 0.25   # 필터맵에서 해당 유형 토큰 하나가 막힘 (토큰 수만큼 누적, 상한까지)
+_FILTER_TOKEN_CAP   = 3      # 필터 토큰 누적 개수 상한 (한 종류가 폭주하지 않게)
+_W_XSS_REFLECT      = 0.3    # 꺾쇠 반사 — 흔하므로 낮게 (메모/검색 오탐 방지)
+_W_XSS_EXEC_CTX     = 0.3    # 실행 컨텍스트(js/attr)에서 반사 — 반사보다 위험
+_W_XSS_REFLECT_ESC  = 0.2    # 실행 컨텍스트 반사지만 꺾쇠 escape — breakout 미확인
+_W_XSS_DOM_SUSPECT  = 0.2    # DOM 싱크 정적 의심 (innerHTML/location은 흔함)
+_PRIOR_CEIL         = 0.39   # prior(이름/스택) 단독 상한 — 증거 밴드엔 못 들어감
+_PRIOR_TIE          = 0.09   # 증거가 있을 때 prior 기여(밴드 내 동점처리용)
 
 
-def _banded(evidence_base: float | None, prior: float) -> float:
-    """증거 클래스 base가 있으면 그 밴드 + prior를 소수점 동점처리로, 없으면 prior만(≤0.39)."""
+def _noisy_or(weights) -> float:
+    """같은 종류 신호를 누적한다 — p = 1 - ∏(1-w). 신호가 많을수록 높아지되 1에 수렴하고,
+    각 신호의 추가 기여는 점점 줄어든다(확정에 쉽게 안 닿게)."""
+    p = 0.0
+    for w in weights:
+        p += w * (1.0 - p)
+    return p
+
+
+def _banded(evidence: float | None, prior: float) -> float:
+    """누적 증거 점수가 있으면 그 위에 prior를 소수점으로 얹고(상한 0.95), 없으면 prior만(≤0.39)."""
     p = max(0.0, min(prior, 1.0))
-    if evidence_base is None:
+    if evidence is None:
         return round(p * _PRIOR_CEIL, 3)
-    return round(evidence_base + p * _PRIOR_TIE, 3)
+    return round(min(evidence + p * _PRIOR_TIE, 0.95), 3)
 
 
-def _sqli_evidence(db: dict, block_ratio: float) -> tuple[float | None, str | None]:
-    """recon 신호 → SQLi 증거 클래스. (base, note) 또는 (None, None).
+def _sqli_signals(db: dict, block_ratio: float) -> list[tuple[float, str | None]]:
+    """recon 신호 → SQLi 신호 가중치 리스트 [(weight, note)]. 누적될수록 점수가 올라간다.
 
-    상위 밴드는 SQL 에러 시그니처(detected_db)만이다 — 응답에서 실제 SQL 에러 패턴을 매칭한 것이라
-    SQL-특정적. 반면 따옴표가 500/상태변화를 유발하는 건 그 자체로는 SQL 특정이 아니다: 잘 짠 앱은
-    SQLi여도 예외처리로 500을 안 내고, 백엔드 로직이 커지면 SQL과 무관한 앱 예외로도 500이 난다.
-    그래서 시그니처 없는 따옴표 반응은 도달 입증(REACHED)이 아니라 정황(SUGGESTIVE)으로 둔다 — 실제
-    확정은 strategy의 boolean/union이 한다. (추후 recon이 boolean 차분을 따로 노출하면 REACHED로 올릴
-    여지가 있다 — 지금은 sqli_signal에 섞여 있어 구분 못 함.)"""
+    상위는 SQL 에러 시그니처(detected_db)만 — 실제 SQL 에러 패턴을 매칭한 것이라 SQL-특정적. 따옴표가
+    500/상태변화를 유발하는 건 그 자체론 SQL 특정이 아니지만(앱 예외일 수도), 필터로 SQL 토큰이 막히는
+    것과 겹치면 누적으로 올라간다 — 단독으론 확정 안 되고 코로보레이션으로만 강해진다."""
+    sigs: list[tuple[float, str | None]] = []
     if db.get('detected_db'):
-        return _CLS_CONFIRMED, f"SQL 에러 시그니처로 DB({db['detected_db']}) 확인 — 사실상 주입 확정"
-    # 시그니처 없는 따옴표/probe 반응 — 단순 반응이라 정황(500은 앱 예외일 수도)
-    if db.get('sqli_signal'):
+        sigs.append((_W_SQL_ERROR_SIG, f"SQL 에러 시그니처로 DB({db['detected_db']}) 확인"))
+    elif db.get('sqli_signal'):   # detected_db가 상위 형태라 중복 집계 방지
         q = db.get('quote_char')
         why = f"따옴표({q}) 반응" if q else "probe 반응"
-        return _CLS_SUGGESTIVE, f"{why} — SQL 에러 시그니처 없음(단순 반응이라 정황)"
-    # 선택적 필터 차단 = 개발자가 이 필드를 SQL로 인지하고 막았다 → 정황
+        sigs.append((_W_SQL_QUOTE_BREAK, f"{why} → 500/상태변화 (에러 시그니처 없음)"))
     if db.get('waf_blocked') and block_ratio < _SELECTIVE_BLOCK_THRESHOLD:
-        return _CLS_SUGGESTIVE, f"선택적 필터 차단(전역 {block_ratio:.0%})"
-    return None, None
+        sigs.append((_W_SELECTIVE_FILTER, f"선택적 필터 차단 (전역 {block_ratio:.0%})"))
+    return sigs
 
 
-def _xss_evidence(db: dict) -> tuple[float | None, str | None]:
-    """recon 반사 신호 → XSS 증거 클래스. (base, note) 또는 (None, None)."""
-    refl = db.get('reflection')
+def _xss_signals(db: dict) -> list[tuple[float, str | None]]:
+    """recon 반사 신호 → XSS 신호 가중치 리스트. 꺾쇠 반사는 흔하므로 낮게 잡고, 실행 컨텍스트
+    (js/attr)에서의 반사가 겹칠 때만 누적으로 올라간다 — 반사 하나로 XSS를 확정하지 않는다."""
+    refl = db.get('reflection') or {}
     if not refl:
-        return None, None
+        return []
+    sigs: list[tuple[float, str | None]] = []
     if refl.get('reflected'):
         ctxs     = set(refl.get('contexts') or [])
         survived = set(refl.get('survived') or [])
         exec_ctx = ctxs & {'js', 'attr_unquoted', 'attr_single', 'attr_double'}
-        # 꺾쇠가 이스케이프 없이 생존 = 태그 주입 가능 → 도달 입증
         if {'<', '>'} <= survived:
-            return _CLS_REACHED, f"반사+꺾쇠생존(컨텍스트={','.join(sorted(ctxs))}) → 도달 입증"
-        # 실행 컨텍스트 반사지만 꺾쇠 escape — 따옴표 breakout 여지(미확인) → 정황
-        if exec_ctx:
-            return _CLS_SUGGESTIVE, f"실행 컨텍스트 반사({','.join(sorted(exec_ctx))}) — 꺾쇠 escape, breakout 미확인"
-        return None, None
-    # 서버 반사는 없지만 DOM 싱크 반사 의심(JS가 URL→innerHTML 등). 단 이건 이 param이 싱크에 닿는다를
-    # 측정한 게 아니라 페이지에 DOM-XSS 모양 코드가 있다는 약한 정적 신호다(innerHTML/location은 현대
-    # 페이지에 흔함). 그래서 측정된 도달(REACHED)이 아니라 정황(SUGGESTIVE)으로 둔다 — 실제 SQL 증거
-    # (0.70+)가 올바르게 이기고, 다른 신호가 없으면 XSS가 최상위라 그대로 돌아 브라우저가 확정/기각한다
-    # (미발화면 strategy가 미보고).
-    if refl.get('dom_suspect'):
-        return _CLS_SUGGESTIVE, f"DOM 반사 의심({refl.get('dom_source')}→{refl.get('dom_sink')}) — 정적 신호, 브라우저 확정 필요"
-    return None, None
+            sigs.append((_W_XSS_REFLECT, f"꺾쇠 반사(컨텍스트={','.join(sorted(ctxs))}) — 흔함"))
+            if exec_ctx:
+                sigs.append((_W_XSS_EXEC_CTX, f"실행 컨텍스트 반사({','.join(sorted(exec_ctx))})"))
+        elif exec_ctx:
+            sigs.append((_W_XSS_REFLECT_ESC, f"실행 컨텍스트 반사 but 꺾쇠 escape — breakout 미확인"))
+    elif refl.get('dom_suspect'):
+        sigs.append((_W_XSS_DOM_SUSPECT, f"DOM 반사 의심({refl.get('dom_source')}→{refl.get('dom_sink')})"))
+    return sigs
 
 
-def _filter_map_evidence(filter_map: dict[str, str] | None) -> dict[str, tuple[float, str]]:
-    """토큰별 필터 지도(outcome: passed/removed/encoded/rejected) → 유형별 정황(SUGGESTIVE)
-    증거. FILTER_PROBE_TOKENS에서 자기 유형에만 기여한다(따옴표 차단이 xss로 번지지 않음).
-
-    removed(입력 제거)·rejected(차단 페이지)만 기여한다 — 그 유형을 의식한 필터라 정황. encoded(출력
-    이스케이프, 예: '→&#39;)는 기여하지 않는다 — 그건 그 공격을 중화한 것이라 성공 신호가 아니고, 특히
-    백엔드 주입형(sqli 등)은 출력 인코딩과 무관(char는 쿼리에 그대로 도달)하므로 encoded를 필터로 세면
-    가짜 신호가 된다. passed도 당연히 제외."""
+def _filter_map_signals(filter_map: dict[str, str] | None) -> dict[str, list[tuple[float, str | None]]]:
+    """토큰별 필터 지도 → 유형별 신호 리스트. removed/rejected만 기여하고(그 유형을 의식한 필터),
+    FILTER_PROBE_TOKENS에서 자기 유형에만 번진다. 막힌 토큰이 많을수록 누적되지만 상한을 둬 폭주를
+    막는다. encoded(출력 이스케이프)·passed는 제외 — 백엔드 주입형은 출력 인코딩과 무관."""
     if not filter_map:
         return {}
     by_vuln: dict[str, list[str]] = {}
@@ -302,13 +304,17 @@ def _filter_map_evidence(filter_map: dict[str, str] | None) -> dict[str, tuple[f
         if outcome not in ('removed', 'rejected'):
             continue
         for vuln in FILTER_PROBE_TOKENS.get(token, {}):
-            by_vuln.setdefault(vuln, []).append(f"{token}({outcome})")
-    return {v: (_CLS_SUGGESTIVE, f"필터된 토큰 {toks}") for v, toks in by_vuln.items()}
+            by_vuln.setdefault(vuln, []).append(token)
+    out: dict[str, list[tuple[float, str | None]]] = {}
+    for vuln, toks in by_vuln.items():
+        n = min(len(toks), _FILTER_TOKEN_CAP)
+        out[vuln] = [(_W_FILTER_TOKEN, f"필터된 토큰 {toks}")] + [(_W_FILTER_TOKEN, None)] * (n - 1)
+    return out
 
 
 def _assemble_hints(field_hints: dict, group: dict, t_boost: dict,
                     db: dict, block_ratio: float):
-    """prior(이름/형제/스택)와 recon 증거 클래스를 밴드 모델로 합쳐 최종 hints를 만든다.
+    """prior(이름/형제/스택)와 recon 증거 신호를 누적(noisy-OR)해 최종 hints를 만든다.
 
     반환: (hints, group_note, recon_note, filter_map_note) — breakdown 표시용 노트 포함."""
     # PRIOR — 필드명 + 형제 상속 + 기술스택(전부 max, 증거 밴드엔 못 들어감)
@@ -317,28 +323,26 @@ def _assemble_hints(field_hints: dict, group: dict, t_boost: dict,
     for vuln, w in (t_boost or {}).items():
         prior[vuln] = max(prior.get(vuln, 0.0), w)
 
-    # EVIDENCE — 유형별 최상위 증거 클래스
-    evidence: dict[str, tuple[float, str]] = {}
-    sb, sn = _sqli_evidence(db, block_ratio)
-    if sb is not None:
-        evidence['sqli'] = (sb, sn)
-    xb, xn = _xss_evidence(db)
-    if xb is not None:
-        evidence['xss'] = (xb, xn)
-    for vuln, (b, n) in _filter_map_evidence(db.get('filter_map')).items():
-        if vuln not in evidence or b > evidence[vuln][0]:
-            evidence[vuln] = (b, n)
+    # EVIDENCE — 유형별 신호를 모아 noisy-OR로 누적 (같은 종류가 많을수록 높아짐)
+    sigs: dict[str, list[tuple[float, str | None]]] = {}
+    for w, n in _sqli_signals(db, block_ratio):
+        sigs.setdefault('sqli', []).append((w, n))
+    for w, n in _xss_signals(db):
+        sigs.setdefault('xss', []).append((w, n))
+    for vuln, lst in _filter_map_signals(db.get('filter_map')).items():
+        sigs.setdefault(vuln, []).extend(lst)
 
-    # BUILD — 밴드 결합
-    hints = {
-        vuln: _banded(evidence.get(vuln, (None, None))[0], prior.get(vuln, 0.0))
-        for vuln in set(prior) | set(evidence)
-    }
+    hints = {}
+    for vuln in set(prior) | set(sigs):
+        weights = [w for w, _ in sigs.get(vuln, [])]
+        ev = _noisy_or(weights) if weights else None
+        hints[vuln] = _banded(ev, prior.get(vuln, 0.0))
 
-    recon_note = evidence.get('sqli', (None, None))[1]
-    other_notes = '; '.join(f"{v}: {n}" for v, (b, n) in evidence.items()
-                            if v != 'sqli' and n)
-    return hints, group_note, recon_note, (other_notes or None)
+    def _notes(vuln: str) -> str:
+        return '; '.join(n for _, n in sigs.get(vuln, []) if n)
+    recon_note  = _notes('sqli') or None
+    other_notes = '; '.join(f"{v}: {_notes(v)}" for v in sigs if v != 'sqli' and _notes(v)) or None
+    return hints, group_note, recon_note, other_notes
 
 
 def _reflection_extra(db: dict) -> dict:

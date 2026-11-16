@@ -48,6 +48,9 @@ class ScannerSpider(CrawlSpider):
         crawler.settings.set('TARGET_URL', spider.target_url, priority='spider')
         crawler.settings.set('LOGIN_ID',   spider.login_id,   priority='spider')
         crawler.settings.set('LOGIN_PW',   spider.login_pw,   priority='spider')
+        # 스캔당 UA 한 개로 고정 — USER_AGENT 설정으로 둔다(스파이더 속성은 deprecated). 기본
+        # UserAgentMiddleware가 이 값을 전 크롤 요청에 적용하고, 파이프라인이 추론 engine에 넘겨 공유한다.
+        crawler.settings.set('USER_AGENT', pick_user_agent(), priority='spider')
         return spider
 
     def __init__(self, target_url=None, login_id=None, login_pw=None, *args, **kwargs):
@@ -59,9 +62,6 @@ class ScannerSpider(CrawlSpider):
         self.target_url  = target_url
         self.login_id    = login_id
         self.login_pw    = login_pw
-        # 스캔당 UA 한 개로 고정 — Scrapy UserAgentMiddleware가 이 속성을 읽어 전 크롤 요청에
-        # 적용하고, 추론 단계도 같은 값을 공유한다(파이프라인이 engine에 넘김).
-        self.user_agent  = pick_user_agent()
         parsed = urlparse(target_url)
         self.allowed_domains = [parsed.hostname]
 

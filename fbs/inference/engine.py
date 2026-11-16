@@ -10,7 +10,7 @@ from fbs.inference.profiler import Profiler
 from fbs.inference.recon import Recon, DBDetect
 from fbs.inference.validation import WafDetector
 from fbs.inference.strategies.base import BaseStrategy
-from fbs.utils import pick_user_agent
+from fbs.utils import pick_user_agent, protect_session_cookies
 
 """추론을 총괄하는 파일.
 
@@ -23,6 +23,17 @@ from fbs.utils import pick_user_agent
 
 
 # ── 엔진 ──────────────────────────────────────────────────────────────────────
+
+def _is_credential_form(surface) -> bool:
+    """이 표면이 credential(로그인/회원가입/비번) 폼의 일부인지 — password류 필드가 같이 제출되는가.
+    이런 폼은 틀린 로그인이 전부 같은 응답(흔히 302 리다이렉트)이라 단순 프로브엔 입력-무관처럼 보이지만,
+    로그인 우회 SQLi의 최우선 타깃이다. 그래서 stub으로 스킵하지 않는다 — 진짜 테스트(우회 페이로드)는
+    strategy가 한다."""
+    names = {surface.param.lower()} if surface.param else set()
+    names |= {str(k).lower() for k in (surface.extra.get('all_params') or {})}
+    # password류 식별: pass/pwd 포함, 또는 pw로 끝남(pw/upw/userpw/newpw 같은 복합 표기 커버)
+    return any('pass' in n or 'pwd' in n or n.endswith('pw') for n in names)
+
 
 class InferenceEngine:
     def __init__(self, db_path: str = 'fbs_results.db',
@@ -99,8 +110,9 @@ class InferenceEngine:
 
     # ── 세션 재사용 ───────────────────────────────────────────────────────────
 
-    def _seed_cookies(self, pages: list[dict]) -> None:
-        """크롤링 때 얻은 쿠키를 recon/strategy가 공유하는 requests.Session에 미리 심는다.
+    def _seed_cookies(self, pages: list[dict]) -> set[str]:
+        """크롤링 때 얻은 쿠키를 recon/strategy가 공유하는 requests.Session에 미리 심고, 심은 쿠키
+        이름 집합을 돌려준다(인증 쿠키 보호 정책용).
 
         추론 단계는 항상 새 requests.Session()으로 시작한다. 그런데 로그인 진입점이 POST 한 번을
         거쳐야만 세션을 발급하는 앱(세션이 없으면 보호된 페이지가 조용히 다른 곳으로 리다이렉트되는
@@ -109,15 +121,16 @@ class InferenceEngine:
         그대로 밟아 필요한 세션을 이미 발급받아 PageItem에 쿠키로 남겨뒀으므로(scanner.py의 Set-Cookie
         수집), 그걸 재사용하면 추론 단계도 크롤링 때와 같은 로그인된/세션 있는 상태에서 시작할 수 있다.
         """
-        seeded = 0
+        seeded_names: set[str] = set()
         for page in pages:
             for c in (page.get('cookies') or []):
                 name, value = c.get('name'), c.get('value')
                 if name:
                     self.session.cookies.set(name, value or '')
-                    seeded += 1
-        if seeded:
-            print(f"    [세션] 크롤링 때 수집한 쿠키 {seeded}개를 추론 세션에 반영")
+                    seeded_names.add(name)
+        if seeded_names:
+            print(f"    [세션] 크롤링 때 수집한 쿠키 {len(seeded_names)}개를 추론 세션에 반영")
+        return seeded_names
 
     # ── 공유 baseline ─────────────────────────────────────────────────────────
 
@@ -131,7 +144,8 @@ class InferenceEngine:
             if not url:
                 continue
             try:
-                resp = self.session.get(url, timeout=10)
+                # raw — diff baseline은 recon 프로브와 같은 정책이어야 "전부 변함" 오탐이 안 난다.
+                resp = self.session.get(url, timeout=10, allow_redirects=False)
                 page['_baseline'] = {
                     'status':  resp.status_code,
                     'body':    resp.text,
@@ -182,7 +196,10 @@ class InferenceEngine:
 
         print(f"\n# [추론 엔진] 페이지 {len(pages)}개 / 버튼 결과 {len(button_results)}개 로드 (scan_id={scan_id})")
 
-        self._seed_cookies(pages)
+        seeded_names = self._seed_cookies(pages)
+        # 시드된(크롤이 받은) 인증 쿠키가 주입 응답에 의해 삭제/만료되지 않게 보호한다 — 주입이
+        # /logout 302로 세션을 비우는 오염은 막되, 서버의 정상 세션 리프레시(새 값)는 받는다.
+        protect_session_cookies(self.session, seeded_names)
 
         # 0단계: 페이지당 baseline(파라미터 없이 그냥 GET)을 한 번만 가져와 WafDetector·Recon이 공유한다 —
         # 둘 다 같은 URL을 baseline GET으로 찔러보므로 중복 요청을 없앤다.
@@ -291,7 +308,11 @@ class InferenceEngine:
                     or refl.get('reflected') or refl.get('dom_suspect')
                     or any(o != 'passed' for o in (surface.extra.get('filter_map') or {}).values())
                 )
-                if not reacted:
+                # credential 폼(로그인/회원가입 등)은 틀린 로그인이 전부 같은 응답이라 입력-무관처럼
+                # 보이는 게 정상이고, 로그인 우회 SQLi의 최우선 타깃이라 stub으로 스킵하면 안 된다.
+                if not reacted and _is_credential_form(surface):
+                    print(f"    · stub 스킵 보류 — credential 폼(로그인 우회 SQLi 타깃)이라 입력-무관이어도 테스트")
+                elif not reacted:
                     psig = (surface.page or {}).get('page_signals') or {}
                     ctx = []
                     redir = psig.get('redirect')
