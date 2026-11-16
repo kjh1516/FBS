@@ -2,6 +2,25 @@ import base64
 import zlib
 import json
 import re
+import random
+
+
+# ── User-Agent ────────────────────────────────────────────────────────────────
+# 스캔당 하나를 골라 크롤·추론이 공유하는 UA 풀. 요청마다 UA를 바꾸면 diff 기반 퍼징
+# 신호가 흔들리고(앱이 UA로 템플릿을 가르면 파라미터 효과와 구분 불가), 매 요청 UA가
+# 뒤집히는 건 그 자체로 봇 지문이라 차단 회피에도 불리하다 — 스캔 시작에 한 번만 고른다.
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+]
+
+
+def pick_user_agent() -> str:
+    """스캔 하나에 쓸 UA를 풀에서 한 번 고른다. 스캔 간에는 다양성이 있고 스캔 내에서는 고정."""
+    return random.choice(USER_AGENTS)
 
 
 # ── Flask 세션 ───────────────────────────────────────────────────────────────

@@ -60,6 +60,7 @@ class SQLitePipeline:
             db_path=self.db_path,
             login_id=self._login_id,
             login_pw=self._login_pw,
+            user_agent=getattr(spider, 'user_agent', None),  # 크롤과 같은 UA 공유
         ).run()
 
     def _create_tables(self):

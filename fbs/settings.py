@@ -45,6 +45,15 @@ DEPTH_LIMIT = 3
 CONCURRENT_REQUESTS_PER_DOMAIN = 1
 DOWNLOAD_DELAY = 1
 
+# ── 퍼징 레인 튜닝 (fuzz 전용 슬롯 — 일반 크롤 정중함과 별개) ──────────────────────
+# 동시성을 올리고 delay를 낮추면 큰 단어장도 빠르게 끝나지만 서버를 세게 때린다. 고정 간격은
+# 봇 지문이라 delay는 [MIN, MAX] 범위에서 랜덤 지터를 준다(MIN=MAX로 두면 고정).
+#   느리고 정중하게 : scrapy crawl scanner -s FUZZ_DELAY_MAX=2 -s FUZZ_CONCURRENCY=2
+#   빠르게(랩 환경) : scrapy crawl scanner -s FUZZ_DELAY_MAX=0 -s FUZZ_CONCURRENCY=16
+FUZZ_CONCURRENCY = 8
+FUZZ_DELAY_MIN   = 0.0
+FUZZ_DELAY_MAX   = 0.5
+
 # Disable cookies (enabled by default)
 #COOKIES_ENABLED = False
 
@@ -70,8 +79,8 @@ SPIDER_MIDDLEWARES = {
 # See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
 DOWNLOADER_MIDDLEWARES = {
     'fbs.middlewares.FuzzNoDelayMiddleware': 350,
-    'fbs.middlewares.RandomUserAgentMiddleware': 400,
-    'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+    # 기본 UserAgentMiddleware가 spider.user_agent를 전 크롤 요청에 적용한다(스캔당 UA 하나로
+    # 고정). 요청마다 UA를 바꾸던 RandomUserAgentMiddleware는 diff 탐지 신호를 흔들어 제거했다.
 }
 
 # Enable or disable extensions

@@ -10,6 +10,7 @@ from fbs.inference.profiler import Profiler
 from fbs.inference.recon import Recon, DBDetect
 from fbs.inference.validation import WafDetector
 from fbs.inference.strategies.base import BaseStrategy
+from fbs.utils import pick_user_agent
 
 """추론을 총괄하는 파일.
 
@@ -25,11 +26,15 @@ from fbs.inference.strategies.base import BaseStrategy
 
 class InferenceEngine:
     def __init__(self, db_path: str = 'fbs_results.db',
-                 login_id: str | None = None, login_pw: str | None = None):
+                 login_id: str | None = None, login_pw: str | None = None,
+                 user_agent: str | None = None):
         self.db_path   = db_path
         self.login_id  = login_id
         self.login_pw  = login_pw
         self.session   = requests.Session()
+        # 크롤과 같은 UA를 쓴다 — UA-sniffing 앱에서 크롤이 본 페이지와 추론이 받는 페이지가
+        # 갈리지 않게. 넘어온 게 없으면(단독 실행) 풀에서 하나 고른다(기본 python-requests UA 방지).
+        self.session.headers['User-Agent'] = user_agent or pick_user_agent()
         self.profiler  = Profiler()
         self.strategies: list[BaseStrategy] = []
         self._results:   list[VulnResult]   = []
@@ -381,12 +386,14 @@ class InferenceEngine:
 
 def main():
     parser = argparse.ArgumentParser(description='FBS 추론 엔진 단독 실행')
-    parser.add_argument('--db',       default='fbs_results.db', help='SQLite DB 경로')
-    parser.add_argument('--login-id', default=None,             help='로그인 아이디')
-    parser.add_argument('--login-pw', default=None,             help='로그인 비밀번호')
+    parser.add_argument('--db',         default='fbs_results.db', help='SQLite DB 경로')
+    parser.add_argument('--login-id',   default=None,             help='로그인 아이디')
+    parser.add_argument('--login-pw',   default=None,             help='로그인 비밀번호')
+    parser.add_argument('--user-agent', default=None,             help='추론 요청 User-Agent (기본: 내장 풀에서 랜덤)')
     args = parser.parse_args()
 
-    InferenceEngine(db_path=args.db, login_id=args.login_id, login_pw=args.login_pw).run()
+    InferenceEngine(db_path=args.db, login_id=args.login_id, login_pw=args.login_pw,
+                    user_agent=args.user_agent).run()
 
 
 if __name__ == '__main__':

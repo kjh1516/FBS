@@ -5,7 +5,7 @@ import json as _json
 import scrapy
 from scrapy.spiders import CrawlSpider
 from urllib.parse import urlparse, urljoin, parse_qs
-from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload, detect_client_redirect, extract_gate_hints
+from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload, detect_client_redirect, extract_gate_hints, pick_user_agent
 from fbs.items import PageItem, ButtonResultItem
 from fbs.inference.validation import classify_waf_block, EVASION_TRANSFORMS
 from fbs.inference.compare import visible_text, diff_score
@@ -59,6 +59,9 @@ class ScannerSpider(CrawlSpider):
         self.target_url  = target_url
         self.login_id    = login_id
         self.login_pw    = login_pw
+        # 스캔당 UA 한 개로 고정 — Scrapy UserAgentMiddleware가 이 속성을 읽어 전 크롤 요청에
+        # 적용하고, 추론 단계도 같은 값을 공유한다(파이프라인이 engine에 넘김).
+        self.user_agent  = pick_user_agent()
         parsed = urlparse(target_url)
         self.allowed_domains = [parsed.hostname]
 

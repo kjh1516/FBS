@@ -2,13 +2,16 @@ import logging
 import random
 from scrapy import signals
 from scrapy.http import Request
-from fake_useragent import UserAgent
 
 logger = logging.getLogger(__name__)
 
 
 class FuzzNoDelayMiddleware:
-    """퍼징 요청을 전용 슬롯에 배정해 DOWNLOAD_DELAY 없이 병렬 처리."""
+    """퍼징 요청을 전용 슬롯에 배정해 일반 DOWNLOAD_DELAY와 별개로 처리한다.
+
+    속도↔정중함은 settings의 FUZZ_CONCURRENCY / FUZZ_DELAY_MIN / FUZZ_DELAY_MAX로 조절한다 —
+    동시성을 올리고 delay를 낮추면 큰 단어장도 빠르게 끝나지만 서버를 세게 때린다. delay를 범위로
+    두는 건 고정 간격이 봇 지문이라 랜덤 지터를 주기 위함이다(MIN=MAX면 고정)."""
 
     FUZZ_SLOT = 'fuzz'
 
@@ -21,8 +24,11 @@ class FuzzNoDelayMiddleware:
 
     def spider_opened(self, spider):
         from scrapy.core.downloader import Slot
+        settings = self.crawler.settings
+        self._delay_min = settings.getfloat('FUZZ_DELAY_MIN', 0.0)
+        self._delay_max = settings.getfloat('FUZZ_DELAY_MAX', 0.5)
+        concurrency = settings.getint('FUZZ_CONCURRENCY', 8)
         downloader = self.crawler.engine.downloader
-        concurrency = self.crawler.settings.getint('CONCURRENT_REQUESTS', 8)
         downloader.slots[self.FUZZ_SLOT] = Slot(concurrency, 0, False)
 
     def process_request(self, request, spider=None):
@@ -33,7 +39,7 @@ class FuzzNoDelayMiddleware:
             request.meta['download_slot'] = self.FUZZ_SLOT
             slot = self.crawler.engine.downloader.slots.get(self.FUZZ_SLOT)
             if slot:
-                slot.delay = random.uniform(0, 0.5)
+                slot.delay = random.uniform(self._delay_min, self._delay_max)
         return None
 
 
@@ -83,11 +89,3 @@ class FuzzAwareDepthMiddleware:
             self.stats.max_value('request_depth_max', depth, spider=spider)
             return True
         return (r for r in result if _filter(r))
-
-
-class RandomUserAgentMiddleware:
-    def __init__(self):
-        self.ua = UserAgent()
-
-    def process_request(self, request, spider=None):
-        request.headers['User-Agent'] = self.ua.random
