@@ -21,7 +21,7 @@ from fbs.inference.compare import visible_text, diff_score
   - 우회: EVASION_TRANSFORMS / XSS_EVASION_TRANSFORMS / try_evade()
   - 비교 유틸: visible_text() / diff_score()
 
-여기 모아둔 이유: recon(DBDetect, 동기 requests)·scanner.py(비동기 Scrapy)·SQLiStrategy/XSSStrategy가
+여기 모아둔 이유: recon(동기 requests)·scanner.py(비동기 Scrapy)·SQLiStrategy/XSSStrategy가
 전부 같은 측정 로직을 써야 신호가 일관되기 때문이다. recon은 FILTER_PROBE_TOKENS·반응 분류기·
 GENERIC_BLOCK_KEYWORDS를 그대로 공유하고, 결과는 surface.extra(filter_map/waf_info)로 profiler/strategy에 흐른다.
 """
@@ -164,7 +164,7 @@ GENERIC_BLOCK_KEYWORDS = [
 BLOCK_STATUS_CODES      = {403, 406, 444, 503, 999}
 RATE_LIMIT_STATUS_CODES = {429}
 
-# recon의 반사/쿼트 프로빙(DBDetect._detect_waf_body)이 쓰는 거부 본문 보수적 키워드셋. 그 자리는
+# recon의 반사/쿼트 프로빙(recon의 반사/쿼트 프로빙)이 쓰는 거부 본문 보수적 키워드셋. 그 자리는
 # baseline 없이 절대값으로 보므로(차분 아님) GENERIC_BLOCK_KEYWORDS보다 좁게 유지한다 — denied·forbidden
 # 같은 흔한 단어까지 넣으면 정상 페이지를 WAF-차단으로 오판해 반사 탐지를 통째로 스킵한다(native 콘텐츠
 # 오탐). classify_waf_block은 더 넓은 GENERIC을 쓰되 baseline 차분/상태코드로 거르므로 괜찮다 — 쓰임이
@@ -337,8 +337,7 @@ def probe_filter_map(send_fn, url, method, data, target, baseline_body, anchor,
                 (passed/removed/encoded). 몰래 sanitize하는 필터를 잡는다.
       · 응답형: 반사 안 되면 응답이 거부 페이지가 되는지로 판정(passed/rejected).
     반환 None = 반응하는 필터 없음. anchor는 영숫자 프로브 마커(recon.BASELINE), noise는 호출부(recon)가
-    compare.profile_response로 미리 잰 페이지 노이즈(거부 임계 산정용). 누적형(memo) 가드는 여기서 안
-    한다 — recon이 behavior.accumulating으로 사전 게이트한다."""
+    미리 잰 페이지 노이즈(거부 임계 산정용). 누적형(memo) 가드는 여기서 안 하고 호출부가 사전 게이트한다."""
     if reflection and reflection.get('reflected'):
         return _filter_map_reflective(send_fn, url, method, data, target, anchor)
     normal_text = visible_text(baseline_body or '')
@@ -375,8 +374,7 @@ def _filter_map_reflective(send_fn, url, method, data, target, anchor) -> dict[s
 def _filter_map_rejective(send_fn, url, method, data, target,
                           normal_text, noise, anchor) -> dict[str, str] | None:
     """응답형(거부 지문): 반사 안 되는 엔드포인트에서 토큰이 차단 페이지를 유발하는지로 판정한다.
-    임계값은 페이지 노이즈로 동적으로 잡는다(max(noise*2, floor)). noise는 호출부(recon)가
-    compare.profile_response로 미리 측정해 넘겨준다."""
+    임계값은 페이지 노이즈로 동적으로 잡는다(max(noise*2, floor)). noise는 호출부(recon)가 넘겨준다."""
     threshold = max(noise * 2, _FILTER_MIN_DIFF_FLOOR)
 
     composite = anchor + ''.join(FILTER_PROBE_TOKENS.keys())

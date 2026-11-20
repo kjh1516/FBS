@@ -53,10 +53,12 @@ def protect_session_cookies(session, names) -> None:
 
 # ── Flask 세션 ───────────────────────────────────────────────────────────────
 
-def is_flask_session(cookie_name: str, cookie_value: str) -> bool:
+def decode_flask_session(cookie_value: str) -> dict | None:
+    """Flask 세션 쿠키(payload.timestamp.signature)에서 payload를 까서 돌려준다. 서명 검증은
+    하지 않고(시크릿이 없으니) base64·zlib 복호 + JSON 파싱만 한다 — 해석 실패면 None."""
     parts = cookie_value.split('.')
     if len(parts) < 3:
-        return False
+        return None
     compressed = cookie_value.startswith('.')
     payload = parts[1] if compressed else parts[0]
     try:
@@ -64,10 +66,14 @@ def is_flask_session(cookie_name: str, cookie_value: str) -> bool:
         decoded = base64.urlsafe_b64decode(payload + padding)
         if compressed:
             decoded = zlib.decompress(decoded)
-        json.loads(decoded)
-        return True
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else {'value': data}
     except Exception:
-        return False
+        return None
+
+
+def is_flask_session(cookie_name: str, cookie_value: str) -> bool:
+    return decode_flask_session(cookie_value) is not None
 
 
 # ── JWT ──────────────────────────────────────────────────────────────────────
@@ -208,29 +214,33 @@ def detect_tech_stack(headers: dict, cookies: list, body: str, url: str = '',
             'language':    str | None,
             'framework':   str | None,
             'cms':         str | None,
-            'spa':         str | None,
-            'session':     str | None,
-            'jwt_cookies': list,
+            'spa':             str | None,
+            'session':         str | None,
+            'session_payload': dict | None,   # Flask 세션이면 까본 payload
+            'jwt_cookies':     list,
         }
     """
     result = {
-        'server':      None,
-        'language':    None,
-        'framework':   None,
-        'cms':         None,
-        'spa':         None,
-        'session':     None,
-        'jwt_cookies': [],
+        'server':          None,
+        'language':        None,
+        'framework':       None,
+        'cms':             None,
+        'spa':             None,
+        'session':         None,
+        'session_payload': None,
+        'jwt_cookies':     [],
     }
 
     def _set(field, value):
         if result[field] is None:
             result[field] = value
 
-    # 헤더 정규화
+    # 헤더 정규화 — 값이 빈 리스트인 헤더(값 없이 이름만 온 경우)는 빈 문자열로 둔다.
     flat = {}
     for k, v in headers.items():
-        flat[k.lower()] = (v[0] if isinstance(v, list) else v).lower()
+        if isinstance(v, list):
+            v = v[0] if v else ''
+        flat[k.lower()] = (v or '').lower()
 
     # 1. X-Powered-By
     powered_by = flat.get('x-powered-by', '')
@@ -289,11 +299,14 @@ def detect_tech_stack(headers: dict, cookies: list, body: str, url: str = '',
                 if result['session'] is None:
                     result['session'] = name
 
-        if is_flask_session(name, value):
+        flask_payload = decode_flask_session(value)
+        if flask_payload is not None:
             _set('framework', 'Flask')
             _set('language', 'Python')
             if result['session'] is None:
                 result['session'] = name
+            if result['session_payload'] is None:
+                result['session_payload'] = flask_payload
 
         if value and is_jwt(value):
             payload = decode_jwt_payload(value)

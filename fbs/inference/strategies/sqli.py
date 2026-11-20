@@ -141,14 +141,9 @@ class SQLiStrategy(BaseStrategy):
             return []
 
         # stateful(시도 카운터/리셋 등으로 요청마다 응답이 바뀜) 여부 + 요청별 변동폭(page_noise).
-        # stateful이면 content 기반 판정을 끄고 시간 기반 오라클로 전환한다. recon이 compare.
-        # profile_response로 (url,method)당 1회 측정해 surface.extra['behavior']에 실어주므로 그걸
-        # 그대로 소비한다(중복 측정 제거). behavior가 없는 표면(버튼 API 등)만 자체 멱등성 프로브로 폴백.
-        beh = surface.extra.get('behavior')
-        if beh is not None:
-            stateful, page_noise, idem_trace = beh.get('stateful', False), beh.get('noise', 0), None
-        else:
-            stateful, page_noise, idem_trace = self._probe_idempotency(surface, base_fields, baseline_body)
+        # stateful이면 content 기반 판정을 끄고 시간 기반 오라클로 전환한다. 자체 멱등성 프로브로 측정한다.
+        # (recon 측정 결과를 받아 재사용하도록 연결하는 건 이후 매핑 단계에서 한다.)
+        stateful, page_noise, idem_trace = self._probe_idempotency(surface, base_fields, baseline_body)
 
         # status만 바뀌고 본문 증거가 없는 약한 신호는 바로 확정 짓지 않고 보류해둔다 —
         # boolean 등 더 확실한 신호를 계속 찾아보고, 끝까지 아무것도 없으면 최후 수단으로 쓴다.

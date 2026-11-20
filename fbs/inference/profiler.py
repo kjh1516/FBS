@@ -107,12 +107,6 @@ _TECH_BOOST: dict[str, dict[str, float]] = {
     'MongoDB':    {'nosqli': 0.3},
 }
 
-# recon의 전역 필터 차단 비율(__block_ratio__)이 이 값 미만이면 선택적 차단(타겟 필터 추정, sqli
-# 신호로 취급)으로, 이상이면 균일 차단(범용 WAF 추정, 신호 불명확 — 점수를 깎지 않고 필드명 기반
-# 베이스라인을 그대로 유지)으로 판단한다.
-_SELECTIVE_BLOCK_THRESHOLD = 0.5
-
-
 # 부분 문자열로 매칭하면 흔한 영단어에 잘못 걸리는 키워드들 — 이것만 토큰 완전 일치로 좁힌다
 # (길이 기준이 아니라 실제 오탐 사례 기준). id→valid/avoid/liquid/paid/guid, no→annotation/ignore/
 # technology, q→quantity/require/frequency, pid→rapid/stupid/cupid, uid→liquid/squid, num→enumerate.
@@ -225,7 +219,6 @@ def _group_hint_note(own: dict, merged: dict) -> str | None:
 #   - 반사는 메모/검색 페이지에서 흔하므로 낮게 잡는다(반사 하나로 XSS를 확정하지 않는다).
 _W_SQL_ERROR_SIG    = 0.6    # 본문에 실제 DB 에러 시그니처 (가장 강하지만 여전히 <1)
 _W_SQL_QUOTE_BREAK  = 0.35   # 따옴표 → 500/상태변화 (앱 예외일 수도 있어 중간)
-_W_SELECTIVE_FILTER = 0.3    # 이 필드만 선택적 필터 차단 (개발자가 SQL로 인지)
 _W_FILTER_TOKEN     = 0.25   # 필터맵에서 해당 유형 토큰 하나가 막힘 (토큰 수만큼 누적, 상한까지)
 _FILTER_TOKEN_CAP   = 3      # 필터 토큰 누적 개수 상한 (한 종류가 폭주하지 않게)
 _W_XSS_REFLECT      = 0.3    # 꺾쇠 반사 — 흔하므로 낮게 (메모/검색 오탐 방지)
@@ -253,12 +246,13 @@ def _banded(evidence: float | None, prior: float) -> float:
     return round(min(evidence + p * _PRIOR_TIE, 0.95), 3)
 
 
-def _sqli_signals(db: dict, block_ratio: float) -> list[tuple[float, str | None]]:
+def _sqli_signals(db: dict) -> list[tuple[float, str | None]]:
     """recon 신호 → SQLi 신호 가중치 리스트 [(weight, note)]. 누적될수록 점수가 올라간다.
 
     상위는 SQL 에러 시그니처(detected_db)만 — 실제 SQL 에러 패턴을 매칭한 것이라 SQL-특정적. 따옴표가
     500/상태변화를 유발하는 건 그 자체론 SQL 특정이 아니지만(앱 예외일 수도), 필터로 SQL 토큰이 막히는
-    것과 겹치면 누적으로 올라간다 — 단독으론 확정 안 되고 코로보레이션으로만 강해진다."""
+    것과 겹치면 누적으로 올라간다 — 단독으론 확정 안 되고 코로보레이션으로만 강해진다. 필터 차단 신호는
+    filter_map(토큰별 거부)이 따로 내므로 여기선 중복 집계하지 않는다."""
     sigs: list[tuple[float, str | None]] = []
     if db.get('detected_db'):
         sigs.append((_W_SQL_ERROR_SIG, f"SQL 에러 시그니처로 DB({db['detected_db']}) 확인"))
@@ -266,8 +260,6 @@ def _sqli_signals(db: dict, block_ratio: float) -> list[tuple[float, str | None]
         q = db.get('quote_char')
         why = f"따옴표({q}) 반응" if q else "probe 반응"
         sigs.append((_W_SQL_QUOTE_BREAK, f"{why} → 500/상태변화 (에러 시그니처 없음)"))
-    if db.get('waf_blocked') and block_ratio < _SELECTIVE_BLOCK_THRESHOLD:
-        sigs.append((_W_SELECTIVE_FILTER, f"선택적 필터 차단 (전역 {block_ratio:.0%})"))
     return sigs
 
 
@@ -312,8 +304,7 @@ def _filter_map_signals(filter_map: dict[str, str] | None) -> dict[str, list[tup
     return out
 
 
-def _assemble_hints(field_hints: dict, group: dict, t_boost: dict,
-                    db: dict, block_ratio: float):
+def _assemble_hints(field_hints: dict, group: dict, t_boost: dict, db: dict):
     """prior(이름/형제/스택)와 recon 증거 신호를 누적(noisy-OR)해 최종 hints를 만든다.
 
     반환: (hints, group_note, recon_note, filter_map_note) — breakdown 표시용 노트 포함."""
@@ -325,7 +316,7 @@ def _assemble_hints(field_hints: dict, group: dict, t_boost: dict,
 
     # EVIDENCE — 유형별 신호를 모아 noisy-OR로 누적 (같은 종류가 많을수록 높아짐)
     sigs: dict[str, list[tuple[float, str | None]]] = {}
-    for w, n in _sqli_signals(db, block_ratio):
+    for w, n in _sqli_signals(db):
         sigs.setdefault('sqli', []).append((w, n))
     for w, n in _xss_signals(db):
         sigs.setdefault('xss', []).append((w, n))
@@ -440,7 +431,7 @@ class Profiler:
             waf_blocked = db.get('waf_blocked', False)
             hints, group_note, recon_note, filter_map_note = _assemble_hints(
                 field_hints, group_hints.get((page['url'].split('?')[0], 'GET'), {}),
-                t_boost, db, recon.get('__block_ratio__', 0.0))
+                t_boost, db)
             rt = _infer_response_type('url_param', None, resp_headers)
             surfaces.append(AttackSurface(
                 surface_type='url_param',
@@ -457,7 +448,6 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
-                    'behavior':    db.get('behavior'),
                     **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
@@ -493,7 +483,7 @@ class Profiler:
                 db = (recon.get(param) or {}).get('db') or {}
                 waf_blocked = db.get('waf_blocked', False)
                 hints, group_note, recon_note, filter_map_note = _assemble_hints(
-                    field_hints, group, t_boost, db, recon.get('__block_ratio__', 0.0))
+                    field_hints, group, t_boost, db)
                 rt = _infer_response_type('form_field', enctype, resp_headers)
                 surfaces.append(AttackSurface(
                     surface_type='form_field',
@@ -510,7 +500,6 @@ class Profiler:
                         'quote_char':     db.get('quote_char'),
                         'detected_db':    db.get('detected_db'),
                         'filter_map':     db.get('filter_map'),
-                        'behavior':       db.get('behavior'),
                         'enctype':        enctype,
                         'all_params':     all_params,
                         'proxy_template': form.get('proxy_template'),
@@ -536,7 +525,7 @@ class Profiler:
             waf_blocked = db.get('waf_blocked', False)
             hints, group_note, recon_note, filter_map_note = _assemble_hints(
                 field_hints, group_hints.get((page['url'].split('?')[0], 'GET'), {}),
-                t_boost, db, recon.get('__block_ratio__', 0.0))
+                t_boost, db)
             rt = _infer_response_type('hidden_param', None, resp_headers)
             surfaces.append(AttackSurface(
                 surface_type='hidden_param',
@@ -553,7 +542,6 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
-                    'behavior':    db.get('behavior'),
                     **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
@@ -578,8 +566,7 @@ class Profiler:
             db = (recon.get(param) or {}).get('db') or {}
             waf_blocked = db.get('waf_blocked', False)
             hints, group_note, recon_note, filter_map_note = _assemble_hints(
-                field_hints, group_hints.get(group_key, {}), t_boost, db,
-                recon.get('__block_ratio__', 0.0))
+                field_hints, group_hints.get(group_key, {}), t_boost, db)
             enctype = entry.get('enctype') or 'application/x-www-form-urlencoded'
             rt = _infer_response_type('hidden_param', enctype, resp_headers)
             # scanner.py가 이 파라미터를 발견할 때 공격적 프로브 값이 필터에 막혀서 특정
@@ -605,7 +592,6 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
-                    'behavior':    db.get('behavior'),
                     'enctype':     enctype,
                     'all_params':  entry.get('known_fields') or {},
                     'discovery_evasion': discovery_evasion,
@@ -640,7 +626,7 @@ class Profiler:
                     continue
                 enctype = call.get('content_type', 'application/json')
                 field_hints, field_matches = _field_hints(field_name)
-                hints, _, _, _ = _assemble_hints(field_hints, {}, t_boost, {}, 0.0)
+                hints, _, _, _ = _assemble_hints(field_hints, {}, t_boost, {})
                 rt = _infer_response_type('api_field', enctype, button_result.get('response_headers'))
                 surfaces.append(AttackSurface(
                     surface_type='api_field',

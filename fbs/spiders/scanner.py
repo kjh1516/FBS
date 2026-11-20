@@ -4,7 +4,7 @@ import uuid
 import json as _json
 import scrapy
 from scrapy.spiders import CrawlSpider
-from urllib.parse import urlparse, urljoin, parse_qs
+from urllib.parse import urlparse, urljoin, parse_qs, urlunparse
 from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload, detect_client_redirect, extract_gate_hints, pick_user_agent
 from fbs.items import PageItem, ButtonResultItem
 from fbs.inference.validation import classify_waf_block, EVASION_TRANSFORMS
@@ -250,6 +250,17 @@ class ScannerSpider(CrawlSpider):
         return item
 
     @staticmethod
+    def _decode_headers(response) -> dict:
+        """응답 헤더를 {이름: [값, ...]} 형태로 디코딩한다. parse_item과 버튼 경로가
+        같은 형식으로 tech_stack 탐지·리포트에 넘기도록 공용으로 쓴다."""
+        out = {}
+        for key, values in response.headers.items():
+            name = header_decode(key)
+            out[name] = [header_decode(v) for v in
+                         (values if isinstance(values, list) else [values])]
+        return out
+
+    @staticmethod
     def _collect_cookies(response):
         """Set-Cookie 응답 헤더 + 현재 요청이 실제로 보낸 Cookie 헤더를 합쳐 쿠키 목록을
         만든다. 세션이 POST 한 번으로만 발급되는 앱(예: 로그인 진입점이 세션 없으면
@@ -302,22 +313,26 @@ class ScannerSpider(CrawlSpider):
                 })
         return cookies
 
+    @staticmethod
+    def _canonical_url(url: str) -> str:
+        """빈 경로를 '/'로 정규화하고 프래그먼트를 뗀다 — scheme://host:port 와
+        scheme://host:port/ 처럼 같은 리소스가 중복 페이지로 저장되는 걸 막는다."""
+        p = urlparse(url)
+        return urlunparse((p.scheme, p.netloc, p.path or '/', p.params, p.query, ''))
+
     def parse_item(self, response):
-        if response.url in self._processed_urls:
+        url = self._canonical_url(response.url)
+        if url in self._processed_urls:
             return
-        self._processed_urls.add(response.url)
+        self._processed_urls.add(url)
 
         print(f"\n{'─'*60}")
-        print(f"  {response.status} {response.request.method} {response.url}")
+        print(f"  {response.status} {response.request.method} {url}")
         print(f"{'─'*60}")
-        item = self._new_page_item(response.url, response, response.meta.get('depth', 0))
+        item = self._new_page_item(url, response, response.meta.get('depth', 0))
 
         # 응답 헤더 수집
-        response_headers = {}
-        for key, values in response.headers.items():
-            name = header_decode(key)
-            response_headers[name] = [header_decode(v) for v in
-                                      (values if isinstance(values, list) else [values])]
+        response_headers = self._decode_headers(response)
         item['response_headers'] = response_headers
 
         # 보안 헤더 점검
@@ -424,8 +439,9 @@ class ScannerSpider(CrawlSpider):
             yield scrapy.Request(link['url'], callback=self.parse_item,
                                  errback=self.ignore_error)
 
-        self._print_tech_stack(tech_stack)
-        self._print_forms(forms)
+        # 페이지 프로필 요약(기술 스택·세션·폼)은 크롤을 다 돌린 뒤 파이프라인에서 일괄 출력한다
+        # — 어느 경로(정적 크롤/버튼 클릭/SPA)로 찾았든 한곳에서 동일하게 보이게. 링크는 크롤 중
+        # 발견 로그로 그때그때 남긴다.
         self._print_links(links)
 
         if tech_stack.get('spa'):
@@ -459,18 +475,6 @@ class ScannerSpider(CrawlSpider):
 
         if self.login_id and self.login_pw and not self._login_done:
             yield from self._do_login(response)
-
-    @staticmethod
-    def _print_forms(forms: list):
-        if not forms:
-            return
-        print(f"\n# [폼 발견] {len(forms)}개")
-        for i, form in enumerate(forms, 1):
-            print(f"    [{i}] {form['method']} {form['action']} ({form['enctype']})")
-            for inp in form['inputs']:
-                name = inp.get('name') or '(이름없음)'
-                typ  = inp.get('type', 'text')
-                print(f"        - {name} [{typ}]")
 
     @staticmethod
     def _print_links(links: list):
@@ -599,12 +603,19 @@ class ScannerSpider(CrawlSpider):
             # 쿠키를 챙긴다 — 안 그러면 추론 단계가 재사용할 쿠키가 없어 세션 필요한 페이지에 대한
             # 이후 페이로드가 전부 조용히 리다이렉트당한다.
             item['cookies'] = self._collect_cookies(response)
+            # 버튼으로만 도달한 페이지도 정적 크롤과 동일하게 기술 스택을 탐지해 둔다 — 세션 쿠키나
+            # 프레임워크가 이 페이지에서 처음 노출되는 경우가 많다(요약 출력은 크롤 종료 시 일괄).
+            response_headers = self._decode_headers(response)
+            item['response_headers'] = response_headers
+            item['tech_stack'] = detect_tech_stack(
+                response_headers, item['cookies'], response.text, page_url,
+                response.css('script::attr(src)').getall(),
+            )
             forms = self._extract_forms_from_rendered(response.text, page_url)
             item['forms'] = forms
             yield item
 
             if forms:
-                self._print_forms(forms)
                 form_params  = {inp['name'] for f in forms for inp in f['inputs'] if inp.get('name')}
                 known_params = set(item['params'].keys()) | form_params
                 yield from self._fuzz_get_params(response, known_params, item)
@@ -1424,23 +1435,3 @@ class ScannerSpider(CrawlSpider):
             })
         item['_fuzz_update'] = True
         yield item
-
-    # ── 출력 ──────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _print_tech_stack(tech_stack: dict):
-        print(f"\n# [기술 스택]")
-        fields = [
-            ('server',    '웹서버    '),
-            ('language',  '언어      '),
-            ('framework', '프레임워크'),
-            ('cms',       'CMS       '),
-            ('spa',       'SPA       '),
-            ('session',   '세션쿠키  '),
-        ]
-        for key, label in fields:
-            val = tech_stack.get(key)
-            marker = '[+]' if val else '[-]'
-            print(f"    {marker} {label}: {val or '없음'}")
-        for jwt_info in tech_stack.get('jwt_cookies', []):
-            print(f"    [+] JWT 쿠키      : {jwt_info['name']} → {jwt_info['payload']}")

@@ -16,7 +16,7 @@ from fbs.inference.strategies.base import BaseStrategy
 설계 철학: 반사됐다 ≠ 취약하다. 실행을 증명한다. 정적 추정 대신 측정으로, 최종 판정은 실제 브라우저
 실행(alert 발화)으로 한다.
 
-반사 여부·반사 컨텍스트·꺾쇠 생존은 recon(DBDetect.probe_reflection)이 이미 측정해
+반사 여부·반사 컨텍스트·꺾쇠 생존은 recon의 반사 측정이 이미 측정해
 surface.extra['reflection']에 실어 둔다 — 반사 검사는 스캐너 전체에서 recon 한 곳으로 통일됐고(SQLi 등
 다른 전략도 blind 판정에 공용으로 쓴다), XSS는 그 신호를 받아 쓴다.
 

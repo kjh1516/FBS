@@ -2,14 +2,16 @@ import sqlite3
 import json
 import argparse
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
 from fbs.inference.profiler import Profiler
-from fbs.inference.recon import Recon, DBDetect
+from fbs.inference.recon import Recon
 from fbs.inference.validation import WafDetector
 from fbs.inference.strategies.base import BaseStrategy
+from fbs.pipelines import PAGE_JSON_COLUMNS, BUTTON_JSON_COLUMNS
 from fbs.utils import pick_user_agent, protect_session_cookies
 
 """추론을 총괄하는 파일.
@@ -23,16 +25,6 @@ from fbs.utils import pick_user_agent, protect_session_cookies
 
 
 # ── 엔진 ──────────────────────────────────────────────────────────────────────
-
-def _is_credential_form(surface) -> bool:
-    """이 표면이 credential(로그인/회원가입/비번) 폼의 일부인지 — password류 필드가 같이 제출되는가.
-    이런 폼은 틀린 로그인이 전부 같은 응답(흔히 302 리다이렉트)이라 단순 프로브엔 입력-무관처럼 보이지만,
-    로그인 우회 SQLi의 최우선 타깃이다. 그래서 stub으로 스킵하지 않는다 — 진짜 테스트(우회 페이로드)는
-    strategy가 한다."""
-    names = {surface.param.lower()} if surface.param else set()
-    names |= {str(k).lower() for k in (surface.extra.get('all_params') or {})}
-    # password류 식별: pass/pwd 포함, 또는 pw로 끝남(pw/upw/userpw/newpw 같은 복합 표기 커버)
-    return any('pass' in n or 'pwd' in n or n.endswith('pw') for n in names)
 
 
 class InferenceEngine:
@@ -73,9 +65,7 @@ class InferenceEngine:
         pages = []
         for row in rows:
             p = dict(row)
-            for key in ('params', 'response_headers', 'cookies',
-                        'tech_stack', 'forms', 'hidden_params', 'hidden_post_params',
-                        'security_headers', 'page_signals'):
+            for key in PAGE_JSON_COLUMNS:
                 raw = p.get(key)
                 if raw:
                     try:
@@ -96,9 +86,7 @@ class InferenceEngine:
         results = []
         for row in rows:
             r = dict(row)
-            for key in ('api_calls', 'set_cookies', 'response_headers',
-                        'cookie_changes', 'localstorage_changes',
-                        'sessionstorage_changes', 'dom_changes'):
+            for key in BUTTON_JSON_COLUMNS:
                 raw = r.get(key)
                 if raw:
                     try:
@@ -123,68 +111,19 @@ class InferenceEngine:
         """
         seeded_names: set[str] = set()
         for page in pages:
+            # 쿠키를 그 쿠키가 수집된 페이지의 호스트로 시드한다. domain 없이 넣으면(domain='')
+            # 서버의 host-only 세션 쿠키(domain=호스트)와 다른 jar 슬롯에 들어가 '같은 이름 쿠키 2개'가
+            # 공존하고, 요청마다 둘 다 전송돼 서버가 stale한 쪽을 읽는다 → tries 같은 세션 상태가 영영
+            # 안 쌓인다. 같은 (domain, path) 슬롯에 넣어야 서버 Set-Cookie가 제자리 교체해 세션이 유지된다.
+            host = urlparse(page.get('url', '')).hostname
             for c in (page.get('cookies') or []):
                 name, value = c.get('name'), c.get('value')
-                if name:
-                    self.session.cookies.set(name, value or '')
+                if name and host:
+                    self.session.cookies.set(name, value or '', domain=host, path='/')
                     seeded_names.add(name)
         if seeded_names:
             print(f"    [세션] 크롤링 때 수집한 쿠키 {len(seeded_names)}개를 추론 세션에 반영")
         return seeded_names
-
-    # ── 공유 baseline ─────────────────────────────────────────────────────────
-
-    def _fetch_baselines(self, pages: list[dict]) -> None:
-        """페이지마다 파라미터 없이 그냥 GET 한 번 — WafDetector/Recon이 각자 따로
-        기본 baseline을 구하던 걸 여기서 한 번만 구해서 page['_baseline']에 저장한다.
-        SQLiStrategy는 필드별로 더미값을 채운 별도 baseline이 필요해서 이 공유 baseline과
-        다르므로(테스트하는 대상 자체가 다름) 여기 포함하지 않는다."""
-        for page in pages:
-            url = page.get('url')
-            if not url:
-                continue
-            try:
-                # raw — diff baseline은 recon 프로브와 같은 정책이어야 "전부 변함" 오탐이 안 난다.
-                resp = self.session.get(url, timeout=10, allow_redirects=False)
-                page['_baseline'] = {
-                    'status':  resp.status_code,
-                    'body':    resp.text,
-                    # resp.headers는 requests.structures.CaseInsensitiveDict라
-                    # 'ETag'/'etag' 상관없이 조회된다 — dict()로 감싸면 이 성질이
-                    # 사라지므로 그대로 들고 있는다 (DB에 다시 저장하지 않아서 안전).
-                    'headers': resp.headers,
-                    'elapsed': resp.elapsed.total_seconds(),
-                }
-            except Exception:
-                page['_baseline'] = None
-
-    # ── 동적 blind 탐지 ───────────────────────────────────────────────────────
-
-    def _verify_blind(self, surfaces: list[AttackSurface]):
-        """recon이 커버하지 못한 표면만 조건부로 반사 프로브한다.
-
-        반사 검사는 recon(DBDetect.probe_reflection) 한 곳으로 통일됐다 — 페이지 표면은
-        recon이 이미 쟀고 profiler가 그 측정값으로 blind를 설정하므로 여기선 건드리지 않는다.
-        reflection 신호가 없는 표면(버튼 클릭이 캡처한 API 필드 등 recon 미커버)만 같은
-        헬퍼로 fallback 프로브해 blind/reflects_html을 채운다. blind = 반사 안 됨."""
-        pending = [s for s in surfaces
-                   if not s.extra.get('waf_blocked') and s.extra.get('reflection') is None]
-        if not pending:
-            return  # 모든 표면의 반사를 recon이 이미 측정 — 추가 프로브 불필요
-        print(f"\n# [동적 검증] recon 미커버 표면 {len(pending)}개 반사 프로브")
-        detector = DBDetect(session=self.session)
-        for s in pending:
-            data = {p: 'test' for p in (s.extra.get('all_params') or [])}
-            refl = detector.probe_reflection(s.url, s.method, data, s.param)
-            if refl is None:
-                print(f"  SKIP   {s.param} | 요청 실패 또는 WAF 차단")
-                continue
-            s.extra['reflection'] = refl
-            survived = refl.get('survived') or ()
-            s.extra['reflects_html'] = bool(
-                refl.get('reflected') and '<' in survived and '>' in survived)
-            s.blind = not refl.get('reflected')
-            print(f"  PROBE  {s.param} | blind={s.blind} ({'blind' if s.blind else 'reflected'})")
 
     # ── 메인 루프 ─────────────────────────────────────────────────────────────
 
@@ -201,15 +140,12 @@ class InferenceEngine:
         # /logout 302로 세션을 비우는 오염은 막되, 서버의 정상 세션 리프레시(새 값)는 받는다.
         protect_session_cookies(self.session, seeded_names)
 
-        # 0단계: 페이지당 baseline(파라미터 없이 그냥 GET)을 한 번만 가져와 WafDetector·Recon이 공유한다 —
-        # 둘 다 같은 URL을 baseline GET으로 찔러보므로 중복 요청을 없앤다.
-        self._fetch_baselines(pages)
-
-        # 1단계: WAF 탐지 — recon보다 먼저, 결과를 page에 실어둔다
-        WafDetector(session=self.session).run(pages)
-
-        # 1.5단계: 리콘 — baseline 프로브
+        # 1단계: 리콘 — 측정이 baseline(page['_baseline'])을 소유해 뒤 단계가 재사용한다. recon은
+        # 중립 토큰이라 WAF를 건드리지 않고 waf_info도 안 쓰므로 WAF보다 먼저 돌아도 된다.
         Recon(session=self.session).run(pages)
+
+        # 2단계: WAF 탐지 — recon이 저장한 baseline을 재사용(중복 GET 없음). 결과(waf_info)는 profiler가 씀.
+        WafDetector(session=self.session).run(pages)
 
         # 2단계: 프로파일링 — 공격 표면 추출
         page_surfaces: list[AttackSurface] = []
@@ -220,7 +156,7 @@ class InferenceEngine:
         for i, s in enumerate(page_surfaces, 1):
             hints = s.extra.get('hints', {})
             hints_str = ', '.join(f"{k}({v})" for k, v in hints.items()) if hints else '없음'
-            print(f"  [{i}] {s.surface_type} | {s.method} {s.url} | param={s.param} | resp={s.response_type} | hints={hints_str}")
+            print(f"\n  [{i}] {s.surface_type} | {s.method} {s.url} | param={s.param} | resp={s.response_type} | hints={hints_str}")
             bd = s.extra.get('breakdown') or {}
             if bd.get('field_matches'):
                 fm = ', '.join(f"'{kw}'→{vuln}+{w}" for kw, vuln, w in bd['field_matches'])
@@ -263,8 +199,9 @@ class InferenceEngine:
         if self.login_id:
             print(f"# [크리덴셜] login_id={self.login_id!r} 주입 완료")
 
-        # 3단계: 동적 검증 — 캐너리 프로브로 blind 확정
-        self._verify_blind(surfaces)
+        # 참고: 버튼 클릭이 캡처한 XHR/API 필드(profile_button)는 아직 recon 측정을 안 거쳐 반사가
+        # 점수에 안 들어간다. 순수 SPA fetch 필드라 니치라 지금은 보류 — 필요해지면 recon이 그
+        # 엔드포인트도 profiler 전에 측정하도록 추가한다.
 
         if not surfaces:
             print("# [추론 엔진] 공격 표면 없음 — 종료")
@@ -290,39 +227,7 @@ class InferenceEngine:
         for i, surface in enumerate(surfaces, 1):
             print(f"  [{i}/{len(surfaces)}] {surface.surface_type} | {surface.method} {surface.url} | param={surface.param}")
 
-            # 입력-무관 응답(stub/인증벽) — recon 반응 프로파일이 입력을 바꿔도 응답이 안 변한다로
-            # 측정한 표면. 주입(SQLi/XSS)은 입력이 처리돼야 성립하므로 공격해도 무의미하다 → 스킵.
-            # 게이트는 측정된 input_sensitive로만 한다 — 크롤러의 redirect 신호는 정적 HTML이라
-            # on-load/on-click 구분을 못 해 단독 게이트하면 과잉 스킵이다. redirect·gate_hints는 왜
-            # stub인지 사유로만 덧붙인다(인증벽이면 보통 둘이 함께 뜬다).
-            beh = surface.extra.get('behavior')
-            if beh and beh.get('input_sensitive') is False:
-                # input_sensitive는 영숫자 프로브만 보므로 따옴표→500 같은 반응은 못 본다. 로그인 폼은
-                # 틀린 자격증명을 전부 같은 페이지로 돌려줘 겉보기엔 입력-무관이지만, recon이 반응
-                # (quote→에러/DB시그니처/반사/필터)을 하나라도 잡았으면 실제로는 입력을 처리(쿼리까지
-                # 도달)하는 것이니 stub로 보고 스킵하면 안 된다(SQLi 오탐 스킵).
-                refl = surface.extra.get('reflection') or {}
-                reacted = bool(
-                    surface.extra.get('quote_char')
-                    or surface.extra.get('detected_db')
-                    or refl.get('reflected') or refl.get('dom_suspect')
-                    or any(o != 'passed' for o in (surface.extra.get('filter_map') or {}).values())
-                )
-                # credential 폼(로그인/회원가입 등)은 틀린 로그인이 전부 같은 응답이라 입력-무관처럼
-                # 보이는 게 정상이고, 로그인 우회 SQLi의 최우선 타깃이라 stub으로 스킵하면 안 된다.
-                if not reacted and _is_credential_form(surface):
-                    print(f"    · stub 스킵 보류 — credential 폼(로그인 우회 SQLi 타깃)이라 입력-무관이어도 테스트")
-                elif not reacted:
-                    psig = (surface.page or {}).get('page_signals') or {}
-                    ctx = []
-                    redir = psig.get('redirect')
-                    if redir:
-                        ctx.append(f"로드 시 이탈→{redir.get('target')}")
-                    if psig.get('gate_hints'):
-                        ctx.append(f"요구 추정:{','.join(psig['gate_hints'])}")
-                    ctx_str = f" [{' | '.join(ctx)}]" if ctx else ''
-                    print(f"    · 스킵 — 입력-무관 응답(stub/인증벽 추정, noise={beh.get('noise')}){ctx_str}: 주입 대상 아님")
-                    continue
+            # stub/인증벽 스킵은 제거됨 — 새 측정(_classify_surface)의 Phase 2a 분기로 다시 구현 예정.
 
             # 이 표면을 처리할 수 있는 전략들 중 우선순위(profiler hint 점수)가 가장 높은 하나만
             # 실행한다 — 한 필드에 SQLi·XSS 등 여러 전략을 전부 돌리지 않는다. 프로파일링이 가장

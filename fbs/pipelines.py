@@ -5,26 +5,48 @@ from urllib.parse import urlparse
 from fbs.items import PageItem, ButtonResultItem
 
 
+# ── DB 스키마 (단일 출처) ──────────────────────────────────────────────────────
+# 두 테이블의 컬럼을 여기 한곳에 정의한다. CREATE TABLE / 마이그레이션 / INSERT / 리포트 dict /
+# engine의 JSON 디코드가 전부 이 목록을 순회해서 생성·복원되므로, 컬럼을 추가/변경할 땐 여기만 고치면
+# 된다. 공통 컬럼 id(PK)·scan_id·scanned_at은 목록에서 빼고 CREATE 템플릿에만 둔다.
+#   PAGE_COLUMNS   : (컬럼명, SQL 타입, JSON 직렬화 여부, 리포트용 기본값)
+#   BUTTON_COLUMNS : (컬럼명, SQL 타입, JSON 직렬화 여부)
+PAGE_COLUMNS = [
+    ('status_code',        'INTEGER', False, None),
+    ('content_type',       'TEXT',    False, None),
+    ('depth',              'INTEGER', False, 0),
+    ('method',             'TEXT',    False, None),
+    ('params',             'TEXT',    True,  {}),
+    ('response_headers',   'TEXT',    True,  []),
+    ('cookies',            'TEXT',    True,  []),
+    ('tech_stack',         'TEXT',    True,  {}),
+    ('forms',              'TEXT',    True,  []),
+    ('hidden_params',      'TEXT',    True,  []),
+    ('hidden_post_params', 'TEXT',    True,  []),
+    ('security_headers',   'TEXT',    True,  {}),
+    ('page_signals',       'TEXT',    True,  {}),
+]
+
+BUTTON_COLUMNS = [
+    ('page_url',               'TEXT', False),
+    ('button',                 'TEXT', False),
+    ('api_calls',              'TEXT', True),
+    ('set_cookies',            'TEXT', True),
+    ('response_headers',       'TEXT', True),
+    ('cookie_changes',         'TEXT', True),
+    ('localstorage_changes',   'TEXT', True),
+    ('sessionstorage_changes', 'TEXT', True),
+    ('dom_changes',            'TEXT', True),
+]
+
+# JSON으로 저장/복원되는 컬럼명만 — engine이 읽을 때 json.loads 대상 (목록에서 자동 파생)
+PAGE_JSON_COLUMNS   = [n for n, _, is_json, _ in PAGE_COLUMNS   if is_json]
+BUTTON_JSON_COLUMNS = [n for n, _, is_json    in BUTTON_COLUMNS if is_json]
+
+
 class SQLitePipeline:
-    # PageItem 필드 하나를 CREATE TABLE / 마이그레이션 / INSERT / 리포트용 인메모리 dict
-    # 네 곳에 따로 반영해야 했던 걸 이 목록 하나로 통합한다. 새 필드를 추가할 땐 여기만
-    # 고치면 나머지는 전부 이 목록을 순회해서 생성된다.
-    # (컬럼명, SQL 타입, JSON 직렬화 여부, 리포트용 기본값)
-    PAGE_COLUMNS = [
-        ('status_code',        'INTEGER', False, None),
-        ('content_type',       'TEXT',    False, None),
-        ('depth',              'INTEGER', False, 0),
-        ('method',             'TEXT',    False, None),
-        ('params',             'TEXT',    True,  {}),
-        ('response_headers',   'TEXT',    True,  []),
-        ('cookies',            'TEXT',    True,  []),
-        ('tech_stack',         'TEXT',    True,  {}),
-        ('forms',              'TEXT',    True,  []),
-        ('hidden_params',      'TEXT',    True,  []),
-        ('hidden_post_params', 'TEXT',    True,  []),
-        ('security_headers',   'TEXT',    True,  {}),
-        ('page_signals',       'TEXT',    True,  {}),
-    ]
+    PAGE_COLUMNS   = PAGE_COLUMNS      # self.PAGE_COLUMNS로 쓰던 기존 참조 유지
+    BUTTON_COLUMNS = BUTTON_COLUMNS
 
     def __init__(self, db_path, target_url='', login_id=None, login_pw=None, user_agent=None):
         self.db_path     = db_path
@@ -66,31 +88,26 @@ class SQLitePipeline:
         ).run()
 
     def _create_tables(self):
-        cols_sql = ',\n                '.join(
+        page_cols_sql = ',\n                '.join(
             f'{name} {sql_type}' for name, sql_type, _, _ in self.PAGE_COLUMNS
+        )
+        btn_cols_sql = ',\n                '.join(
+            f'{name} {sql_type}' for name, sql_type, _ in self.BUTTON_COLUMNS
         )
         self.conn.executescript(f'''
             CREATE TABLE IF NOT EXISTS pages (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 scan_id          TEXT NOT NULL,
                 url              TEXT NOT NULL,
-                {cols_sql},
+                {page_cols_sql},
                 scanned_at       TEXT,
                 UNIQUE(scan_id, url)
             );
             CREATE TABLE IF NOT EXISTS button_results (
-                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-                scan_id                TEXT NOT NULL,
-                page_url               TEXT NOT NULL,
-                button                 TEXT,
-                api_calls              TEXT,
-                set_cookies            TEXT,
-                response_headers       TEXT,
-                cookie_changes         TEXT,
-                localstorage_changes   TEXT,
-                sessionstorage_changes TEXT,
-                dom_changes            TEXT,
-                scanned_at             TEXT
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id          TEXT NOT NULL,
+                {btn_cols_sql},
+                scanned_at       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_pages_scan_id   ON pages(scan_id);
             CREATE INDEX IF NOT EXISTS idx_buttons_scan_id ON button_results(scan_id);
@@ -156,37 +173,18 @@ class SQLitePipeline:
             self._pages[url] = page
 
     def _process_button(self, item, now):
-        self.conn.execute(
-            '''INSERT INTO button_results (
-                scan_id, page_url, button, api_calls, set_cookies, response_headers,
-                cookie_changes, localstorage_changes, sessionstorage_changes,
-                dom_changes, scanned_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (
-                self._scan_id,
-                item.get('page_url'),
-                item.get('button'),
-                json.dumps(item.get('api_calls'),              ensure_ascii=False),
-                json.dumps(item.get('set_cookies'),            ensure_ascii=False),
-                json.dumps(item.get('response_headers'),       ensure_ascii=False),
-                json.dumps(item.get('cookie_changes'),         ensure_ascii=False),
-                json.dumps(item.get('localstorage_changes'),   ensure_ascii=False),
-                json.dumps(item.get('sessionstorage_changes'), ensure_ascii=False),
-                json.dumps(item.get('dom_changes'),            ensure_ascii=False),
-                now,
-            ),
+        col_names    = ', '.join(name for name, *_ in self.BUTTON_COLUMNS)
+        placeholders = ', '.join('?' * len(self.BUTTON_COLUMNS))
+        values = tuple(
+            json.dumps(item.get(name), ensure_ascii=False) if is_json else item.get(name)
+            for name, _, is_json in self.BUTTON_COLUMNS
         )
-        self._button_results.append({
-            'page_url':               item.get('page_url'),
-            'button':                 item.get('button'),
-            'api_calls':              item.get('api_calls', []),
-            'set_cookies':            item.get('set_cookies', []),
-            'response_headers':       item.get('response_headers', []),
-            'cookie_changes':         item.get('cookie_changes', {}),
-            'localstorage_changes':   item.get('localstorage_changes', {}),
-            'sessionstorage_changes': item.get('sessionstorage_changes', {}),
-            'dom_changes':            item.get('dom_changes', []),
-        })
+        self.conn.execute(
+            f'''INSERT INTO button_results (scan_id, {col_names}, scanned_at)
+                VALUES (?, {placeholders}, ?)''',
+            (self._scan_id, *values, now),
+        )
+        self._button_results.append({name: item.get(name) for name, *_ in self.BUTTON_COLUMNS})
 
     # ── 리포트 생성 ───────────────────────────────────────────────────────────
 
@@ -227,6 +225,8 @@ class SQLitePipeline:
         with open(report_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
 
+        self._print_page_summaries(pages_sorted)
+
         print(f"\n{'='*52}")
         print(f"  스캔 완료  : {origin}")
         print(f"  페이지     : {len(self._pages)}")
@@ -235,3 +235,66 @@ class SQLitePipeline:
         print(f"  리포트     : {report_path}")
         print(f"  DB         : {self.db_path}")
         print(f"{'='*52}\n")
+
+    # ── 페이지 프로필 요약 (크롤 종료 시 일괄) ──────────────────────────────────
+    # 어느 경로(정적 크롤/버튼 클릭/SPA)로 찾았든, 모든 페이지가 self._pages에 모인 뒤 여기서
+    # 한 번에 요약한다 — 크롤 중 분기마다 따로 찍지 않아 경로에 따라 요약이 빠지는 일이 없다.
+
+    _TECH_FIELDS = [
+        ('server',    '웹서버    '),
+        ('language',  '언어      '),
+        ('framework', '프레임워크'),
+        ('cms',       'CMS       '),
+        ('spa',       'SPA       '),
+        ('session',   '세션쿠키  '),
+    ]
+
+    def _print_page_summaries(self, pages_sorted: list) -> None:
+        if not pages_sorted:
+            return
+        print(f"\n# [페이지 요약] {len(pages_sorted)}개 (깊이순)")
+        for p in pages_sorted:
+            print(f"\n  ── {p.get('method') or 'GET'} {p['url']} "
+                  f"(status={p.get('status_code')}, depth={p.get('depth')})")
+            self._print_tech(p.get('tech_stack') or {})
+            self._print_cookies(p.get('cookies') or [])
+            self._print_forms(p.get('forms') or [])
+            hidden     = p.get('hidden_params') or []
+            hidden_post = [e.get('param') for e in (p.get('hidden_post_params') or [])]
+            if hidden or hidden_post:
+                print(f"    [숨은 파라미터] GET={hidden or '없음'} | POST={hidden_post or '없음'}")
+
+    def _print_tech(self, tech_stack: dict) -> None:
+        print(f"    [기술 스택]")
+        for key, label in self._TECH_FIELDS:
+            val = tech_stack.get(key)
+            marker = '+' if val else '-'
+            print(f"      [{marker}] {label}: {val or '없음'}")
+        payload = tech_stack.get('session_payload')
+        if payload:
+            print(f"      [+] 세션 해석    : {payload}")
+        for jwt_info in tech_stack.get('jwt_cookies', []):
+            print(f"      [+] JWT 쿠키      : {jwt_info['name']} → {jwt_info['payload']}")
+
+    @staticmethod
+    def _print_cookies(cookies: list) -> None:
+        if not cookies:
+            return
+        print(f"    [쿠키] {len(cookies)}개")
+        for c in cookies:
+            flags = c.get('flags') or {}
+            on = [k for k in ('httponly', 'secure') if flags.get(k)]
+            samesite = f" samesite={flags['samesite']}" if flags.get('samesite') else ''
+            tags = (f" ({', '.join(on)}{samesite})" if on or samesite else '')
+            print(f"      - {c.get('name')}{tags}")
+
+    @staticmethod
+    def _print_forms(forms: list) -> None:
+        if not forms:
+            return
+        print(f"    [폼] {len(forms)}개")
+        for i, form in enumerate(forms, 1):
+            print(f"      [{i}] {form.get('method')} {form.get('action')} ({form.get('enctype')})")
+            for inp in form.get('inputs', []):
+                name = inp.get('name') or '(이름없음)'
+                print(f"          - {name} [{inp.get('type', 'text')}]")
