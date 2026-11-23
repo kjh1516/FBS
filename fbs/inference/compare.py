@@ -28,6 +28,53 @@ def diff_score(text_a: str, text_b: str) -> int:
     )
 
 
+# ── 동적 영역 마스킹 ──────────────────────────────────────────────────────────
+# 같은 페이지를 두 번 받아(제출 없는 GET 2회 등) 비교하면 요청마다 저절로 바뀌는 구간(광고·타임스탬프·
+# nonce 등)이 드러난다. 그 구간의 앞뒤에 붙은 고정 텍스트를 앵커로 뽑아두고, 이후 어떤 응답이든 그
+# 앵커로 변동 구간을 찾아 지운다. 내용이 매번 달라지거나 앞쪽 길이가 바뀌어 위치가 밀려도 앵커 텍스트로
+# 찾으므로 영향받지 않는다. diff_score는 그렇게 변동 구간을 뺀 텍스트끼리 비교한다(diff_score는 순수).
+
+def volatile_anchors(a: str, b: str, ctx: int = 24) -> list[dict]:
+    """두 샘플에서 달라지는 구간마다 (앞 앵커, 뒤 앵커, 예시)를 뽑는다. 앵커는 그 구간에 바로 붙은
+    고정 텍스트(최대 ctx자)다. 둘 다 빈 앵커(페이지 전체가 변동)는 제외한다."""
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    anchors = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        # 변동 구간을 양옆 공백까지 넓혀 단어(토큰) 단위로 잡는다. difflib는 두 샘플의 최소 차이만 잡아
+        # 변동 값의 일부가 공통으로 남을 수 있는데, 그러면 앵커에 변동 문자가 섞여 값이 다른 응답에서 못 찾는다.
+        while i1 > 0 and not a[i1 - 1].isspace():
+            i1 -= 1
+        while i2 < len(a) and not a[i2].isspace():
+            i2 += 1
+        prefix = a[max(0, i1 - ctx):i1]
+        suffix = a[i2:i2 + ctx]
+        if not prefix and not suffix:
+            continue
+        sample = (a[i1:i2] or b[j1:j2])[:40]
+        anchors.append({'prefix': prefix, 'suffix': suffix, 'sample': sample})
+    return anchors
+
+
+def strip_volatile(text: str, anchors: list[dict]) -> str:
+    """앵커(앞/뒤 고정 텍스트)로 변동 구간을 찾아 그 사이 내용을 지운다(앵커는 남긴다). 내용이 매번
+    바뀌어도, 앞 내용이 밀려도 앵커로 찾으므로 동적 요소만 빠진다. 앵커가 응답에 없으면 그 앵커는 건너뛴다."""
+    if not text or not anchors:
+        return text
+    for anc in anchors:
+        prefix, suffix = anc.get('prefix', ''), anc.get('suffix', '')
+        start = 0 if not prefix else text.find(prefix)
+        if start == -1:
+            continue
+        cut_from = start + len(prefix)
+        end = len(text) if not suffix else text.find(suffix, cut_from)
+        if end == -1:
+            continue
+        text = text[:cut_from] + text[end:]
+    return text
+
+
 
 
 # ── 리다이렉트-인지 응답 관측 (추론 공용) ──────────────────────────────────────

@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 
 from fbs.inference.sql_dialects import detect_db_from_error
 from fbs.inference.validation import probe_filter_map
-from fbs.inference.compare import visible_text, diff_score
+from fbs.inference.compare import visible_text, diff_score, volatile_anchors, strip_volatile
 
 BASELINE = 'john35912'
 
@@ -168,13 +168,19 @@ class Recon:
         return (src, sink) if src and sink else None
 
     def _classify_surface(self, action: str, method: str, siblings: dict,
-                          target: str, reload_noise: int, base_text: str) -> tuple[str, str, dict]:
+                          target: str, reload_noise: int, base_text: str,
+                          anchors: list) -> tuple[str, str, dict]:
         """직전 관측 대비 변화가 reload_noise(바닥)를 넘는지만으로 종류를 가른다. 고정 임계는 없다.
+        모든 diff 비교는 anchors로 동적 구간(광고 등)을 제거한 텍스트로 한다(base_text도 이미 제거됨).
         측정(Phase 1→2a→3)으로 성격을 가른 뒤, 반응 있은 필드만 2b(적대적 프로브)를 돌린다.
         반환: (판정 문자열, 힌트 문자열, db dict). db는 소비처가 읽는 구조화 결과
         {label, db_hint, quote_char, sqli_signal, detected_db, filter_map, reflection}."""
         floor = reload_noise
         hints: list[str] = []
+
+        def clean(resp):
+            # 반사(토큰 박힘)는 원문으로 보고, diff 비교는 동적 구간 제거한 텍스트로 한다.
+            return strip_volatile(visible_text(resp.text), anchors) if resp is not None else ''
 
         def harvest(text):
             snip = self._added_text(base_text, text)
@@ -204,7 +210,7 @@ class Recon:
         empty, _ = self._send(action, method, {**siblings, target: ''})
         if empty is not None and 300 <= empty.status_code < 400:
             return done(f"이탈형: 빈 값 → {empty.status_code} {empty.headers.get('Location')}", 'redirect')
-        empty_text = visible_text(empty.text) if empty is not None else ''
+        empty_text = clean(empty)
         harvest(empty_text)
         d_empty = diff_score(base_text, empty_text)   # 빈 제출이 평소 페이지를 움직였나
 
@@ -215,8 +221,8 @@ class Recon:
             return done("측정 불가: 요청 실패", 'error')
         if 300 <= r1.status_code < 400:
             return done(f"이탈형: 프로브 → {r1.status_code} {r1.headers.get('Location')}", 'redirect')
-        body1  = r1.text
-        t1_text = visible_text(body1)
+        body1  = r1.text                # 반사 판정용 원문
+        t1_text = clean(r1)             # diff 비교용(동적 구간 제거)
         harvest(t1_text)
         d_token = diff_score(empty_text, t1_text)     # 토큰이 빈 값 대비 응답을 바꿨나
 
@@ -233,8 +239,8 @@ class Recon:
         if reflected:
             tok2 = self._probe_token()
             r2, _ = self._send(action, method, {**siblings, target: tok2})
-            body2 = r2.text if r2 is not None else ''
-            harvest(visible_text(body2))
+            body2 = r2.text if r2 is not None else ''   # 반사 판정용 원문
+            harvest(clean(r2))
             if tok1 in body2:
                 label, text = 'memo', "반사형 · 메모: 다른 입력을 보내도 이전 값이 남음(입력이 쌓임)"
             elif tok1 in t1_text:          # 눈에 보이는 본문에 박힘
@@ -245,7 +251,7 @@ class Recon:
             # 층2: 서버 반사는 없지만 URL 소스→위험 싱크(innerHTML 등) 공존 → DOM 반사 의심
             dom = self._dom_suspect(body1)   # (src, sink) | None
             r1b, _ = self._send(action, method, {**siblings, target: tok1})
-            d_repeat = diff_score(t1_text, visible_text(r1b.text) if r1b is not None else '')
+            d_repeat = diff_score(t1_text, clean(r1b))
             if d_repeat > floor:
                 label, text = 'stateful', f"상태형(stateful): 같은 입력에도 응답이 계속 변함 (반복 diff={d_repeat} > 바닥 {floor})"
             else:
@@ -391,13 +397,22 @@ class Recon:
         results['__methods__'] = self._probe_methods(base_url)   # OPTIONS — baseline 불필요
 
         # Phase 0 — 제출 없는 GET ×2. 첫 응답이 곧 baseline(= __default__ + page['_baseline'], 뒤의
-        # WafDetector가 재사용), 두 응답의 diff가 reload_noise(페이지 자체 동적 노이즈 바닥)다. 이하 모든
-        # 필드 측정이 이 바닥 하나를 공유한다(고정 임계 없음). baseline을 따로 또 받지 않는다.
+        # WafDetector가 재사용). 두 응답을 비교해 요청마다 바뀌는 구간(광고·타임스탬프 등)을 앵커로 뽑아
+        # page['_volatile']에 저장하고, 그 구간을 뺀 텍스트로 reload_noise(바닥)를 잰다. 이하 모든 필드
+        # 측정이 같은 앵커로 변동 구간을 제거한 뒤 비교한다. baseline은 따로 또 안 받는다.
         r1, elapsed = self._send(base_url, 'GET', {})
         r2, _       = self._send(base_url, 'GET', {})
         body1 = r1.text if r1 is not None else None
-        base_text = visible_text(body1) if body1 is not None else ''
-        reload_noise = diff_score(base_text, visible_text(r2.text) if r2 is not None else '')
+        raw1 = visible_text(body1) if body1 is not None else ''
+        raw2 = visible_text(r2.text) if r2 is not None else ''
+        anchors = volatile_anchors(raw1, raw2)
+        page['_volatile'] = anchors
+        base_text = strip_volatile(raw1, anchors)
+        reload_noise = diff_score(base_text, strip_volatile(raw2, anchors))
+        if anchors:
+            print(f"  [노이즈 제외] {len(anchors)}개 동적 구간 마스킹:")
+            for anc in anchors:
+                print(f"      · …{anc['prefix'][-15:]}❲{anc['sample']}❳{anc['suffix'][:15]}…")
         page['_baseline'] = {
             'status':  r1.status_code if r1 is not None else None,
             'body':    body1,
@@ -419,7 +434,7 @@ class Recon:
         field_class = page.setdefault('field_class', {})
         for action, method, siblings, target in self._classify_surfaces(page, base_url):
             verdict, hints, db = self._classify_surface(
-                action, method, siblings, target, reload_noise, base_text)
+                action, method, siblings, target, reload_noise, base_text, anchors)
             results[target] = {'db': db}
             field_class[(action, method, target)] = db['label']
             print(f"      · [{target}] {verdict or '(미확정)'}"
