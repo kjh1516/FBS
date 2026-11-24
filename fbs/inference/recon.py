@@ -1,15 +1,11 @@
 import time
-import random
-import string
 import difflib
 import requests
 from urllib.parse import urljoin
 
 from fbs.inference.sql_dialects import detect_db_from_error
 from fbs.inference.validation import probe_filter_map
-from fbs.inference.compare import visible_text, diff_score, volatile_anchors, strip_volatile
-
-BASELINE = 'john35912'
+from fbs.inference.compare import visible_text, diff_score, volatile_anchors, strip_volatile, probe_token
 
 # 언어/공통별 노출 파일 탐지 경로
 _EXPOSED_PATHS: dict[str, list[str]] = {
@@ -121,9 +117,9 @@ class Recon:
             method = form.get('method', 'GET').upper()
             # 형제 필드는 빈 값이 아니라 non-empty 기본값으로 채운다 — 멀티필드 폼(로그인 등)은
             # 다른 필드가 비어 있으면 "값을 입력하세요" 단계에서 멈춰 제출 자체가 발화하지 않아
-            # 상태 변화(로그인 카운터 등)를 못 본다. recon 본 루프와 동일하게 BASELINE으로 채운다.
+            # 상태 변화(로그인 카운터 등)를 못 본다. 크롤러·전략과 동일하게 캡처값 없으면 'test'로 채운다.
             inputs = {
-                inp['name']: (inp.get('value') or BASELINE)
+                inp['name']: (inp.get('value') or 'test')
                 for inp in form.get('inputs', []) if inp.get('name')
             }
             for inp in form.get('inputs', []):
@@ -141,21 +137,55 @@ class Recon:
     @staticmethod
     def _probe_token() -> str:
         """반사 여부를 보려고 보내는 프로브. 필터·SQL에 안 걸리는 영숫자라, 응답에 이 토큰이
-        그대로 박혀 있으면 입력이 반사된 것으로 본다."""
-        return 'fbs' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        그대로 박혀 있으면 입력이 반사된 것으로 본다. fbsrf 접두어로 recon 반사 프로브임을 표식."""
+        return probe_token('fbsrf')
 
     @staticmethod
     def _added_text(base: str, cur: str, max_len: int = 120) -> str:
         """cur에서 base 대비 새로 생긴 텍스트만 뽑는다 — 빈 값/토큰 응답에서 나오는 안내 문구
-        같은 힌트를 모으는 용도."""
+        같은 힌트를 모으는 용도. 글자 단위 diff는 base에 우연히 있는 같은 글자를 공통으로 매칭해
+        단어를 조각내므로(예: Good → Gd), 바뀐 구간을 양옆 공백까지 넓혀 단어를 통째로 뽑는다."""
         if not cur or cur == base:
             return ''
         matcher = difflib.SequenceMatcher(None, base, cur, autojunk=False)
-        added = ''.join(
-            cur[j1:j2] for tag, _, _, j1, j2 in matcher.get_opcodes()
-            if tag in ('insert', 'replace')
-        ).strip()
+        parts, last_end = [], 0
+        for tag, _, _, j1, j2 in matcher.get_opcodes():
+            if tag not in ('insert', 'replace'):
+                continue
+            # 구간 양끝의 공백을 먼저 벗겨 단어 경계에서 시작/끝나게 한다(안 그러면 앞뒤 기존 단어까지 딸려옴).
+            while j1 < j2 and cur[j1].isspace():
+                j1 += 1
+            while j2 > j1 and cur[j2 - 1].isspace():
+                j2 -= 1
+            if j1 >= j2:
+                continue
+            # 남은 구간을 양옆 비공백까지 넓혀 단어를 통째로 잡는다.
+            while j1 > 0 and not cur[j1 - 1].isspace():
+                j1 -= 1
+            while j2 < len(cur) and not cur[j2].isspace():
+                j2 += 1
+            j1 = max(j1, last_end)   # 이전에 넓혀 뽑은 단어와 겹치지 않게
+            if j1 >= j2:
+                continue
+            parts.append(cur[j1:j2])
+            last_end = j2
+        added = ' '.join(p.strip() for p in parts if p.strip()).strip()
         return added[:max_len] if added else ''
+
+    @staticmethod
+    def _fmt_filter(filter_map: dict | None) -> str | None:
+        """필터 지도를 사람이 읽기 좋게 압축한다 — 원시 dict 대신 outcome별로 토큰을 묶고, 공백
+        토큰은 ␣로 보인다. 예: {"'":'rejected', ' ':'rejected'} → "2/44 차단  rejected ← ' ␣"."""
+        if not filter_map:
+            return None
+        hit = {t: o for t, o in filter_map.items() if o != 'passed'}
+        if not hit:
+            return None
+        by_outcome: dict[str, list[str]] = {}
+        for t, o in hit.items():
+            by_outcome.setdefault(o, []).append('␣' if t == ' ' else t)
+        groups = ' / '.join(f"{o} ← {' '.join(ts)}" for o, ts in by_outcome.items())
+        return f"{len(hit)}/{len(filter_map)} 차단  {groups}"
 
     @staticmethod
     def _dom_suspect(body: str) -> tuple[str, str] | None:
@@ -260,7 +290,8 @@ class Recon:
                 text += f" | DOM 반사 의심({dom[0]}→{dom[1]})"
 
         # 2b — 적대적 프로브 (반응 있은 필드만). 어떤 프로브를 보낼지는 라벨별 _PROBE_RULES가 정한다.
-        adv = self._adversarial_probes(action, method, siblings, target, label, base_text, floor)
+        # anchor는 2a에서 이미 반사됨을 측정한 tok1을 그대로 넘긴다(새 고정값 대신 측정된 값 재사용).
+        adv = self._adversarial_probes(action, method, siblings, target, label, base_text, floor, tok1)
 
         # reflection dict 조립 — reflected/survived/dom은 위 측정값 그대로, contexts만 분류기로 추가.
         if reflected:
@@ -276,9 +307,10 @@ class Recon:
         return done(verdict, label, reflection=reflection, adv=adv)
 
     def _adversarial_probes(self, action: str, method: str, siblings: dict, target: str,
-                            label: str, baseline_body: str, noise: int) -> dict:
+                            label: str, baseline_body: str, noise: int, token: str) -> dict:
         """2b — filter_map / 따옴표(',") / 꺾쇠 생존. 어떤 프로브를 보낼지는 라벨별 _PROBE_RULES로
         정한다(기본은 다 보냄, 의미 없는 것만 뺌). 구조화된 신호 dict를 돌려준다.
+        token은 2a에서 반사됨을 측정한 그 프로브(tok1)로, filter_map·꺾쇠의 anchor로 재사용한다.
         반환: {filter_map, sqli_signal, detected_db, quote_char, survived}."""
         allow_fmap, allow_quotes, allow_angle = _PROBE_RULES.get(label, (True, True, False))
         reflected = label in _REFLECT_LABELS
@@ -291,7 +323,7 @@ class Recon:
                 r, _ = self._send(u, m, d)
                 return r, 0, None
             result['filter_map'] = probe_filter_map(send3, action, method, siblings, target,
-                                                    baseline_body, BASELINE, noise, {'reflected': reflected})
+                                                    baseline_body, token, noise, {'reflected': reflected})
         fmap = result['filter_map'] or {}
 
         # ② 따옴표 ',\" (모든 라벨) — filter_map에서 막힌 따옴표는 배제, 통과한 것만 500/에러 관측.
@@ -311,8 +343,7 @@ class Recon:
 
         # ③ 꺾쇠 <> 생존 — 반사형 라벨에서만(반사 안 되는데 XSS 프로브는 낭비).
         if allow_angle:
-            tok = self._probe_token()
-            r, _ = self._send(action, method, {**siblings, target: f"{tok}<>"})
+            r, _ = self._send(action, method, {**siblings, target: f"{token}<>"})
             if r is not None:
                 result['survived'] = [c for c in ('<', '>') if c in r.text]
 
@@ -342,7 +373,12 @@ class Recon:
             page['recon'] = self._probe_page(page)
 
         for page in pages:
-            print(f"  URL: {page['url']}")
+            recon  = page['recon']
+            default = recon.get('__default__', {})
+            methods = recon.get('__methods__') or {}
+            method_str = ' '.join(methods.get('allow') or []) or '—'
+            print(f"\n── {page['url']}   {default.get('status')} · {default.get('length')}B · {method_str}")
+
             psig = page.get('page_signals') or {}
             redir = psig.get('redirect')
             if redir or psig.get('gate_hints'):
@@ -351,43 +387,46 @@ class Recon:
                     parts.append(f"로드 시 이탈({redir.get('kind')}→{redir.get('target')})")
                 if psig.get('gate_hints'):
                     parts.append(f"요구 추정 {psig['gate_hints']}")
-                print(f"  [페이지 신호] {' | '.join(parts)}")
-            default = page['recon'].get('__default__', {})
-            print(f"  [기본] status={default.get('status')} length={default.get('length')}")
-            for entry in (page['recon'].get('__exposed__') or []):
+                print(f"  페이지 신호 : {' | '.join(parts)}")
+            for entry in (recon.get('__exposed__') or []):
                 flag = '★' if entry['status'] == 200 else '△'
-                note = '접근 차단' if entry['status'] == 403 else f"{entry['length']} bytes"
-                print(f"  {flag} [노출 파일] {entry['path']} → {entry['status']} ({note})")
-            methods = page['recon'].get('__methods__')
-            if methods:
-                print(f"  [메소드] 허용: {', '.join(methods['allow']) or '없음'} (OPTIONS {methods['status']})")
-            for field, data in page['recon'].items():
+                note = '접근 차단' if entry['status'] == 403 else f"{entry['length']}B"
+                print(f"  {flag} 노출 파일 : {entry['path']} → {entry['status']} ({note})")
+
+            for field, data in recon.items():
                 if field in ('__default__', '__exposed__', '__methods__'):
                     continue
-                db = data.get('db', {})
-                print(f"  [{field}]")
-                print(f"    종류={db.get('label') or '미확정'} | db_hint={db.get('db_hint')}")
+                db    = data.get('db', {})
+                label = db.get('label') or '미확정'
+
+                # redirect/error/미확정은 라벨만으론 부족해 verdict(목적지·사유)를 그대로 보인다.
+                if label in ('redirect', 'error', '미확정', ''):
+                    print(f"  [{field}] {data.get('verdict') or label or '미확정'}")
+                    continue
+
+                # SQLi 신호는 라벨 옆에 한눈에.
                 if db.get('detected_db'):
-                    print(f"    ★ error-based SQLi: DB={db['detected_db']} (따옴표={db.get('quote_char')!r})")
+                    sig = f"   ★ SQLi: {db['detected_db']} 에러 (따옴표 {db.get('quote_char')!r})"
                 elif db.get('sqli_signal'):
-                    print(f"    ★ SQLi 신호: 따옴표={db.get('quote_char')!r} → 500")
-                filter_map = db.get('filter_map')
-                if filter_map:
-                    hit = {t: o for t, o in filter_map.items() if o != 'passed'}
-                    print(f"    필터 지도 : {len(hit)}/{len(filter_map)}개 토큰 필터됨 — {hit}")
-                reflection = db.get('reflection')
-                if reflection is None:
-                    pass
-                elif not reflection.get('reflected'):
-                    if reflection.get('dom_suspect'):
-                        print(f"    반사 여부 : 서버 반사 없음 — DOM 반사 의심 "
-                              f"({reflection.get('dom_source')} → {reflection.get('dom_sink')}, 브라우저 확인 필요)")
+                    sig = f"   ★ SQLi: 따옴표 {db.get('quote_char')!r} → 500"
                 else:
-                    survived = reflection.get('survived') or []
-                    tested   = reflection.get('tested') or []
-                    ctxs = ', '.join(sorted(set(reflection.get('contexts') or [])))
-                    surv = ' '.join(c for c in tested if c in survived) or '없음'
-                    print(f"    반사 여부 : 반사됨 | 컨텍스트={ctxs} | 꺾쇠 생존={surv}")
+                    sig = ''
+                print(f"  [{field}] {label}{sig}")
+
+                if data.get('hint'):
+                    print(f"      힌트 : {data['hint']}")
+                fm = self._fmt_filter(db.get('filter_map'))
+                if fm:
+                    print(f"      필터 : {fm}")
+                refl = db.get('reflection') or {}
+                if refl.get('reflected'):
+                    ctxs = ', '.join(sorted(set(refl.get('contexts') or []))) or '없음'
+                    surv = ' '.join(c for c in (refl.get('tested') or [])
+                                    if c in (refl.get('survived') or [])) or '없음'
+                    print(f"      반사 : 반사됨 | 컨텍스트={ctxs} | 꺾쇠 생존={surv}")
+                elif refl.get('dom_suspect'):
+                    print(f"      반사 : 서버 반사 없음 — DOM 반사 의심 "
+                          f"({refl.get('dom_source')}→{refl.get('dom_sink')}, 브라우저 확인 필요)")
         return pages
 
     def _probe_page(self, page: dict) -> dict:
@@ -435,10 +474,10 @@ class Recon:
         for action, method, siblings, target in self._classify_surfaces(page, base_url):
             verdict, hints, db = self._classify_surface(
                 action, method, siblings, target, reload_noise, base_text, anchors)
-            results[target] = {'db': db}
+            # 필드 상세는 run()의 요약에서 한 번만 출력한다(라이브 중복 제거). 요약이 읽도록
+            # verdict(redirect/미확정 등 라벨만으론 부족한 경우 표시용)와 hint를 결과에 실어둔다.
+            results[target] = {'db': db, 'verdict': verdict, 'hint': hints}
             field_class[(action, method, target)] = db['label']
-            print(f"      · [{target}] {verdict or '(미확정)'}"
-                  + (f"  |힌트: {hints}" if hints else ''), flush=True)
 
         return results
 

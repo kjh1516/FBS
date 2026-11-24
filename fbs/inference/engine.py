@@ -1,3 +1,4 @@
+import sys
 import sqlite3
 import json
 import argparse
@@ -5,6 +6,11 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
+
+# 추론 출력은 ASCII 밖 기호(─·★␣ 등)를 쓴다. Windows 기본 콘솔(cp949)에선 인코딩 불가로
+# 출력이 깨지거나 예외가 나므로, 크롤러(scanner)와 동일하게 stdout/stderr를 utf-8로 맞춘다.
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 
 from fbs.inference.models import AttackSurface, VulnResult
 from fbs.inference.profiler import Profiler
@@ -155,22 +161,23 @@ class InferenceEngine:
         print(f"# [프로파일링] 페이지 공격 표면 {len(page_surfaces)}개 추출")
         for i, s in enumerate(page_surfaces, 1):
             hints = s.extra.get('hints', {})
-            hints_str = ', '.join(f"{k}({v})" for k, v in hints.items()) if hints else '없음'
-            print(f"\n  [{i}] {s.surface_type} | {s.method} {s.url} | param={s.param} | resp={s.response_type} | hints={hints_str}")
+            ranked = sorted((kv for kv in hints.items() if kv[1] > 0), key=lambda kv: -kv[1])
+            hints_str = ', '.join(f"{k}({v})" for k, v in ranked) if ranked else '없음'
+            print(f"\n  [{i}] {s.surface_type} | {s.method} {s.url} | param={s.param} | resp={s.response_type}")
+            print(f"      hints : {hints_str}")
             bd = s.extra.get('breakdown') or {}
             if bd.get('field_matches'):
-                fm = ', '.join(f"'{kw}'→{vuln}+{w}" for kw, vuln, w in bd['field_matches'])
-                print(f"        └ 필드명 매칭     : {fm}")
+                fm = ', '.join(f"{kw!r}→{vuln}+{w}" for kw, vuln, w in bd['field_matches'])
+                print(f"      └ 필드명 : {fm}")
             if bd.get('tech_matches'):
-                tm = ', '.join(f"{field}={val}→{vuln}+{w}" for field, val, vuln, w in bd['tech_matches'])
-                print(f"        └ 기술스택 가중치 : {tm}")
-            if bd.get('db_hint') or bd.get('recon_note'):
-                note = f" | {bd['recon_note']}" if bd.get('recon_note') else ''
-                print(f"        └ recon 신호      : db_hint={bd.get('db_hint')}{note}")
+                tm = ', '.join(f"{val}→{vuln}+{w}" for _f, val, vuln, w in bd['tech_matches'])
+                print(f"      └ 스택   : {tm}")
+            if bd.get('recon_note'):
+                print(f"      └ recon  : {bd['recon_note']}")
             if bd.get('group_note'):
-                print(f"        └ 그룹 신호       : {bd['group_note']}")
+                print(f"      └ 그룹   : {bd['group_note']}")
             if bd.get('filter_map_note'):
-                print(f"        └ 필터 지도 신호  : {bd['filter_map_note']}")
+                print(f"      └ 필터   : {bd['filter_map_note']}")
 
         # 버튼 공격 표면 추출 — 페이지에서 이미 발견된 (url, method, param) 제외
         page_seen = {(s.url, s.method, s.param) for s in page_surfaces}

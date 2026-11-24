@@ -8,13 +8,12 @@ from urllib.parse import urlparse, urljoin, parse_qs, urlunparse
 from fbs.utils import detect_tech_stack, header_decode, is_jwt, decode_jwt_payload, detect_client_redirect, extract_gate_hints, pick_user_agent
 from fbs.items import PageItem, ButtonResultItem
 from fbs.inference.validation import classify_waf_block, EVASION_TRANSFORMS
-from fbs.inference.compare import visible_text, diff_score
+from fbs.inference.compare import visible_text, diff_score, probe_token
 from scrapy_playwright.page import PageMethod
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
-FUZZ_MARKER = "john17823"
 BLOCK_SIZE   = 45
 DEFAULT_WORDLIST = os.path.join(os.path.dirname(__file__), '..', 'wordlists', 'params.txt')
 
@@ -1111,7 +1110,7 @@ class ScannerSpider(CrawlSpider):
         candidates = [p for p in self._param_wordlist if p not in (known_params or set())]
         if not candidates:
             return
-        ctx = {'method': 'GET', 'url': base_url, 'known_fields': {}, 'probe_value': FUZZ_MARKER}
+        ctx = {'method': 'GET', 'url': base_url, 'known_fields': {}, 'probe_value': probe_token('fbsfz')}
         state = {'ctx': ctx, 'baseline_text': visible_text(response.text)}
         yield from self._fuzz_start(state, candidates, item)
 

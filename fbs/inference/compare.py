@@ -2,8 +2,18 @@
 recon·전략·scanner가 공유한다."""
 
 import difflib
+import random
+import string
 
 from bs4 import BeautifulSoup
+
+
+def probe_token(prefix: str) -> str:
+    """필터·SQL에 안 걸리는 영숫자 프로브 토큰을 만든다. 응답에 이 토큰이 그대로 박혀 있으면
+    입력이 반사된 것으로 본다. 매 호출 달라서 메모형(이전 입력 잔존) 판정과 페이지에 원래
+    있던 텍스트와의 우연한 충돌을 피한다. 크롤러·recon·전략이 공유하되, prefix로 어느 단계·
+    필드에서 보낸 토큰인지 응답에서 바로 식별할 수 있게 한다(예: 퍼징 fbsfz, 반사 fbsrf)."""
+    return prefix + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
 
 def visible_text(body: str) -> str:
