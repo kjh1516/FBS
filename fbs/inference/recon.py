@@ -4,7 +4,7 @@ import requests
 from urllib.parse import urljoin
 
 from fbs.inference.sql_dialects import detect_db_from_error
-from fbs.inference.validation import probe_filter_map
+from fbs.inference.validation import probe_filter_map, classify_reflected_reaction
 from fbs.inference.compare import visible_text, diff_score, volatile_anchors, strip_volatile, probe_token
 
 # 언어/공통별 노출 파일 탐지 경로
@@ -197,20 +197,20 @@ class Recon:
         sink = next((k for k in _DOM_SINKS   if k in low), None)
         return (src, sink) if src and sink else None
 
-    def _classify_surface(self, action: str, method: str, siblings: dict,
-                          target: str, reload_noise: int, base_text: str,
-                          anchors: list) -> tuple[str, str, dict]:
-        """직전 관측 대비 변화가 reload_noise(바닥)를 넘는지만으로 종류를 가른다. 고정 임계는 없다.
-        모든 diff 비교는 anchors로 동적 구간(광고 등)을 제거한 텍스트로 한다(base_text도 이미 제거됨).
+    def _classify_surface(self, action: str, method: str, siblings: dict, target: str,
+                          get_floor: int, get_base_text: str, get_anchors: list,
+                          base_url: str) -> tuple[str, str, dict]:
+        """직전 관측 대비 변화가 바닥(floor)을 넘는지만으로 종류를 가른다. 고정 임계는 없다.
+        바닥·마스킹 앵커는 엔드포인트별로 잡는다 — GET 랜딩이면 Phase 0에서 온 GET 값을 재사용하고,
+        그 외 엔드포인트(POST·다른 action)는 빈 값을 2번 보내 그 엔드포인트의 양성 변동 앵커와 바닥을
+        따로 잰다(빈 값은 검증에서 걸려 state를 안 건드려 양성 기준이 된다). GET는 Phase 0에서 하던
+        동적 구간 마스킹을, POST 응답에도 대칭으로 적용하기 위함.
+        base_text(반응 게이트 기준)는 어느 경우든 GET 랜딩이다 — 빈 제출이 로드와 달라졌는지를 봐야 한다.
         측정(Phase 1→2a→3)으로 성격을 가른 뒤, 반응 있은 필드만 2b(적대적 프로브)를 돌린다.
         반환: (판정 문자열, 힌트 문자열, db dict). db는 소비처가 읽는 구조화 결과
         {label, db_hint, quote_char, sqli_signal, detected_db, filter_map, reflection}."""
-        floor = reload_noise
+        base_text = get_base_text
         hints: list[str] = []
-
-        def clean(resp):
-            # 반사(토큰 박힘)는 원문으로 보고, diff 비교는 동적 구간 제거한 텍스트로 한다.
-            return strip_volatile(visible_text(resp.text), anchors) if resp is not None else ''
 
         def harvest(text):
             snip = self._added_text(base_text, text)
@@ -240,6 +240,22 @@ class Recon:
         empty, _ = self._send(action, method, {**siblings, target: ''})
         if empty is not None and 300 <= empty.status_code < 400:
             return done(f"이탈형: 빈 값 → {empty.status_code} {empty.headers.get('Location')}", 'redirect')
+
+        # 엔드포인트 양성 베이스라인 — GET 랜딩은 Phase 0 재사용, 그 외는 빈 값을 한 번 더 보내 이
+        # 엔드포인트의 변동 앵커(GET 앵커와 합집합)와 바닥을 잰다. 빈 값 요청이 아예 실패했으면 GET으로 폴백.
+        if empty is None or (action == base_url and method == 'GET'):
+            anchors, floor = get_anchors, get_floor
+        else:
+            empty2, _ = self._send(action, method, {**siblings, target: ''})
+            raw1 = visible_text(empty.text)
+            raw2 = visible_text(empty2.text) if empty2 is not None else raw1
+            anchors = get_anchors + volatile_anchors(raw1, raw2)
+            floor = diff_score(strip_volatile(raw1, anchors), strip_volatile(raw2, anchors))
+
+        def clean(resp):
+            # 반사(토큰 박힘)는 원문으로 보고, diff 비교는 동적 구간 제거한 텍스트로 한다.
+            return strip_volatile(visible_text(resp.text), anchors) if resp is not None else ''
+
         empty_text = clean(empty)
         harvest(empty_text)
         d_empty = diff_score(base_text, empty_text)   # 빈 제출이 평소 페이지를 움직였나
@@ -326,26 +342,36 @@ class Recon:
                                                     baseline_body, token, noise, {'reflected': reflected})
         fmap = result['filter_map'] or {}
 
-        # ② 따옴표 ',\" (모든 라벨) — filter_map에서 막힌 따옴표는 배제, 통과한 것만 500/에러 관측.
+        # ② 따옴표 ',\" (모든 라벨) — filter_map에서 막힌 따옴표는 배제, 통과한 것만 관측.
+        # 에러 기반 SQLi는 200으로 내려오며 본문에 SQL 에러를 뱉는 게 가장 흔하므로, 상태코드와
+        # 무관하게 본문 에러 시그니처(detect_db_from_error)를 보고, 500은 별도 신호로 더한다.
+        # 단 baseline에도 같은 시그니처가 있으면 그 페이지 native 콘텐츠라 신호가 아니다(baseline 차분).
+        base_db = detect_db_from_error(baseline_body or '') if allow_quotes else None
         if allow_quotes:
             for q in ("'", '"'):
                 if fmap.get(q, 'passed') != 'passed':
                     continue
                 r, _ = self._send(action, method, {**siblings, target: q})
-                if r is None or r.status_code < 500:
+                if r is None:
+                    continue
+                db = detect_db_from_error(r.text)
+                if db == base_db:        # baseline에 이미 있던 시그니처 → 반응 아님
+                    db = None
+                if not (db or r.status_code >= 500):
                     continue
                 result['sqli_signal'] = True
                 if result['quote_char'] is None:
                     result['quote_char'] = q
-                db = detect_db_from_error(r.text)
                 if db and not result['detected_db']:
                     result['detected_db'] = db
 
-        # ③ 꺾쇠 <> 생존 — 반사형 라벨에서만(반사 안 되는데 XSS 프로브는 낭비).
+        # ③ 꺾쇠 <> 생존 — 반사형 라벨에서만(반사 안 되는데 XSS 프로브는 낭비). 응답 전체엔 태그 때문에
+        # <>가 늘 있으므로, 토큰(앵커) 바로 뒤에 우리가 보낸 <>가 이스케이프 없이 그대로 반사됐을 때만
+        # 생존으로 본다(classify_reflected_reaction이 passed/encoded/removed를 가른다).
         if allow_angle:
             r, _ = self._send(action, method, {**siblings, target: f"{token}<>"})
-            if r is not None:
-                result['survived'] = [c for c in ('<', '>') if c in r.text]
+            if r is not None and classify_reflected_reaction(r.text, token, '<>') == 'passed':
+                result['survived'] = ['<', '>']
 
         return result
 
@@ -473,7 +499,7 @@ class Recon:
         field_class = page.setdefault('field_class', {})
         for action, method, siblings, target in self._classify_surfaces(page, base_url):
             verdict, hints, db = self._classify_surface(
-                action, method, siblings, target, reload_noise, base_text, anchors)
+                action, method, siblings, target, reload_noise, base_text, anchors, base_url)
             # 필드 상세는 run()의 요약에서 한 번만 출력한다(라이브 중복 제거). 요약이 읽도록
             # verdict(redirect/미확정 등 라벨만으론 부족한 경우 표시용)와 hint를 결과에 실어둔다.
             results[target] = {'db': db, 'verdict': verdict, 'hint': hints}
