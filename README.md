@@ -8,7 +8,7 @@ Scrapy + Playwright 기반의 공부에 목적을 둔 범용 웹 취약점 스�
 ```
 [단계 A: 크롤링]                      [단계 B: 추론]
 Scrapy + Playwright                   SQLite 읽기
-  ├ 폼/URL 파라미터 수집                ├ Recon  (반사·필터맵·WAF·노출파일·기술스택)
+  ├ 폼/URL 파라미터 수집                ├ Recon  (입력면 분류·반사·필터맵·WAF·노출파일·기술스택)
   ├ 숨은 파라미터 퍼징                  ├ Profiler (증거 클래스 기반 우선순위 점수)
   ├ SPA 버튼 클릭 → XHR 가로채기   →    └ Strategy (표면별 최우선 전략 1개 실행)
   └ 로그인/세션 유지                         ├ SQLiStrategy
@@ -48,7 +48,7 @@ scrapy crawl scanner -a target_url=http://TARGET/ -a login_id=ID -a login_pw=PW
 - **Reflected**: 중립 카나리로 반사 컨텍스트 분류 → 컨텍스트별 페이로드 → 브라우저 실행 확정
 
 ### Recon (공용 신호)
-반사 여부·컨텍스트, 필터 지도(제거/인코딩/거부 구분), WAF 탐지(단어경계 매칭), 노출 파일, 캐시 헤더, 기술 스택 핑거프린팅
+입력면 분류(반사형 메모/검색/단순·stateful·blind·redirect 등 라벨), 반사 여부·컨텍스트, 필터 지도(제거/인코딩/거부 구분), WAF 탐지(단어경계 매칭), 노출 파일, 기술 스택 핑거프린팅
 
 
 ## 프로젝트 구조
@@ -59,7 +59,7 @@ fbs/
 ├─ pipelines.py, items.py  # 크롤 결과 → SQLite
 └─ inference/              # 단계 B: 추론 엔진
    ├─ engine.py            #   파이프라인 총괄
-   ├─ recon.py             #   신호 수집 허브 (반사·필터맵·차단비율)
+   ├─ recon.py             #   입력면 측정 허브 (입력면 분류·반사·필터맵)
    ├─ profiler.py          #   증거 클래스 기반 우선순위 점수
    ├─ validation.py        #   필터·WAF 탐지(baseline 차분) + 우회 변형
    ├─ compare.py           #   범용 응답 비교 (visible_text·diff_score)
